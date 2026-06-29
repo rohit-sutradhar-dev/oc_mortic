@@ -1,0 +1,38 @@
+{
+  "api": {
+    "name": "inception",
+    "base_url": "https://api.inceptionlabs.ai/v1",
+    "env_var": "INCEPTION_API_KEY",
+    "timeout_sec": 300,
+    "max_retries": 2,
+    "retry_backoff_sec": 1.0,
+    "generation_id_header": null
+  },
+  "dataset": {
+    "name": "perplexity-ai/draco",
+    "split": "test",
+    "cache_path": "data/draco/test.jsonl",
+    "url": "https://huggingface.co/datasets/perplexity-ai/draco/resolve/main/test.jsonl"
+  },
+  "defaults": {
+    "temperature": 0.75,
+    "max_tokens": 2048
+  },
+  "systems": [
+    {
+      "name": "solo_mercury_2",
+      "model": "mercury-2"
+    },
+    {
+      "name": "local_fusion_mercury_2_x2",
+      "strategy": "local_fusion",
+      "model": "mercury-2",
+      "synthesis_model": "mercury-2",
+      "analysis_models": [
+        "mercury-2",
+        "mercury-2"
+      ],
+      "synthesis_prompt_template": "You are synthesizing multiple candidate answers to the same benchmark task. Produce one final answer that is more accurate, complete, and concise than any single candidate. Do not mention candidates, panels, fusion, or the synthesis process.\\n\\nTask:\\n{prompt}\\n\\nCandidate answers:\\n{answers}\\n\\nFinal answer:"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "openrouter": {
+    "base_url": "https://openrouter.ai/api/v1",
+    "timeout_sec": 300,
+    "max_retries": 2,
+    "retry_backoff_sec": 1.0,
+    "headers": {
+      "X-Title": "OpenRouter Fusion Mercury 2 DRACO Benchmark",
+      "X-OpenRouter-Metadata": "enabled"
+    }
+  },
+  "dataset": {
+    "name": "perplexity-ai/draco",
+    "split": "test",
+    "cache_path": "data/draco/test.jsonl",
+    "url": "https://huggingface.co/datasets/perplexity-ai/draco/resolve/main/test.jsonl"
+  },
+  "defaults": {
+    "temperature": 0.2,
+    "max_completion_tokens": 2048,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "systems": [
+    {
+      "name": "solo_mercury_2",
+      "model": "inception/mercury-2"
+    },
+    {
+      "name": "fusion_mercury_2_x2",
+      "model": "openrouter/fusion",
+      "plugins": [
+        {
+          "id": "fusion",
+          "model": "inception/mercury-2",
+          "analysis_models": [
+            "inception/mercury-2",
+            "inception/mercury-2"
+          ],
+          "max_tool_calls": 8
+        }
+      ]
+    }
+  ]
+}

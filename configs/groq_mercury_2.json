@@ -1,0 +1,145 @@
+{
+  "apis": {
+    "inception": {
+      "base_url": "https://api.inceptionlabs.ai/v1",
+      "env_var": "INCEPTION_API_KEY",
+      "timeout_sec": 300,
+      "max_retries": 2,
+      "retry_backoff_sec": 1.0,
+      "generation_id_header": null
+    },
+    "groq": {
+      "base_url": "https://api.groq.com/openai/v1",
+      "env_var": "GROQ_API_KEY",
+      "timeout_sec": 300,
+      "max_retries": 2,
+      "retry_backoff_sec": 1.0,
+      "generation_id_header": null,
+      "headers": {
+        "User-Agent": "groq-python/0.9.0"
+      }
+    }
+  },
+  "dataset": {
+    "name": "perplexity-ai/draco",
+    "split": "test",
+    "cache_path": "data/draco/test.jsonl",
+    "url": "https://huggingface.co/datasets/perplexity-ai/draco/resolve/main/test.jsonl"
+  },
+  "defaults": {},
+  "systems": [
+    {
+      "name": "solo_mercury_2",
+      "api": "inception",
+      "model": "mercury-2",
+      "temperature": 0.75,
+      "max_tokens": 2048
+    },
+    {
+      "name": "solo_llama_3_3_70b_groq",
+      "api": "groq",
+      "model": "llama-3.3-70b-versatile",
+      "temperature": 0.2,
+      "max_tokens": 2048
+    },
+    {
+      "name": "solo_llama_4_scout_groq",
+      "api": "groq",
+      "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "temperature": 0.2,
+      "max_tokens": 2048
+    },
+    {
+      "name": "fusion_mercury_2_llama_70b_groq_synth",
+      "strategy": "local_fusion",
+      "analysis_models": [
+        {
+          "api": "inception",
+          "model": "mercury-2",
+          "defaults": {
+            "temperature": 0.75,
+            "max_tokens": 2048
+          }
+        },
+        {
+          "api": "groq",
+          "model": "llama-3.3-70b-versatile",
+          "defaults": {
+            "temperature": 0.2,
+            "max_tokens": 2048
+          }
+        }
+      ],
+      "synthesis_api": "groq",
+      "synthesis_model": "llama-3.3-70b-versatile",
+      "synthesis_defaults": {
+        "temperature": 0.2,
+        "max_tokens": 2048
+      },
+      "synthesis_prompt_template": "You are synthesizing two candidate answers to the same benchmark task. Prefer exact facts, calculations, citations named in the task, and safety-critical caveats. Remove unsupported numeric claims. Produce one final answer only; do not mention candidates, panels, fusion, or this synthesis process.\\n\\nTask:\\n{prompt}\\n\\nCandidate answers:\\n{answers}\\n\\nFinal answer:"
+    },
+    {
+      "name": "mercury_2_draft_groq_llama_70b_check",
+      "strategy": "draft_check",
+      "draft_api": "inception",
+      "draft_model": "mercury-2",
+      "draft_defaults": {
+        "temperature": 0.75,
+        "max_tokens": 2048
+      },
+      "checker_api": "groq",
+      "checker_model": "llama-3.3-70b-versatile",
+      "checker_defaults": {
+        "temperature": 0.2,
+        "max_tokens": 2048
+      },
+      "checker_prompt_template": "You are checking a fast draft answer against a benchmark task. Correct factual errors, fill important omissions, remove unsupported numeric claims, and keep the answer concise. If the draft lacks the exact numbers needed, state the calculation framework rather than inventing figures. Return one final answer only; do not mention the draft, checker, or review process.\\n\\nTask:\\n{prompt}\\n\\nFast draft answer:\\n{draft}\\n\\nChecked final answer:"
+    },
+    {
+      "name": "fusion_mercury_2_llama_4_scout_groq_synth",
+      "strategy": "local_fusion",
+      "analysis_models": [
+        {
+          "api": "inception",
+          "model": "mercury-2",
+          "defaults": {
+            "temperature": 0.75,
+            "max_tokens": 2048
+          }
+        },
+        {
+          "api": "groq",
+          "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+          "defaults": {
+            "temperature": 0.2,
+            "max_tokens": 2048
+          }
+        }
+      ],
+      "synthesis_api": "groq",
+      "synthesis_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "synthesis_defaults": {
+        "temperature": 0.2,
+        "max_tokens": 2048
+      },
+      "synthesis_prompt_template": "You are synthesizing two candidate answers to the same benchmark task. Prefer exact facts, calculations, citations named in the task, and safety-critical caveats. Remove unsupported numeric claims. Produce one final answer only; do not mention candidates, panels, fusion, or this synthesis process.\\n\\nTask:\\n{prompt}\\n\\nCandidate answers:\\n{answers}\\n\\nFinal answer:"
+    },
+    {
+      "name": "mercury_2_draft_groq_llama_4_scout_check",
+      "strategy": "draft_check",
+      "draft_api": "inception",
+      "draft_model": "mercury-2",
+      "draft_defaults": {
+        "temperature": 0.75,
+        "max_tokens": 2048
+      },
+      "checker_api": "groq",
+      "checker_model": "meta-llama/llama-4-scout-17b-16e-instruct",
+      "checker_defaults": {
+        "temperature": 0.2,
+        "max_tokens": 2048
+      },
+      "checker_prompt_template": "You are checking a fast draft answer against a benchmark task. Correct factual errors, fill important omissions, remove unsupported numeric claims, and keep the answer concise. If the draft lacks the exact numbers needed, state the calculation framework rather than inventing figures. Return one final answer only; do not mention the draft, checker, or review process.\\n\\nTask:\\n{prompt}\\n\\nFast draft answer:\\n{draft}\\n\\nChecked final answer:"
+    }
+  ]
+}

@@ -1,0 +1,197 @@
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+import webbrowser
+from pathlib import Path
+from threading import Timer
+
+import uvicorn
+
+from opencode_voice.config import VoiceConfig, load_voice_agent_prompt, parse_model_ref, render_opencode_config_content
+from opencode_voice.server import create_app
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    model = parse_model_ref(args.model, variant=args.model_variant)
+    opencode_process: subprocess.Popen[str] | None = None
+    opencode_url = None
+    detected_url = detect_opencode_url()
+    if not args.managed_opencode:
+        opencode_url = args.opencode_url or os.environ.get("OPENCODE_VOICE_OPENCODE_URL") or detected_url
+    if not opencode_url:
+        opencode_dir = args.opencode_dir or (detect_opencode_directory(detected_url) if detected_url else None)
+        opencode_url, opencode_process = start_managed_opencode(
+            model_name=args.model,
+            model_variant=args.model_variant,
+            opencode_dir=opencode_dir,
+            voice_agent_prompt_path=args.voice_agent_prompt,
+            voice_agent_name=args.agent,
+        )
+
+    config = VoiceConfig(
+        opencode_url=opencode_url,
+        bridge_host=args.host,
+        bridge_port=args.port,
+        model=model,
+        context_threshold_tokens=args.context_threshold,
+        deepgram_stt_model=args.stt_model,
+        deepgram_tts_model=args.tts_model,
+        deepgram_sample_rate=args.sample_rate,
+        flux_eager_eot_threshold=args.eager_eot_threshold,
+        opencode_agent=args.agent,
+        voice_agent_prompt_path=args.voice_agent_prompt,
+        keep_fork_default=args.keep_fork,
+    )
+    if args.print_config:
+        print(
+            render_opencode_config_content(
+                model,
+                voice_agent_prompt=load_voice_agent_prompt(args.voice_agent_prompt),
+                voice_agent_name=args.agent,
+            ),
+            file=sys.stderr,
+        )
+        return 0
+    app = create_app(config)
+    if args.open:
+        Timer(1.0, lambda: webbrowser.open(config.browser_url)).start()
+    try:
+        uvicorn.run(app, host=config.bridge_host, port=config.bridge_port, log_level=args.log_level)
+    finally:
+        if opencode_process:
+            opencode_process.terminate()
+            try:
+                opencode_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                opencode_process.kill()
+    return 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Speak with an OpenCode thread through Mercury 2 and Deepgram.")
+    parser.add_argument("--opencode-url", help="Existing OpenCode server URL. Auto-detected when omitted.")
+    parser.add_argument("--managed-opencode", action="store_true", help="Start a clean managed OpenCode server.")
+    parser.add_argument("--opencode-dir", help="Working directory for a managed OpenCode server.")
+    parser.add_argument("--host", default="127.0.0.1", help="Voice bridge host.")
+    parser.add_argument("--port", type=int, default=8765, help="Voice bridge port.")
+    parser.add_argument("--open", action="store_true", help="Open the browser UI after startup.")
+    parser.add_argument("--model", default="inception/mercury-2", help="OpenCode model in provider/model form.")
+    parser.add_argument("--model-variant", default="high", help="OpenCode model variant.")
+    parser.add_argument("--agent", default="voice-build", help="OpenCode agent for voice turns.")
+    parser.add_argument(
+        "--voice-agent-prompt",
+        default="opencode_voice/voice_agent.md",
+        help="Markdown prompt used for the ephemeral managed-server voice agent.",
+    )
+    parser.add_argument("--context-threshold", type=int, default=70_000, help="Token threshold for proactive compaction.")
+    parser.add_argument("--stt-model", default="flux-general-en", help="Deepgram Flux STT model.")
+    parser.add_argument("--tts-model", default="aura-2-thalia-en", help="Deepgram Aura TTS model.")
+    parser.add_argument("--sample-rate", type=int, default=16_000, help="PCM sample rate for STT and TTS.")
+    parser.add_argument("--eager-eot-threshold", type=float, help="Enable experimental Flux eager end-of-turn.")
+    parser.add_argument("--keep-fork", action="store_true", help="Keep ephemeral forks by default.")
+    parser.add_argument("--print-config", action="store_true", help="Print the generated OpenCode config overlay.")
+    parser.add_argument("--log-level", default="info", choices=["critical", "error", "warning", "info", "debug"])
+    return parser.parse_args(argv)
+
+
+def detect_opencode_url() -> str | None:
+    candidates = []
+    for port in ports_from_processes():
+        candidates.append(f"http://127.0.0.1:{port}")
+    candidates.extend(["http://127.0.0.1:4096", "http://127.0.0.1:17242"])
+    seen: set[str] = set()
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        if is_healthy(url):
+            return url
+    return None
+
+
+def ports_from_processes() -> list[int]:
+    try:
+        output = subprocess.check_output(["pgrep", "-fl", "opencode"], text=True)
+    except Exception:
+        return []
+    ports: list[int] = []
+    words = output.replace("=", " ").split()
+    for index, word in enumerate(words):
+        if word == "--port" and index + 1 < len(words):
+            try:
+                ports.append(int(words[index + 1]))
+            except ValueError:
+                pass
+    return ports
+
+
+def is_healthy(base_url: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"{base_url.rstrip('/')}/global/health", timeout=2) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def detect_opencode_directory(base_url: str | None) -> str | None:
+    if not base_url:
+        return None
+    try:
+        with urllib.request.urlopen(f"{base_url.rstrip('/')}/path", timeout=2) as response:
+            data = __import__("json").loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    directory = data.get("directory") or data.get("worktree")
+    return str(directory) if directory else None
+
+
+def start_managed_opencode(
+    model_name: str,
+    model_variant: str | None = "high",
+    opencode_dir: str | None = None,
+    voice_agent_prompt_path: str = "opencode_voice/voice_agent.md",
+    voice_agent_name: str = "voice-build",
+) -> tuple[str, subprocess.Popen[str]]:
+    port = free_port()
+    env = os.environ.copy()
+    env["OPENCODE_CONFIG_CONTENT"] = render_opencode_config_content(
+        parse_model_ref(model_name, variant=model_variant),
+        voice_agent_prompt=load_voice_agent_prompt(voice_agent_prompt_path),
+        voice_agent_name=voice_agent_name,
+    )
+    cwd = str(Path(opencode_dir).expanduser()) if opencode_dir else None
+    process = subprocess.Popen(
+        ["opencode", "serve", "--hostname", "127.0.0.1", "--port", str(port), "--cors", "*"],
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    url = f"http://127.0.0.1:{port}"
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Managed OpenCode server exited before becoming healthy.")
+        if is_healthy(url):
+            return url, process
+        time.sleep(0.25)
+    process.terminate()
+    raise RuntimeError("Managed OpenCode server did not become healthy within 20 seconds.")
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
