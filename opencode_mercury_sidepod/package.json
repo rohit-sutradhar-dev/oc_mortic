@@ -1,0 +1,23 @@
+{
+  "name": "opencode-mortic-sidepod",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Native OpenCode TUI sidebar proof for Mortic voice control.",
+  "type": "module",
+  "main": "dist/index.js",
+  "oc-plugin": ["tui"],
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./tui": {
+      "import": "./dist/tui.js"
+    }
+  },
+  "files": ["dist"],
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.4.0",
+    "@opentui/solid": ">=0.1.0",
+    "solid-js": ">=1.8.0"
+  }
+}

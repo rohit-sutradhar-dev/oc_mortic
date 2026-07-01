@@ -5,7 +5,14 @@ import unittest
 
 from opencode_voice.config import ModelRef, render_opencode_config
 from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
-from opencode_voice.state import AssistantTextTracker, session_context_tokens
+from opencode_voice.opencode_client import SSEParser
+from opencode_voice.state import (
+    AssistantTextTracker,
+    OpenCodeEventTurnTracker,
+    active_context_estimate,
+    session_context_tokens,
+    session_usage_tokens,
+)
 
 
 class MercuryConfigTests(unittest.TestCase):
@@ -19,6 +26,7 @@ class MercuryConfigTests(unittest.TestCase):
         self.assertEqual(config["provider"]["inception"]["options"]["apiKey"], "{env:INCEPTION_API_KEY}")
         self.assertEqual(config["provider"]["inception"]["models"]["mercury-2"]["id"], "mercury-2")
         self.assertEqual(config["provider"]["inception"]["models"]["inception/mercury-2"]["id"], "mercury-2")
+        self.assertIs(config["compaction"]["auto"], False)
 
     def test_ephemeral_voice_agent_prompt_is_configured_when_supplied(self) -> None:
         config = render_opencode_config(
@@ -33,11 +41,76 @@ class MercuryConfigTests(unittest.TestCase):
 
 
 class TokenTests(unittest.TestCase):
-    def test_context_tokens_sum_input_output_reasoning(self) -> None:
+    def test_session_tokens_are_usage_accounting(self) -> None:
+        self.assertEqual(
+            session_usage_tokens({"tokens": {"input": 70000, "output": 12, "reasoning": 3, "cache": {"read": 9}}}),
+            70015,
+        )
         self.assertEqual(
             session_context_tokens({"tokens": {"input": 70000, "output": 12, "reasoning": 3, "cache": {"read": 9}}}),
             70015,
         )
+
+    def test_active_context_uses_latest_assistant_input_tokens(self) -> None:
+        estimate = active_context_estimate(
+            [
+                {
+                    "info": {"id": "msg_user", "role": "user", "time": {"created": 1}},
+                    "parts": [{"type": "text", "text": "hello"}],
+                },
+                {
+                    "info": {
+                        "id": "msg_assistant",
+                        "role": "assistant",
+                        "time": {"created": 2, "completed": 3},
+                        "tokens": {"input": 521, "output": 100, "cache": {"read": 70000}},
+                    },
+                    "parts": [{"type": "text", "text": "hi"}],
+                },
+            ]
+        )
+
+        self.assertEqual(estimate.tokens, 70521)
+        self.assertEqual(estimate.source, "assistant_input")
+        self.assertEqual(estimate.measured_message_id, "msg_assistant")
+
+    def test_active_context_resets_after_completed_summary(self) -> None:
+        messages = [
+            {
+                "info": {"id": "msg_user", "role": "user", "time": {"created": 1}},
+                "parts": [{"type": "text", "text": "A" * 300_000}],
+            },
+            {
+                "info": {
+                    "id": "msg_assistant",
+                    "role": "assistant",
+                    "time": {"created": 2, "completed": 3},
+                    "tokens": {"input": 75000, "output": 20},
+                },
+                "parts": [{"type": "text", "text": "older answer"}],
+            },
+            {
+                "info": {"id": "msg_compaction", "role": "user", "time": {"created": 4}},
+                "parts": [{"type": "compaction", "auto": False}],
+            },
+            {
+                "info": {
+                    "id": "msg_summary",
+                    "role": "assistant",
+                    "summary": True,
+                    "finish": "stop",
+                    "time": {"created": 5, "completed": 6},
+                    "tokens": {"input": 76000, "output": 128},
+                },
+                "parts": [{"type": "text", "text": "Short summary."}],
+            },
+        ]
+
+        estimate = active_context_estimate(messages)
+
+        self.assertLess(estimate.tokens, 70_000)
+        self.assertEqual(estimate.source, "content_estimate")
+        self.assertEqual(estimate.summary_message_id, "msg_summary")
 
 
 class AssistantTrackerTests(unittest.TestCase):
@@ -91,6 +164,123 @@ class AssistantTrackerTests(unittest.TestCase):
         self.assertEqual(update.message_id, "msg_err")
         self.assertTrue(update.completed)
         self.assertEqual(update.error, {"name": "APIError"})
+
+
+class SSEParserTests(unittest.TestCase):
+    def test_parses_multiline_data_frame(self) -> None:
+        parser = SSEParser()
+
+        self.assertIsNone(parser.push_line("event: message"))
+        self.assertIsNone(parser.push_line('data: {"type":'))
+        self.assertIsNone(parser.push_line('data: "session.idle"}'))
+        event = parser.push_line("")
+
+        self.assertEqual(event, {"type": "session.idle"})
+
+    def test_skips_malformed_data_frame(self) -> None:
+        parser = SSEParser()
+
+        parser.push_line("data: {not json")
+
+        self.assertIsNone(parser.push_line(""))
+
+
+class OpenCodeEventTurnTrackerTests(unittest.TestCase):
+    def test_ignores_user_text_part_updates(self) -> None:
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
+        tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"sessionID": "ses_1", "info": {"id": "msg_user", "role": "user"}},
+            }
+        )
+
+        update = tracker.update(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": "ses_1",
+                    "part": {"id": "prt_1", "messageID": "msg_user", "type": "text", "text": "hello"},
+                },
+            }
+        )
+
+        self.assertEqual(update.deltas, [])
+        self.assertEqual(update.full_text, "")
+
+    def test_accepts_assistant_text_delta(self) -> None:
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids={"msg_old"})
+        tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
+            }
+        )
+
+        update = tracker.update(
+            {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": "ses_1",
+                    "messageID": "msg_new",
+                    "partID": "prt_1",
+                    "field": "text",
+                    "delta": "hel",
+                },
+            }
+        )
+
+        self.assertEqual(update.deltas, ["hel"])
+        self.assertEqual(update.full_text, "hel")
+
+    def test_deduplicates_full_text_updates(self) -> None:
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
+        tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
+            }
+        )
+
+        first = tracker.update(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": "ses_1",
+                    "part": {"id": "prt_1", "messageID": "msg_new", "type": "text", "text": "hel"},
+                },
+            }
+        )
+        second = tracker.update(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": "ses_1",
+                    "part": {"id": "prt_1", "messageID": "msg_new", "type": "text", "text": "hello"},
+                },
+            }
+        )
+        duplicate = tracker.update(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": "ses_1",
+                    "part": {"id": "prt_1", "messageID": "msg_new", "type": "text", "text": "hello"},
+                },
+            }
+        )
+
+        self.assertEqual(first.deltas, ["hel"])
+        self.assertEqual(second.deltas, ["lo"])
+        self.assertEqual(duplicate.deltas, [])
+        self.assertEqual(duplicate.full_text, "hello")
+
+    def test_completes_on_session_idle(self) -> None:
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
+
+        update = tracker.update({"type": "session.idle", "properties": {"sessionID": "ses_1"}})
+
+        self.assertTrue(update.completed)
 
 
 class DeepgramProtocolTests(unittest.TestCase):
@@ -192,6 +382,14 @@ class TTSTests(unittest.TestCase):
         self.assertNotIn("sandhi_split", spoken)
         self.assertNotIn("python paninian_tokenizer.py", spoken)
         self.assertNotIn("parse_sentence", spoken)
+
+    def test_speech_filter_releases_safe_partial_sentences(self) -> None:
+        filter_ = SpeechTextFilter()
+
+        spoken = filter_.push("Done. I am still forming the next sentence")
+
+        self.assertEqual(spoken, "Done.")
+        self.assertEqual(filter_.flush(), "I am still forming the next sentence")
 
 
 if __name__ == "__main__":

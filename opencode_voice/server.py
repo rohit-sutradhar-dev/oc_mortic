@@ -23,10 +23,38 @@ from opencode_voice.deepgram import (
 )
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import OpenCodeClient
-from opencode_voice.state import AssistantTextTracker, elapsed_ms, session_context_tokens, session_title
+from opencode_voice.state import (
+    AssistantTextTracker,
+    OpenCodeEventTurnTracker,
+    active_context_estimate,
+    elapsed_ms,
+    event_properties,
+    session_context_tokens,
+    session_title,
+    session_usage_tokens,
+)
 
 STATIC_DIR = Path(__file__).with_name("static")
 EPHEMERAL_PREFIX = "[voice tmp]"
+CONTEXT_OVERFLOW_MARKERS = (
+    "maximum context length",
+    "context length",
+    "context window",
+    "reduce the length of the messages",
+    "too many tokens",
+)
+
+
+def is_context_overflow_error(exc: Exception) -> bool:
+    text = repr(exc).lower()
+    return any(marker in text for marker in CONTEXT_OVERFLOW_MARKERS)
+
+
+class OpenCodeEventFallback(Exception):
+    def __init__(self, reason: str, prompt_sent: bool = False) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.prompt_sent = prompt_sent
 
 
 def create_app(config: VoiceConfig) -> FastAPI:
@@ -98,6 +126,7 @@ def create_app(config: VoiceConfig) -> FastAPI:
                         "title": session_title(row),
                         "tokens": row.get("tokens") or {},
                         "context_tokens": session_context_tokens(row),
+                        "usage_tokens": session_usage_tokens(row),
                         "model": row.get("model"),
                         "time": row.get("time") or {},
                         "is_voice_tmp": str(row.get("title") or "").startswith(EPHEMERAL_PREFIX),
@@ -252,12 +281,17 @@ class VoiceConnection:
             await self.client.update_session(fork_id, {"title": title})
         self.fork_session_id = fork_id
         session = await self.client.get_session(fork_id)
+        messages = await self.client.messages(fork_id)
+        estimate = active_context_estimate(messages)
+        usage_tokens = session_usage_tokens(session)
         self.logger.write(
             "fork.create",
             source_session_id=session_id,
             fork_session_id=fork_id,
             latency_ms=elapsed_ms(fork_started),
-            context_tokens=session_context_tokens(session),
+            context_tokens=estimate.tokens,
+            context_source=estimate.source,
+            usage_tokens=usage_tokens,
             keep_fork=keep_fork,
         )
         await self.send_json(
@@ -266,7 +300,9 @@ class VoiceConnection:
                 "source_session_id": session_id,
                 "fork_session_id": fork_id,
                 "title": title,
-                "context_tokens": session_context_tokens(session),
+                "context_tokens": estimate.tokens,
+                "context_source": estimate.source,
+                "usage_tokens": usage_tokens,
                 "keep_fork": keep_fork,
             }
         )
@@ -293,15 +329,19 @@ class VoiceConnection:
     async def handle_flux_event(self, event: dict[str, Any]) -> None:
         await self.send_json(event)
         if event["type"] == "speech.start":
+            self.logger.write("speech.start")
             await self.barge_in(reason="speech_start")
             await self.maybe_start_compaction(reason="speech_start", run_in_background=True)
         elif event["type"] == "speech.resumed":
+            self.logger.write("speech.resumed")
             await self.barge_in(reason="speech_resumed")
         elif event["type"] == "speech.transcript" and event.get("is_final") and event.get("transcript"):
             self.final_transcript = str(event["transcript"]).strip()
+            self.logger.write("speech.transcript.final", transcript_chars=len(self.final_transcript))
         elif event["type"] == "speech.end":
             transcript = str(event.get("transcript") or self.final_transcript).strip()
             self.final_transcript = ""
+            self.logger.write("speech.end", transcript_chars=len(transcript), eager=bool(event.get("eager")))
             if transcript:
                 await self.enqueue_text_turn(transcript, source="voice", eager=bool(event.get("eager")))
 
@@ -326,16 +366,74 @@ class VoiceConnection:
         before_messages = await self.client.messages(session_id)
         tracker = AssistantTextTracker(before_messages)
         await self.send_json({"type": "turn.start", "turn_id": turn_id, "source": source, "text": text, "eager": eager})
-        self.logger.write("turn.start", turn_id=turn_id, source=source, eager=eager, session_id=session_id)
+        self.logger.write(
+            "turn.start",
+            turn_id=turn_id,
+            source=source,
+            eager=eager,
+            session_id=session_id,
+            stream_source="event",
+        )
         try:
-            await self.client.prompt_text(session_id, text, self.config.model, agent=self.config.opencode_agent)
+            await self.run_event_text_turn(
+                session_id=session_id,
+                text=text,
+                before_messages=before_messages,
+                turn_id=turn_id,
+                started=started,
+            )
+            return
+        except OpenCodeEventFallback as exc:
+            if self.active_turn_id != turn_id:
+                return
+            self.logger.write(
+                "opencode.stream.fallback",
+                turn_id=turn_id,
+                reason=exc.reason,
+                prompt_sent=exc.prompt_sent,
+            )
+            await self.send_json(
+                {
+                    "type": "opencode.stream.fallback",
+                    "turn_id": turn_id,
+                    "reason": exc.reason,
+                    "prompt_sent": exc.prompt_sent,
+                }
+            )
+            if exc.prompt_sent:
+                await self.poll_text_turn(
+                    session_id=session_id,
+                    tracker=tracker,
+                    turn_id=turn_id,
+                    started=started,
+                    stream_source="poll_after_event",
+                )
+                return
+
+        try:
+            tracker = await self.prompt_with_overflow_retry(session_id, text, tracker, turn_id)
         except Exception as exc:  # noqa: BLE001 - keep the WebSocket alive and make the failure visible.
             self.active_turn_id = None
             self.logger.write("turn.request.error", turn_id=turn_id, error=repr(exc))
             await self.send_json({"type": "turn.error", "turn_id": turn_id, "message": repr(exc)})
             return
         await self.send_json({"type": "opencode.requested", "turn_id": turn_id})
+        await self.poll_text_turn(
+            session_id=session_id,
+            tracker=tracker,
+            turn_id=turn_id,
+            started=started,
+            stream_source="poll",
+        )
 
+    async def poll_text_turn(
+        self,
+        session_id: str,
+        tracker: AssistantTextTracker,
+        turn_id: int,
+        started: float,
+        stream_source: str,
+    ) -> None:
         chunker = TTSChunker()
         speech_filter = SpeechTextFilter()
         first_text_ms: int | None = None
@@ -373,6 +471,7 @@ class VoiceConnection:
                     turn_id=turn_id,
                     latency_ms=elapsed_ms(started),
                     response_chars=len(update.full_text or full_text),
+                    stream_source=stream_source,
                 )
                 self.active_turn_id = None
                 await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
@@ -383,6 +482,187 @@ class VoiceConnection:
             await self.send_json({"type": "turn.timeout", "turn_id": turn_id})
             self.logger.write("turn.timeout", turn_id=turn_id, latency_ms=elapsed_ms(started))
             self.active_turn_id = None
+
+    async def run_event_text_turn(
+        self,
+        session_id: str,
+        text: str,
+        before_messages: list[dict[str, Any]],
+        turn_id: int,
+        started: float,
+    ) -> None:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        ready = asyncio.Event()
+        reader_task = asyncio.create_task(self.read_opencode_events(session_id, queue, ready))
+        prompt_sent = False
+        try:
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=3)
+            except asyncio.TimeoutError as exc:
+                raise OpenCodeEventFallback("event_stream_open_timeout", prompt_sent=False) from exc
+            self.logger.write("opencode.stream.start", turn_id=turn_id, session_id=session_id)
+            try:
+                await self.client.prompt_async(session_id, text, self.config.model, agent=self.config.opencode_agent)
+            except Exception as exc:  # noqa: BLE001 - prompt_async is optional; fallback preserves old behavior.
+                raise OpenCodeEventFallback(f"prompt_async_error:{type(exc).__name__}", prompt_sent=False) from exc
+            prompt_sent = True
+            await self.send_json({"type": "opencode.requested", "turn_id": turn_id})
+
+            tracker = OpenCodeEventTurnTracker(
+                session_id=session_id,
+                existing_message_ids={
+                    str((message.get("info") or {}).get("id") or "")
+                    for message in before_messages
+                    if isinstance(message, dict)
+                },
+            )
+            chunker = TTSChunker()
+            speech_filter = SpeechTextFilter()
+            first_text_ms: int | None = None
+            full_text = ""
+            last_event_ms = elapsed_ms(started)
+            while self.active_turn_id == turn_id and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=8)
+                except asyncio.TimeoutError as exc:
+                    if first_text_ms is None:
+                        raise OpenCodeEventFallback("event_stream_no_initial_events", prompt_sent=prompt_sent) from exc
+                    raise OpenCodeEventFallback("event_stream_stalled", prompt_sent=prompt_sent) from exc
+                if event.get("type") == "_stream_error":
+                    raise OpenCodeEventFallback(str(event.get("reason") or "event_stream_error"), prompt_sent=prompt_sent)
+                last_event_ms = elapsed_ms(started)
+                update = tracker.update(event)
+                if update.deltas and first_text_ms is None:
+                    first_text_ms = elapsed_ms(started)
+                    await self.send_json({"type": "assistant.first_text", "turn_id": turn_id, "latency_ms": first_text_ms})
+                    self.logger.write("assistant.first_text", turn_id=turn_id, latency_ms=first_text_ms)
+                    self.logger.write("opencode.stream.first_delta", turn_id=turn_id, latency_ms=first_text_ms)
+                for delta in update.deltas:
+                    full_text += delta
+                    await self.send_json({"type": "assistant.delta", "turn_id": turn_id, "delta": delta})
+                    for chunk in chunker.push(speech_filter.push(delta)):
+                        await self.speak(chunk, turn_id=turn_id)
+                if update.completed:
+                    if not update.full_text and not full_text:
+                        raise OpenCodeEventFallback("event_stream_completed_without_text", prompt_sent=prompt_sent)
+                    await self.complete_event_text_turn(
+                        session_id=session_id,
+                        before_messages=before_messages,
+                        turn_id=turn_id,
+                        started=started,
+                        chunker=chunker,
+                        speech_filter=speech_filter,
+                        event_text=update.full_text or full_text,
+                    )
+                    self.logger.write(
+                        "opencode.stream.done",
+                        turn_id=turn_id,
+                        latency_ms=elapsed_ms(started),
+                        last_event_ms=last_event_ms,
+                    )
+                    return
+
+            if self.active_turn_id == turn_id:
+                await self.send_json({"type": "turn.timeout", "turn_id": turn_id})
+                self.logger.write("turn.timeout", turn_id=turn_id, latency_ms=elapsed_ms(started), stream_source="event")
+                self.active_turn_id = None
+        finally:
+            reader_task.cancel()
+            try:
+                await reader_task
+            except asyncio.CancelledError:
+                pass
+
+    async def read_opencode_events(
+        self,
+        session_id: str,
+        queue: asyncio.Queue[dict[str, Any]],
+        ready: asyncio.Event,
+    ) -> None:
+        try:
+            async for event in self.client.events(on_open=ready.set):
+                properties = event_properties(event)
+                if properties.get("sessionID") == session_id:
+                    await queue.put(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - event stream is an optimization; caller falls back.
+            if not ready.is_set():
+                ready.set()
+            await queue.put({"type": "_stream_error", "reason": repr(exc)})
+
+    async def complete_event_text_turn(
+        self,
+        session_id: str,
+        before_messages: list[dict[str, Any]],
+        turn_id: int,
+        started: float,
+        chunker: TTSChunker,
+        speech_filter: SpeechTextFilter,
+        event_text: str,
+    ) -> None:
+        for chunk in chunker.push(speech_filter.flush()) + chunker.flush():
+            await self.speak(chunk, turn_id=turn_id)
+        messages = await self.client.messages(session_id)
+        final_tracker = AssistantTextTracker(before_messages)
+        final_update = final_tracker.update(messages)
+        final_text = final_update.full_text or event_text
+        if final_update.error:
+            await self.send_json({"type": "turn.error", "turn_id": turn_id, "message": str(final_update.error)[:1000]})
+            self.logger.write("turn.error", turn_id=turn_id, error=final_update.error)
+        await self.send_json(
+            {
+                "type": "turn.complete",
+                "turn_id": turn_id,
+                "latency_ms": elapsed_ms(started),
+                "text": final_text,
+            }
+        )
+        self.logger.write(
+            "turn.complete",
+            turn_id=turn_id,
+            latency_ms=elapsed_ms(started),
+            response_chars=len(final_text),
+            stream_source="event",
+        )
+        self.active_turn_id = None
+        await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
+
+    async def prompt_with_overflow_retry(
+        self,
+        session_id: str,
+        text: str,
+        tracker: AssistantTextTracker,
+        turn_id: int,
+    ) -> AssistantTextTracker:
+        overflow_compacted = False
+        while True:
+            try:
+                await self.client.prompt_text(session_id, text, self.config.model, agent=self.config.opencode_agent)
+                return tracker
+            except Exception as exc:  # noqa: BLE001 - only retry known context overflow failures.
+                if overflow_compacted or not is_context_overflow_error(exc):
+                    raise
+                overflow_compacted = True
+                messages = await self.client.messages(session_id)
+                update = tracker.update(messages)
+                before_tokens = max(active_context_estimate(messages).tokens, self.config.context_threshold_tokens)
+                self.logger.write(
+                    "turn.context_overflow",
+                    turn_id=turn_id,
+                    error=repr(exc),
+                    before_tokens=before_tokens,
+                    response_chars=len(update.full_text),
+                )
+                await self.send_json(
+                    {
+                        "type": "turn.context_overflow",
+                        "turn_id": turn_id,
+                        "before_tokens": before_tokens,
+                    }
+                )
+                await self.compact(reason="context_overflow_error", before_tokens=before_tokens)
+                tracker = AssistantTextTracker(await self.client.messages(session_id))
 
     async def speak(self, text: str, turn_id: int) -> None:
         if not os.environ.get("DEEPGRAM_API_KEY"):
@@ -441,14 +721,36 @@ class VoiceConnection:
             return
         try:
             session = await self.client.get_session(self.fork_session_id)
+            messages = await self.client.messages(self.fork_session_id)
         except Exception as exc:  # noqa: BLE001 - status should not break speech.
             self.logger.write("tokens.error", session_id=self.fork_session_id, error=repr(exc))
             return
-        tokens = session_context_tokens(session)
-        await self.send_json({"type": "tokens", "session_id": self.fork_session_id, "context_tokens": tokens})
-        if tokens < self.config.context_threshold_tokens:
+        estimate = active_context_estimate(messages)
+        usage_tokens = session_usage_tokens(session)
+        await self.send_json(
+            {
+                "type": "tokens",
+                "session_id": self.fork_session_id,
+                "context_tokens": estimate.tokens,
+                "context_source": estimate.source,
+                "usage_tokens": usage_tokens,
+                "summary_message_id": estimate.summary_message_id,
+            }
+        )
+        self.logger.write(
+            "tokens.check",
+            session_id=self.fork_session_id,
+            context_tokens=estimate.tokens,
+            context_source=estimate.source,
+            usage_tokens=usage_tokens,
+            summary_message_id=estimate.summary_message_id,
+            measured_message_id=estimate.measured_message_id,
+            included_messages=estimate.included_messages,
+            threshold=self.config.context_threshold_tokens,
+        )
+        if estimate.tokens < self.config.context_threshold_tokens:
             return
-        self.compaction_task = asyncio.create_task(self.compact(reason=reason, before_tokens=tokens))
+        self.compaction_task = asyncio.create_task(self.compact(reason=reason, before_tokens=estimate.tokens))
         if not run_in_background:
             await self.compaction_task
 
@@ -464,14 +766,20 @@ class VoiceConnection:
         try:
             raw = await self.client.summarize(session_id, self.config.model, auto=False)
             after = await self.client.get_session(session_id)
-            after_tokens = session_context_tokens(after)
+            messages = await self.client.messages(session_id)
+            estimate = active_context_estimate(messages)
+            usage_tokens = session_usage_tokens(after)
             latency = elapsed_ms(started)
             self.logger.write(
                 "compaction.complete",
                 session_id=session_id,
                 latency_ms=latency,
                 before_tokens=before_tokens,
-                after_tokens=after_tokens,
+                after_tokens=estimate.tokens,
+                context_source=estimate.source,
+                usage_tokens=usage_tokens,
+                summary_message_id=estimate.summary_message_id,
+                measured_message_id=estimate.measured_message_id,
                 raw=raw,
             )
             await self.send_json(
@@ -480,7 +788,10 @@ class VoiceConnection:
                     "session_id": session_id,
                     "latency_ms": latency,
                     "before_tokens": before_tokens,
-                    "after_tokens": after_tokens,
+                    "after_tokens": estimate.tokens,
+                    "context_source": estimate.source,
+                    "usage_tokens": usage_tokens,
+                    "summary_message_id": estimate.summary_message_id,
                 }
             )
         except Exception as exc:  # noqa: BLE001 - tell UI and keep conversation usable.

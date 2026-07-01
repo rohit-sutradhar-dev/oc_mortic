@@ -5,3 +5,5 @@ __pycache__/
 .pytest_cache/
 data/
 runs/
+_not_needed_for_push/
+node_modules/

@@ -38,7 +38,7 @@ class VoiceConfig:
     model: ModelRef = ModelRef()
     context_threshold_tokens: int = 70_000
     compaction_wait_sec: float = 10.0
-    poll_interval_sec: float = 0.2
+    poll_interval_sec: float = 0.1
     max_turn_sec: float = 300.0
     run_root: str = "runs/voice"
     deepgram_stt_model: str = "flux-general-en"
@@ -114,7 +114,7 @@ def render_opencode_config(
         "small_model": model_name,
         "agent": agent_config,
         "compaction": {
-            "auto": True,
+            "auto": False,
             "prune": True,
             "tail_turns": 2,
             "preserve_recent_tokens": 8000,

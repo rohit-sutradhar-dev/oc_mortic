@@ -70,8 +70,8 @@ async function loadSessions() {
     if (session.is_voice_tmp) continue;
     const option = document.createElement("option");
     option.value = session.id;
-    option.textContent = `${session.title} (${formatNumber(session.context_tokens)} tokens)`;
-    option.dataset.tokens = session.context_tokens;
+    option.textContent = `${session.title} (${formatNumber(session.usage_tokens || session.context_tokens)} usage)`;
+    option.dataset.tokens = session.usage_tokens || session.context_tokens;
     els.sessionSelect.appendChild(option);
   }
   updateSelectedTokens();
@@ -104,7 +104,7 @@ async function handleSocketMessage(event) {
       break;
     case "fork.ready":
       els.statusText.textContent = "Fork ready";
-      els.tokenText.textContent = formatNumber(message.context_tokens);
+      els.tokenText.textContent = `${formatNumber(message.context_tokens)} active`;
       els.startBtn.disabled = true;
       els.stopBtn.disabled = false;
       els.micBtn.disabled = false;
@@ -112,7 +112,7 @@ async function handleSocketMessage(event) {
       append(els.transcript, `Fork: ${message.fork_session_id}\n`);
       break;
     case "tokens":
-      els.tokenText.textContent = formatNumber(message.context_tokens);
+      els.tokenText.textContent = `${formatNumber(message.context_tokens)} active`;
       break;
     case "speech.start":
       append(els.transcript, "Listening\n");
@@ -144,7 +144,7 @@ async function handleSocketMessage(event) {
       break;
     case "compaction.complete":
       els.compactionText.textContent = `${message.latency_ms}ms`;
-      els.tokenText.textContent = formatNumber(message.after_tokens);
+      els.tokenText.textContent = `${formatNumber(message.after_tokens)} active`;
       break;
     case "compaction.error":
       els.compactionText.textContent = "Error";
@@ -238,7 +238,7 @@ function append(element, text) {
 
 function updateSelectedTokens() {
   const selected = els.sessionSelect.selectedOptions[0];
-  els.tokenText.textContent = selected ? formatNumber(selected.dataset.tokens) : "-";
+  els.tokenText.textContent = selected ? `${formatNumber(selected.dataset.tokens)} usage` : "-";
 }
 
 els.sessionSelect.addEventListener("change", updateSelectedTokens);

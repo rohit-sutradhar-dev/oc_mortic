@@ -86,7 +86,7 @@ class FlushLimiter:
 
 
 class TTSChunker:
-    def __init__(self, preferred_chars: int = 220, max_chars: int = 1800) -> None:
+    def __init__(self, preferred_chars: int = 120, max_chars: int = 1200) -> None:
         self.preferred_chars = preferred_chars
         self.max_chars = max_chars
         self.buffer = ""
@@ -140,6 +140,7 @@ class SpeechTextFilter:
     def __init__(self) -> None:
         self.in_fence = False
         self.pending = ""
+        self.early_chars = 120
 
     def push(self, text: str) -> str:
         self.pending += text
@@ -148,7 +149,7 @@ class SpeechTextFilter:
             self.pending = lines.pop()
         else:
             self.pending = ""
-        return "".join(self._filter_line(line) for line in lines)
+        return "".join(self._filter_line(line) for line in lines) + self._drain_pending_prose()
 
     def flush(self) -> str:
         if not self.pending:
@@ -166,11 +167,37 @@ class SpeechTextFilter:
             return ""
         return _sanitize_spoken_line(line)
 
+    def _drain_pending_prose(self) -> str:
+        if not self.pending or self.in_fence:
+            return ""
+        stripped = self.pending.lstrip()
+        if stripped.startswith(("```", "~~~")) or _drop_line_for_speech(self.pending):
+            return ""
+        split_at = _first_sentence_end(self.pending)
+        if split_at is None and len(self.pending) >= self.early_chars:
+            split_at = self.pending.rfind(" ", 0, self.early_chars)
+            if split_at <= 0:
+                split_at = self.early_chars
+        if split_at is None:
+            return ""
+        chunk = self.pending[:split_at]
+        self.pending = self.pending[split_at:].lstrip()
+        return _sanitize_spoken_line(chunk)
+
 
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[\.)]\s+)")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _RAW_URL_RE = re.compile(r"https?://\S+")
+
+
+def _first_sentence_end(text: str) -> int | None:
+    for index, char in enumerate(text):
+        if char in ".!?\n":
+            next_index = index + 1
+            if next_index == len(text) or text[next_index].isspace():
+                return next_index
+    return None
 
 
 def _drop_line_for_speech(line: str) -> bool:

@@ -1,10 +1,42 @@
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
 
 from opencode_voice.config import ModelRef
+
+
+class SSEParser:
+    def __init__(self) -> None:
+        self._data_lines: list[str] = []
+
+    def push_line(self, line: str) -> dict[str, Any] | None:
+        if not line:
+            return self._flush()
+        if line.startswith(":"):
+            return None
+        field, separator, value = line.partition(":")
+        if not separator:
+            return None
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "data":
+            self._data_lines.append(value)
+        return None
+
+    def _flush(self) -> dict[str, Any] | None:
+        if not self._data_lines:
+            return None
+        raw = "\n".join(self._data_lines)
+        self._data_lines.clear()
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return event if isinstance(event, dict) else None
 
 
 class OpenCodeClient:
@@ -83,6 +115,22 @@ class OpenCodeClient:
             "parts": [{"type": "text", "text": text}],
         }
         return await self._post(f"/session/{session_id}/prompt_async", payload)
+
+    async def events(self, on_open: Callable[[], None] | None = None) -> AsyncIterator[dict[str, Any]]:
+        parser = SSEParser()
+        async with self._client.stream(
+            "GET",
+            "/event",
+            headers={"accept": "text/event-stream"},
+            timeout=None,
+        ) as response:
+            response.raise_for_status()
+            if on_open:
+                on_open()
+            async for line in response.aiter_lines():
+                event = parser.push_line(line)
+                if event is not None:
+                    yield event
 
     async def abort(self, session_id: str) -> Any:
         return await self._post(f"/session/{session_id}/abort", {})
