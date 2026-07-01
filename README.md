@@ -7,7 +7,6 @@ Mortic is an OpenCode voice sidepod prototype. The repo now focuses on:
 - `docs/MORTIC_OPENCODE_SIDEPOD_PRD.md`: current product requirements draft.
 - `MORTIC_PLUGIN_HANDOFF.md`: implementation handoff notes connecting the bridge and sidepod.
 
-Benchmarking, DRACO data, previous run logs, and the old Electron reference app have been moved into `_not_needed_for_push/`, which is ignored by Git.
 
 ## Setup
 
