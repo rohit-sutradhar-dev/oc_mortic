@@ -1,6 +1,6 @@
 # Mortic Sidepod Engine Protocol v0
 
-Status: payload examples draft for MOR-163 and MOR-164
+Status: frozen v0 contract for MOR-135
 Date: 2026-07-02
 Source: `docs/MORTIC_PROJECT_EXECUTION_PLAN.md` section 2
 
@@ -9,6 +9,39 @@ Source: `docs/MORTIC_PROJECT_EXECUTION_PLAN.md` section 2
 This document defines concrete JSON examples for the first Sidepod <-> Engine protocol. The protocol is a local control/event contract between the native OpenCode sidepod and the invisible Mortic helper.
 
 Field names use lower camel case. All timestamps are ISO 8601 UTC strings. Identifiers in examples are illustrative and must not be treated as fixed formats unless a later section explicitly says so.
+
+## Contract Freeze
+
+The frozen protocol version tag is `mortic.sidepod.v0`.
+
+Lane negotiation:
+
+- New WP-1 implementations must send `protocolVersion: "mortic.sidepod.v0"` on `start`.
+- The Engine must echo `protocolVersion: "mortic.sidepod.v0"` on `ready` before the sidepod treats the lane as fully connected.
+- After `ready`, messages on the same lane are interpreted as v0 unless a future approved version explicitly changes that rule.
+- If `start` omits `protocolVersion`, the Engine may treat it as v0 for bootstrap compatibility, but should log the omission for developer diagnostics.
+- If the Engine cannot support the requested protocol version, it must emit `voice_bridge_issue` with `diagnosticCode: "protocol_version_unsupported"` and safe user copy only.
+
+Compatibility rules:
+
+- Receivers must ignore unknown fields on known message types.
+- Receivers must log and ignore unknown message types.
+- Missing required fields make a message invalid. The Engine should respond to invalid sidepod commands with `voice_bridge_issue` and `diagnosticCode: "protocol_invalid_message"` when the transport is still usable. The sidepod should ignore invalid Engine events, keep the prior product state, and log a developer-only diagnostic.
+- `sequence` is monotonic within a `turnId` and event type. Stale or duplicate sequence values must not regress sidepod state.
+- Streaming events for inactive or superseded `turnId` values must not replace the active turn display.
+
+Safety rules:
+
+- Engine events must not include secrets, raw provider payloads, provider names, model names, or runtime names for normal UI.
+- Sidepod UI must translate protocol messages into product states and must not display protocol type names directly outside developer-only logs.
+- `assistant.delta` content with `screenOnly: true` must not be sent to TTS.
+
+Change control:
+
+- Post-v0 protocol changes require Platform and Engine owner approval and an update to this document.
+- Adding optional fields is allowed only when both sides can ignore them safely and the field is documented here before use.
+- Adding message types, removing fields, renaming fields, changing required fields, or changing event ordering is a protocol change.
+- For WP-1, both-owner approval is recorded by the user verification review after this document and the MOR-136 fixtures are accepted.
 
 ## Sidepod Commands
 
@@ -28,8 +61,11 @@ Required fields:
 
 Optional fields:
 
-- `protocolVersion`: requested protocol version. In v0 examples this is `mortic.sidepod.v0`.
 - `workspacePath`: current workspace path when OpenCode exposes it.
+
+Contract field:
+
+- `protocolVersion`: requested protocol version. New WP-1 implementations must send `mortic.sidepod.v0`.
 
 Example:
 
@@ -248,7 +284,10 @@ Optional fields:
 
 - `sourceSessionId`: source OpenCode session id associated with the lane.
 - `forkSessionId`: active voice fork id, if already created.
-- `protocolVersion`: helper protocol version.
+
+Contract field:
+
+- `protocolVersion`: helper protocol version. New WP-1 implementations must send `mortic.sidepod.v0`.
 
 Example:
 
