@@ -48,12 +48,29 @@ test("source preserves current sidepod surface hooks", async () => {
 test("source exposes MOR-165 slash and terminal smoke hooks", async () => {
   const src = await readText("src/tui.js");
 
-  assert.match(src, /slash:\s*{\s*name:\s*"mortic"\s*}/);
   assert.match(src, /renderer\.useKittyKeyboard/);
   assert.match(src, /\[mortic smoke\]/);
   assert.match(src, /name:\s*"mortic\.ptt\.press"/);
   assert.match(src, /name:\s*"mortic\.ptt\.release"/);
   assert.match(src, /key:\s*"m",\s*eventType:\s*"release"/);
+});
+
+test("slash registration matches OpenCode 1.17.x reachability rules", async () => {
+  const src = await readText("src/tui.js");
+  const dist = await readText("dist/tui.js");
+
+  for (const body of [src, dist]) {
+    // Slash menu requires a flat slashName on the layer command; the nested
+    // legacy shape `slash: { name }` is only honored by deprecated api.command.
+    assert.match(body, /slashName:\s*"mortic"/);
+    assert.equal(/slash:\s*{/.test(body), false);
+
+    // The palette layer must not be mode-pinned or the prompt's slash menu
+    // treats its commands as unreachable. Only the focus-mode layer pins a mode.
+    const modePins = body.match(/registerLayer\(\{\s*\n\s*mode:/g) ?? [];
+    assert.equal(modePins.length, 1);
+    assert.match(body, /mode:\s*"mortic\.sidepod"/);
+  }
 });
 
 test("normal UI source does not expose provider or runtime names", async () => {

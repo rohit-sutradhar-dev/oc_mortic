@@ -390,9 +390,9 @@ function renderPod(state, actions, theme) {
   );
 }
 
-const plugin = {
-  id: "mortic-sidepod:tui",
-  tui: async (api) => {
+const id = "mortic.sidepod";
+
+export async function tui(api) {
     const [getArmed, setArmed] = createSignal(false);
     const [getLive, setLive] = createSignal(false);
     const [getFocused, setFocused] = createSignal(false);
@@ -531,12 +531,15 @@ const plugin = {
       copy: copyValue
     };
 
+    // Palette layer must stay unpinned: mode-pinned layers are not "reachable"
+    // from the prompt's slash menu, and the slash menu only lists commands
+    // that carry a flat `slashName` (verified against OpenCode 1.17.13).
     api.keymap.registerLayer({
-      mode: "base",
       commands: [
         {
           name: "mortic.focus",
           title: "Mortic: Focus sidepod",
+          desc: "Focus the Mortic sidepod",
           category: "Mortic",
           namespace: "palette",
           run: () => focusMortic("keymap")
@@ -544,8 +547,10 @@ const plugin = {
         {
           name: "mortic.slash",
           title: "Mortic: /mortic",
+          desc: "Focus the Mortic sidepod",
           category: "Mortic",
-          slash: { name: "mortic" },
+          namespace: "palette",
+          slashName: "mortic",
           run: () => focusMortic("slash")
         }
       ],
@@ -608,7 +613,8 @@ const plugin = {
           )
       }
     });
-  }
-};
+}
+
+const plugin = { id, tui };
 
 export default plugin;

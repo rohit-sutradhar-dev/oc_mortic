@@ -18,17 +18,24 @@ This smoke confirms the native sidepod entrypoint and key handling behavior that
 
 The sidepod source now registers:
 
-- `mortic.slash` with `slash: { name: "mortic" }`.
+- `mortic.slash` with a flat `slashName: "mortic"` on an unpinned palette layer.
 - `mortic.ptt.press` for `M` press in `mortic.sidepod` mode.
 - `mortic.ptt.release` for `M` release in `mortic.sidepod` mode.
 
 Smoke hooks emit structured diagnostics with the prefix `[mortic smoke]`. Each focus/key diagnostic includes `useKittyKeyboard`, current mode, event name, and key event type where available.
 
+## Slash Registration Root Cause (2026-07-02 debug session)
+
+`/mortic` initially showed `No matching items` in live OpenCode 1.17.13. Two stacked causes, both fixed and locked in by a package regression test:
+
+1. The prompt slash menu only lists layer commands carrying a flat `slashName` string. The nested `slash: { name }` shape is honored only by the deprecated `api.command` adapter, not by `api.keymap.registerLayer`.
+2. The slash menu queries `getCommandEntries({ visibility: "reachable", namespace: "palette" })`, and a layer pinned to `mode: "base"` is not reachable from the prompt. Internal OpenCode plugins register palette commands on unpinned layers; the sidepod now does the same. Only the focus-mode layer pins `mode: "mortic.sidepod"`.
+
 ## Local Evidence
 
-- `opencode --version` returned `1.17.11`.
-- Installed plugin type surface exposes `TuiCommand.slash?: { name, aliases }`.
-- `npm run check` verifies source and generated `dist/` include the slash and terminal smoke hooks.
+- `opencode --version` returned `1.17.13`.
+- PTY-driven live TUI probe: typing `/mortic` shows `/mortic  Focus the Mortic sidepod` in the slash menu; pressing Enter runs the command without sending a model prompt (no session created, prompt resets).
+- `npm run check` (6 tests) verifies package shape, deprecated-API absence, smoke hooks, and the slash reachability rules above in both `src/` and generated `dist/`.
 - `uv run pytest` remains the repo-wide gate after the sidepod package check.
 
 ## 10-Minute Human Checklist
