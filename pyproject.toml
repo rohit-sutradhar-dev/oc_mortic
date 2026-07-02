@@ -15,3 +15,11 @@ opencode-voice = "opencode_voice.__main__:main"
 
 [tool.setuptools.package-data]
 opencode_voice = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

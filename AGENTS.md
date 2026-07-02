@@ -151,6 +151,12 @@ If Jira updates are not available, include the exact update text in the final re
 
 Use the smallest verification that proves the ticket.
 
+Default local suite:
+
+```bash
+uv run pytest
+```
+
 Examples:
 - Platform UI/state work: sidepod fixture tests, protocol reducer tests, visual snapshots if available.
 - Key/focus work: tests proving `/mortic` is not sent as a prompt and `M` does not leak into OpenCode keymaps.

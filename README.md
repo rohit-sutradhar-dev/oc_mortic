@@ -56,7 +56,7 @@ The current sidepod is a native TUI proof. The PRD describes the intended packag
 ## Tests
 
 ```bash
-python -m unittest tests.test_opencode_voice
+uv run pytest
 ```
 
 ## Repo Notes
