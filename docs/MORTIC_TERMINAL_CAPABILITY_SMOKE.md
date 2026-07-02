@@ -39,6 +39,16 @@ The first human run found typing leaking into the OpenCode prompt during focus m
 2. **M release never fired**: keymap bindings only dispatch on key press — the `{ key: "m", eventType: "release" }` binding was dead code. Release now comes from `api.renderer.keyInput.on("keyrelease", ...)`, which OpenTUI emits when the terminal reports Kitty event types.
 3. **Escape hatch**: if the terminal claims Kitty support but never delivers release events, PTT would stick armed. A second M press now always stops PTT.
 
+## Real-Terminal Tap Result Root Cause (2026-07-02 second live run)
+
+The human matrix run recorded `Tap` in all three Kitty-protocol terminals tested (Ghostty, WezTerm, iTerm2 3.5+) — not the expected `Hold`. A temporary file-based diagnostic sink (not committed; console output in a raw TUI is painted over by screen redraws and never reaches `opencode.log`) confirmed the actual mechanism in Ghostty: `useKittyKeyboard: true`, repeated `raw.keypress` events for `m`, and **zero `raw.keyrelease` events**.
+
+Traced into `@opentui/core`'s renderer (`node_modules/@opentui/core/index-6xr3rbbe.js`): the boolean setter `renderer.useKittyKeyboard = true`, which OpenCode's host calls at startup, only requests Kitty flags `DISAMBIGUATE(1) | ALTERNATE_KEYS(4)`. It never requests `EVENT_TYPES(2)` — the bit that makes a terminal distinguish press from release at all for a plain unmodified key. This was true regardless of terminal; every Kitty-capable terminal was starved of a request it never received, which is why the matrix showed `Tap` across the board rather than a per-terminal split.
+
+Fix: `focusMortic` now calls `renderer.enableKittyKeyboard(DISAMBIGUATE | EVENT_TYPES | ALTERNATE_KEYS)` (flags `= 7`) itself when base Kitty support is present, and `blurMortic` restores the host default (`useKittyKeyboard = true`, flags `= 5`) so unrelated OpenCode keymaps outside Mortic focus mode are unaffected. The double-press escape hatch stays as a safety net for terminals that accept the flag request but still don't honor it.
+
+This was verified against the mechanism (renderer API, flag semantics) and against the previously-passing emulated-Kitty PTY scenario, but **not yet against a real terminal** — the emulator can't fabricate what a real terminal would send in response to the escalated flag request. The terminal matrix below needs to be re-run once more against this build.
+
 ## Local Evidence
 
 - `opencode --version` returned `1.17.13`.
@@ -46,7 +56,7 @@ The first human run found typing leaking into the OpenCode prompt during focus m
   - `/mortic` appears in the slash menu and runs without sending a model prompt.
   - Typing lock: printable probe text does not reach the prompt in focus mode; typing works again after `Esc`.
   - M press arms (`Hold-M push-to-talk is active.`), Kitty release stops (`Push-to-talk released.`, deck `OFF`), re-arm works, and a second press without release stops (`Push-to-talk stopped.`).
-- `npm run check` (7 tests) locks the slash reachability rules, the keyrelease-listener mechanism, and the typing-lock guards in both `src/` and generated `dist/`.
+- `npm run check` (8 tests) locks the slash reachability rules, the keyrelease-listener mechanism, the typing-lock guards, and the Kitty `EVENT_TYPES` flag escalation in both `src/` and generated `dist/`.
 - `uv run pytest` remains the repo-wide gate after the sidepod package check.
 
 ## 10-Minute Human Checklist
@@ -66,14 +76,14 @@ The first human run found typing leaking into the OpenCode prompt during focus m
 
 | Terminal | Expected Mode | Expected `useKittyKeyboard` | Human Result | Notes |
 | --- | --- | --- | --- | --- |
-| PTY probe (emulated Kitty, machine) | Hold-`M` | `true` | Pass 2026-07-02 | Press arms, release stops, double-press escape hatch stops. |
-| Ghostty | Hold-`M` | `true` | Pending | Verify press and release diagnostics. |
+| PTY probe (emulated Kitty, machine) | Hold-`M` | `true` | Pass 2026-07-02 | Press arms, release stops, double-press escape hatch stops. Re-verified after the flag-escalation fix. |
+| Ghostty | Hold-`M` | `true` | Pending re-test | Was `Tap` pre-fix (flags never requested EVENT_TYPES). Re-run against the flag-escalation build. |
 | Kitty | Hold-`M` | `true` | Pending | Verify press and release diagnostics. |
-| WezTerm | Hold-`M` | `true` | Pending | Verify press and release diagnostics. |
-| iTerm2 3.5+ | Hold-`M` | `true` | Pending | Kitty keyboard protocol must be enabled by terminal/app version. |
+| WezTerm | Hold-`M` | `true` | Pending re-test | Was `Tap` pre-fix. Re-run against the flag-escalation build. |
+| iTerm2 3.5+ | Hold-`M` | `true` | Pending re-test | Was `Tap` pre-fix. Re-run against the flag-escalation build. |
 | Alacritty 0.13+ | Hold-`M` | `true` | Pending | Verify press and release diagnostics if available locally. |
-| macOS Terminal.app | Tap fallback | `false` | Pending | Release diagnostics are not expected; M press should toggle tap mode. |
+| macOS Terminal.app | Tap fallback | `false` | Tap | Confirmed pre-fix; Terminal.app has no Kitty support so this result is unaffected by the fix. |
 
 ## Completion Rule
 
-MOR-165 should remain In Progress until at least one Kitty-protocol terminal and macOS Terminal.app are run by a human and the matrix above is updated with observed results.
+MOR-165 should remain In Progress until at least one Kitty-protocol terminal shows `Hold` against the flag-escalation build (Ghostty is the cheapest re-test since it was already exercised once) and macOS Terminal.app is confirmed `Tap`.

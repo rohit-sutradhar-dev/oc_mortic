@@ -325,6 +325,39 @@ function copyToClipboard(value) {
   return false;
 }
 
+// Kitty progressive-enhancement flags (https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
+// OpenCode's own `renderer.useKittyKeyboard = true` only requests
+// DISAMBIGUATE(1) | ALTERNATE_KEYS(4) — it never asks for EVENT_TYPES(2),
+// so terminals never report a release for a plain unmodified key like `m`.
+// Mortic focus mode escalates to request event types too, then restores the
+// host default on blur so unrelated OpenCode keymaps are unaffected.
+const KITTY_FLAG_DISAMBIGUATE = 1;
+const KITTY_FLAG_EVENT_TYPES = 2;
+const KITTY_FLAG_ALTERNATE_KEYS = 4;
+const MORTIC_KITTY_FLAGS = KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_EVENT_TYPES | KITTY_FLAG_ALTERNATE_KEYS;
+
+function requestPttReleaseReporting(api) {
+  if (!api.renderer.useKittyKeyboard || typeof api.renderer.enableKittyKeyboard !== "function") {
+    return;
+  }
+  try {
+    api.renderer.enableKittyKeyboard(MORTIC_KITTY_FLAGS);
+  } catch {
+    // best-effort: fall back to whatever flags the host already negotiated
+  }
+}
+
+function restoreHostKittyFlags(api) {
+  if (typeof api.renderer.enableKittyKeyboard !== "function") {
+    return;
+  }
+  try {
+    api.renderer.useKittyKeyboard = true;
+  } catch {
+    // best-effort restore
+  }
+}
+
 function keyboardMode(api) {
   return api.renderer.useKittyKeyboard ? "hold" : "tap";
 }
@@ -428,6 +461,7 @@ export async function tui(api) {
           previousFocus = api.renderer.currentFocusedRenderable ?? undefined;
           previousFocus?.blur?.();
         }
+        requestPttReleaseReporting(api);
         setFocused(true);
         recordSmoke("focus", { source, pttMode: keyboardMode(api), typingLockProbe: "type printable keys after focus" });
         setEvent(source === "slash" ? "slash focus" : "focus mode");
@@ -440,6 +474,7 @@ export async function tui(api) {
         }
         previousFocus?.focus?.();
         previousFocus = undefined;
+        restoreHostKittyFlags(api);
         setFocused(false);
         setEvent("prompt mode");
       });

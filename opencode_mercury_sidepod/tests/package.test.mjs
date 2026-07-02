@@ -71,6 +71,23 @@ test("focus mode locks typing and hears M release via key input stream", async (
   }
 });
 
+test("focus mode escalates Kitty flags to request real M release events", async () => {
+  const src = await readText("src/tui.js");
+  const dist = await readText("dist/tui.js");
+
+  for (const body of [src, dist]) {
+    // OpenCode's own `useKittyKeyboard = true` only requests
+    // DISAMBIGUATE(1) | ALTERNATE_KEYS(4) = 5, which never includes
+    // EVENT_TYPES(2), so terminals never report a release for a plain
+    // unmodified key. Mortic focus mode must ask for EVENT_TYPES itself.
+    assert.match(body, /KITTY_FLAG_EVENT_TYPES\s*=\s*2/);
+    assert.match(body, /enableKittyKeyboard/);
+    // Escalation and restoration both live on the focus/blur transitions.
+    assert.match(body, /requestPttReleaseReporting\(api\)/);
+    assert.match(body, /restoreHostKittyFlags\(api\)/);
+  }
+});
+
 test("slash registration matches OpenCode 1.17.x reachability rules", async () => {
   const src = await readText("src/tui.js");
   const dist = await readText("dist/tui.js");
