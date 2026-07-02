@@ -1,6 +1,6 @@
 # Mortic Sidepod Engine Protocol v0
 
-Status: command payload draft for MOR-163
+Status: payload examples draft for MOR-163 and MOR-164
 Date: 2026-07-02
 Source: `docs/MORTIC_PROJECT_EXECUTION_PLAN.md` section 2
 
@@ -229,5 +229,283 @@ Example:
 
 ## Engine Events
 
-Engine-to-sidepod event payloads are documented by MOR-164.
+Engine events are sent from the helper to the OpenCode TUI sidepod.
 
+Streaming events that belong to a turn must include `turnId`. Repeated updates for a turn should include monotonically increasing `sequence` values per event type where ordering matters. Sidepod renderers must ignore stale turn ids when a newer active turn has superseded them.
+
+### `ready`
+
+Sent when the helper is connected and can accept sidepod controls.
+
+Required fields:
+
+- `type`: `ready`
+- `sentAt`: helper timestamp.
+- `voiceLaneId`: active voice lane id.
+- `state`: high-level state, normally `ready`.
+
+Optional fields:
+
+- `sourceSessionId`: source OpenCode session id associated with the lane.
+- `forkSessionId`: active voice fork id, if already created.
+- `protocolVersion`: helper protocol version.
+
+Example:
+
+```json
+{
+  "type": "ready",
+  "sentAt": "2026-07-02T04:00:00.500Z",
+  "protocolVersion": "mortic.sidepod.v0",
+  "voiceLaneId": "lane_123",
+  "state": "ready",
+  "sourceSessionId": "ses_source_123",
+  "forkSessionId": "ses_voice_tmp_456"
+}
+```
+
+### `listening`
+
+Sent when STT is actively accepting audio.
+
+Required fields:
+
+- `type`: `listening`
+- `sentAt`: helper timestamp.
+- `voiceLaneId`: active voice lane id.
+- `mode`: `ptt` or `live`.
+
+Optional fields:
+
+- `turnId`: active turn id if listening belongs to a specific turn.
+
+Example:
+
+```json
+{
+  "type": "listening",
+  "sentAt": "2026-07-02T04:00:01.100Z",
+  "voiceLaneId": "lane_123",
+  "mode": "ptt",
+  "turnId": "turn_0001"
+}
+```
+
+### `transcript`
+
+Sent for interim and final STT transcript updates.
+
+Required fields:
+
+- `type`: `transcript`
+- `sentAt`: helper timestamp.
+- `turnId`: active turn id.
+- `sequence`: transcript update sequence within the turn.
+- `text`: transcript text.
+- `final`: whether this transcript is final for the turn.
+
+Optional fields:
+
+- `confidence`: recognizer confidence when available.
+- `timing`: safe timing metadata.
+
+Example:
+
+```json
+{
+  "type": "transcript",
+  "sentAt": "2026-07-02T04:00:02.000Z",
+  "turnId": "turn_0001",
+  "sequence": 1,
+  "text": "Make the test output easier to scan.",
+  "final": false,
+  "confidence": 0.91,
+  "timing": {
+    "firstTranscriptMs": 420
+  }
+}
+```
+
+### `thinking`
+
+Sent after the final user transcript is submitted to the voice fork and before assistant speech begins.
+
+Required fields:
+
+- `type`: `thinking`
+- `sentAt`: helper timestamp.
+- `turnId`: active turn id.
+- `sourceMode`: `ptt` or `live`.
+
+Optional fields:
+
+- `voiceLaneId`: active voice lane id.
+- `submittedTextChars`: character count of submitted user text, not the raw text.
+
+Example:
+
+```json
+{
+  "type": "thinking",
+  "sentAt": "2026-07-02T04:00:04.300Z",
+  "turnId": "turn_0001",
+  "sourceMode": "ptt",
+  "voiceLaneId": "lane_123",
+  "submittedTextChars": 36
+}
+```
+
+### `assistant.delta`
+
+Sent for streamed assistant text that COMMS can render as the current Mortic response.
+
+Required fields:
+
+- `type`: `assistant.delta`
+- `sentAt`: helper timestamp.
+- `turnId`: active turn id.
+- `sequence`: assistant delta sequence within the turn.
+- `delta`: text delta.
+
+Optional fields:
+
+- `screenOnly`: whether the delta is safe only for screen rendering and must not be fed to TTS.
+
+Example:
+
+```json
+{
+  "type": "assistant.delta",
+  "sentAt": "2026-07-02T04:00:04.900Z",
+  "turnId": "turn_0001",
+  "sequence": 1,
+  "delta": "I will tighten the failure summary and keep the detailed output in the thread.",
+  "screenOnly": false
+}
+```
+
+### `speaking`
+
+Sent when TTS has started or is actively playing.
+
+Required fields:
+
+- `type`: `speaking`
+- `sentAt`: helper timestamp.
+- `turnId`: active turn id.
+
+Optional fields:
+
+- `voiceLaneId`: active voice lane id.
+- `firstAudioLatencyMs`: latency from turn start to first playable audio.
+
+Example:
+
+```json
+{
+  "type": "speaking",
+  "sentAt": "2026-07-02T04:00:05.300Z",
+  "turnId": "turn_0001",
+  "voiceLaneId": "lane_123",
+  "firstAudioLatencyMs": 1320
+}
+```
+
+### `complete`
+
+Sent when a turn finishes.
+
+Required fields:
+
+- `type`: `complete`
+- `sentAt`: helper timestamp.
+- `turnId`: completed turn id.
+- `latency`: safe timing summary.
+
+Optional fields:
+
+- `fullSpokenText`: final speakable text if available.
+- `tokenSummary`: safe token summary for diagnostics or logs. Do not include provider payloads.
+- `streamSource`: `event`, `poll`, or `poll_after_event`.
+
+Example:
+
+```json
+{
+  "type": "complete",
+  "sentAt": "2026-07-02T04:00:08.000Z",
+  "turnId": "turn_0001",
+  "fullSpokenText": "I tightened the failure summary and kept the details in the thread.",
+  "latency": {
+    "firstTranscriptMs": 420,
+    "firstAssistantTextMs": 900,
+    "firstAudioMs": 1320,
+    "totalMs": 7000
+  },
+  "tokenSummary": {
+    "contextTokens": 18500,
+    "source": "assistant_input"
+  },
+  "streamSource": "event"
+}
+```
+
+### `interrupted`
+
+Sent when active speech or an active turn is interrupted.
+
+Required fields:
+
+- `type`: `interrupted`
+- `sentAt`: helper timestamp.
+- `reason`: interruption reason.
+
+Optional fields:
+
+- `turnId`: affected turn id, if known.
+- `voiceLaneId`: active voice lane id.
+
+Example:
+
+```json
+{
+  "type": "interrupted",
+  "sentAt": "2026-07-02T04:00:06.500Z",
+  "turnId": "turn_0001",
+  "voiceLaneId": "lane_123",
+  "reason": "barge_in"
+}
+```
+
+### `voice_bridge_issue`
+
+Sent when the helper cannot proceed safely. The payload separates user-facing copy from diagnostics.
+
+Required fields:
+
+- `type`: `voice_bridge_issue`
+- `sentAt`: helper timestamp.
+- `userMessage`: safe product copy. For bridge failures this must be `Voice Bridge Issue`.
+- `diagnosticCode`: stable diagnostic code for logs and support.
+- `retryable`: whether Refresh or reconnect may recover.
+
+Optional fields:
+
+- `safeDetail`: concise user-safe detail such as `Mic permission needed`.
+- `voiceLaneId`: active voice lane id, if known.
+- `debugRef`: opaque local log or run reference. Do not include secrets, raw provider payloads, or model/provider/runtime names.
+
+Example:
+
+```json
+{
+  "type": "voice_bridge_issue",
+  "sentAt": "2026-07-02T04:00:09.000Z",
+  "userMessage": "Voice Bridge Issue",
+  "safeDetail": "Mic permission needed",
+  "diagnosticCode": "mic_permission_needed",
+  "retryable": true,
+  "voiceLaneId": "lane_123",
+  "debugRef": "run_20260702T040000Z"
+}
+```
