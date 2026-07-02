@@ -1,0 +1,330 @@
+{
+  "protocolVersion": "mortic.sidepod.v0",
+  "description": "Canonical WP-1 fixture set for the frozen Mortic Sidepod <-> Engine protocol v0.",
+  "commands": [
+    {
+      "name": "start",
+      "message": {
+        "type": "start",
+        "protocolVersion": "mortic.sidepod.v0",
+        "clientEventId": "evt_sidepod_0001",
+        "sentAt": "2026-07-02T04:00:00.000Z",
+        "sourceSessionId": "ses_source_123",
+        "keepFork": false,
+        "workspacePath": "/Users/aeroknight/Documents/Fusion Self Benchmarking"
+      }
+    },
+    {
+      "name": "ptt.start",
+      "message": {
+        "type": "ptt.start",
+        "clientEventId": "evt_sidepod_0002",
+        "sentAt": "2026-07-02T04:00:01.000Z",
+        "turnId": "turn_0001",
+        "inputMode": "ptt",
+        "key": "M",
+        "eventType": "press",
+        "terminalSupportsKeyRelease": true
+      }
+    },
+    {
+      "name": "ptt.stop",
+      "message": {
+        "type": "ptt.stop",
+        "clientEventId": "evt_sidepod_0003",
+        "matchingStartEventId": "evt_sidepod_0002",
+        "sentAt": "2026-07-02T04:00:04.000Z",
+        "turnId": "turn_0001",
+        "reason": "key.release",
+        "eventType": "release"
+      }
+    },
+    {
+      "name": "live.set",
+      "message": {
+        "type": "live.set",
+        "clientEventId": "evt_sidepod_0004",
+        "sentAt": "2026-07-02T04:00:10.000Z",
+        "value": true,
+        "reason": "user.toggle"
+      }
+    },
+    {
+      "name": "refresh",
+      "message": {
+        "type": "refresh",
+        "clientEventId": "evt_sidepod_0005",
+        "sentAt": "2026-07-02T04:01:00.000Z",
+        "reason": "user.confirmed_refresh",
+        "voiceLaneId": "lane_123",
+        "sourceSessionId": "ses_source_123",
+        "confirmedByPromptId": "prompt_refresh_0001"
+      }
+    },
+    {
+      "name": "barge_in",
+      "message": {
+        "type": "barge_in",
+        "clientEventId": "evt_sidepod_0006",
+        "sentAt": "2026-07-02T04:01:30.000Z",
+        "reason": "user.started_speaking",
+        "turnId": "turn_0001",
+        "voiceLaneId": "lane_123"
+      }
+    },
+    {
+      "name": "confirm.response",
+      "message": {
+        "type": "confirm.response",
+        "clientEventId": "evt_sidepod_0007",
+        "sentAt": "2026-07-02T04:01:31.000Z",
+        "promptId": "prompt_refresh_0001",
+        "actionId": "refresh",
+        "confirmed": true,
+        "voiceLaneId": "lane_123"
+      }
+    }
+  ],
+  "events": [
+    {
+      "name": "ready",
+      "message": {
+        "type": "ready",
+        "sentAt": "2026-07-02T04:00:00.500Z",
+        "protocolVersion": "mortic.sidepod.v0",
+        "voiceLaneId": "lane_123",
+        "state": "ready",
+        "sourceSessionId": "ses_source_123",
+        "forkSessionId": "ses_voice_tmp_456"
+      }
+    },
+    {
+      "name": "listening",
+      "message": {
+        "type": "listening",
+        "sentAt": "2026-07-02T04:00:01.100Z",
+        "voiceLaneId": "lane_123",
+        "mode": "ptt",
+        "turnId": "turn_0001"
+      }
+    },
+    {
+      "name": "transcript",
+      "message": {
+        "type": "transcript",
+        "sentAt": "2026-07-02T04:00:02.000Z",
+        "turnId": "turn_0001",
+        "sequence": 1,
+        "text": "Make the test output easier to scan.",
+        "final": false,
+        "confidence": 0.91,
+        "timing": {
+          "firstTranscriptMs": 420
+        }
+      }
+    },
+    {
+      "name": "thinking",
+      "message": {
+        "type": "thinking",
+        "sentAt": "2026-07-02T04:00:04.300Z",
+        "turnId": "turn_0001",
+        "sourceMode": "ptt",
+        "voiceLaneId": "lane_123",
+        "submittedTextChars": 36
+      }
+    },
+    {
+      "name": "assistant.delta",
+      "message": {
+        "type": "assistant.delta",
+        "sentAt": "2026-07-02T04:00:04.900Z",
+        "turnId": "turn_0001",
+        "sequence": 1,
+        "delta": "I will tighten the failure summary and keep the detailed output in the thread.",
+        "screenOnly": false
+      }
+    },
+    {
+      "name": "speaking",
+      "message": {
+        "type": "speaking",
+        "sentAt": "2026-07-02T04:00:05.300Z",
+        "turnId": "turn_0001",
+        "voiceLaneId": "lane_123",
+        "firstAudioLatencyMs": 1320
+      }
+    },
+    {
+      "name": "complete",
+      "message": {
+        "type": "complete",
+        "sentAt": "2026-07-02T04:00:08.000Z",
+        "turnId": "turn_0001",
+        "fullSpokenText": "I tightened the failure summary and kept the details in the thread.",
+        "latency": {
+          "firstTranscriptMs": 420,
+          "firstAssistantTextMs": 900,
+          "firstAudioMs": 1320,
+          "totalMs": 7000
+        },
+        "tokenSummary": {
+          "contextTokens": 18500,
+          "source": "assistant_input"
+        },
+        "streamSource": "event"
+      }
+    },
+    {
+      "name": "interrupted",
+      "message": {
+        "type": "interrupted",
+        "sentAt": "2026-07-02T04:00:06.500Z",
+        "turnId": "turn_0001",
+        "voiceLaneId": "lane_123",
+        "reason": "barge_in"
+      }
+    },
+    {
+      "name": "voice_bridge_issue",
+      "message": {
+        "type": "voice_bridge_issue",
+        "sentAt": "2026-07-02T04:00:09.000Z",
+        "userMessage": "Voice Bridge Issue",
+        "safeDetail": "Mic permission needed",
+        "diagnosticCode": "mic_permission_needed",
+        "retryable": true,
+        "voiceLaneId": "lane_123",
+        "debugRef": "run_20260702T040000Z"
+      }
+    }
+  ],
+  "screenOnlyExamples": [
+    {
+      "name": "code_block_delta",
+      "category": "code",
+      "message": {
+        "type": "assistant.delta",
+        "sentAt": "2026-07-02T04:00:05.000Z",
+        "turnId": "turn_0001",
+        "sequence": 2,
+        "delta": "```python\nprint('hello from the fixture')\n```",
+        "screenOnly": true
+      }
+    },
+    {
+      "name": "command_output_delta",
+      "category": "output",
+      "message": {
+        "type": "assistant.delta",
+        "sentAt": "2026-07-02T04:00:05.100Z",
+        "turnId": "turn_0001",
+        "sequence": 3,
+        "delta": "$ uv run pytest\n21 passed in 0.03s",
+        "screenOnly": true
+      }
+    },
+    {
+      "name": "diff_delta",
+      "category": "diff",
+      "message": {
+        "type": "assistant.delta",
+        "sentAt": "2026-07-02T04:00:05.200Z",
+        "turnId": "turn_0001",
+        "sequence": 4,
+        "delta": "@@ -1,2 +1,2 @@\n-old copy\n+new copy",
+        "screenOnly": true
+      }
+    },
+    {
+      "name": "path_delta",
+      "category": "path",
+      "message": {
+        "type": "assistant.delta",
+        "sentAt": "2026-07-02T04:00:05.300Z",
+        "turnId": "turn_0001",
+        "sequence": 5,
+        "delta": "/Users/aeroknight/Documents/Fusion Self Benchmarking/docs/MORTIC_PROTOCOL_V0.md",
+        "screenOnly": true
+      }
+    },
+    {
+      "name": "json_delta",
+      "category": "json",
+      "message": {
+        "type": "assistant.delta",
+        "sentAt": "2026-07-02T04:00:05.400Z",
+        "turnId": "turn_0001",
+        "sequence": 6,
+        "delta": "{\"type\":\"ready\",\"state\":\"ready\"}",
+        "screenOnly": true
+      }
+    }
+  ],
+  "turnTrace": [
+    {
+      "direction": "sidepod_to_engine",
+      "fixture": "start"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "ready"
+    },
+    {
+      "direction": "sidepod_to_engine",
+      "fixture": "ptt.start"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "listening"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "transcript"
+    },
+    {
+      "direction": "sidepod_to_engine",
+      "fixture": "ptt.stop"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "thinking"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "assistant.delta"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "speaking"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "complete"
+    },
+    {
+      "direction": "sidepod_to_engine",
+      "fixture": "live.set"
+    },
+    {
+      "direction": "sidepod_to_engine",
+      "fixture": "barge_in"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "interrupted"
+    },
+    {
+      "direction": "sidepod_to_engine",
+      "fixture": "confirm.response"
+    },
+    {
+      "direction": "sidepod_to_engine",
+      "fixture": "refresh"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "voice_bridge_issue"
+    }
+  ]
+}

@@ -14,6 +14,8 @@ Field names use lower camel case. All timestamps are ISO 8601 UTC strings. Ident
 
 The frozen protocol version tag is `mortic.sidepod.v0`.
 
+Machine-readable fixtures for this contract live in `tests/fixtures/protocol_v0_messages.json`. The pytest validator in `tests/test_protocol_v0_fixtures.py` checks message coverage, required fields, version tags, turn-trace references, and screen-only examples.
+
 Lane negotiation:
 
 - New WP-1 implementations must send `protocolVersion: "mortic.sidepod.v0"` on `start`.
