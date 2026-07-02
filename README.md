@@ -5,6 +5,7 @@ Mortic is an OpenCode voice sidepod prototype. The repo now focuses on:
 - `opencode_voice/`: Python/FastAPI voice bridge for OpenCode, Mercury/Inception, and Deepgram.
 - `opencode_mercury_sidepod/`: native OpenCode TUI sidepod proof.
 - `docs/MORTIC_OPENCODE_SIDEPOD_PRD.md`: current product requirements draft.
+- `docs/MORTIC_CURRENT_CODE_INVENTORY.md`: shared inventory of reusable code, reference-only pieces, ownership mapping, and latency-sensitive paths.
 - `MORTIC_PLUGIN_HANDOFF.md`: implementation handoff notes connecting the bridge and sidepod.
 
 
