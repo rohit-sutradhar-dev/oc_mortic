@@ -1,0 +1,54 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+
+const rootDir = fileURLToPath(new URL("..", import.meta.url));
+
+async function readPackageJson() {
+  return JSON.parse(await readFile(join(rootDir, "package.json"), "utf8"));
+}
+
+async function readText(path) {
+  return readFile(join(rootDir, path), "utf8");
+}
+
+test("package remains installable as an OpenCode TUI plugin", async () => {
+  const pkg = await readPackageJson();
+
+  assert.equal(pkg.type, "module");
+  assert.equal(pkg.main, "dist/index.js");
+  assert.deepEqual(pkg["oc-plugin"], ["tui"]);
+  assert.deepEqual(pkg.exports["."], { import: "./dist/index.js" });
+  assert.deepEqual(pkg.exports["./tui"], { import: "./dist/tui.js" });
+  assert.ok(pkg.files.includes("dist"));
+});
+
+test("source and generated dist avoid deprecated command API", async () => {
+  const src = await readText("src/tui.js");
+  const dist = await readText("dist/tui.js");
+
+  for (const body of [src, dist]) {
+    assert.equal(body.includes("api.command"), false);
+    assert.match(body, /api\.keymap\.registerLayer/);
+    assert.match(body, /api\.mode\.push\("mortic\.sidepod"\)/);
+    assert.match(body, /sidebar_content/);
+  }
+});
+
+test("source preserves current sidepod surface hooks", async () => {
+  const src = await readText("src/tui.js");
+
+  for (const expectedText of ["MORTIC", "COMMAND DECK", "COMMS", "Transcript", "Handoff", "Push to Talk"]) {
+    assert.match(src, new RegExp(expectedText));
+  }
+});
+
+test("normal UI source does not expose provider or runtime names", async () => {
+  const src = await readText("src/tui.js");
+
+  for (const forbidden of ["Mercury", "mercury", "Inception", "Deepgram", "runtime"]) {
+    assert.equal(src.includes(forbidden), false);
+  }
+});

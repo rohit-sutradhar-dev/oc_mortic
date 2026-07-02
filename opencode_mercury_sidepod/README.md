@@ -2,6 +2,20 @@
 
 Native OpenCode TUI sidebar proof for Mortic voice control.
 
+Tested against OpenCode 1.17.11 and the `@opencode-ai/plugin` 1.17.8 type surface. The plugin uses `api.keymap.registerLayer` for commands; `api.command` is deprecated for OpenCode v2 and is not used.
+
+Build from source:
+
+```bash
+npm run build
+```
+
+Run the package fixture tests:
+
+```bash
+npm test
+```
+
 Install locally:
 
 ```bash

@@ -6,6 +6,11 @@
   "type": "module",
   "main": "dist/index.js",
   "oc-plugin": ["tui"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "npm run build && npm test"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js"
@@ -14,7 +19,7 @@
       "import": "./dist/tui.js"
     }
   },
-  "files": ["dist"],
+  "files": ["dist", "README.md"],
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.4.0",
     "@opentui/solid": ">=0.1.0",

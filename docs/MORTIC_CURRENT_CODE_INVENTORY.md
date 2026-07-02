@@ -39,11 +39,11 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 
 ### Platform-Reusable
 
-- `opencode_mercury_sidepod/dist/tui.js`
-  - Reusable TUI frame helpers, text wrapping, sidebar slot registration, command-palette registration, mode push/pop pattern, popup host pattern, transcript/handoff draft rendering, clipboard attempt, and pulsing braille sprite approach.
+- `opencode_mercury_sidepod/src/tui.js`
+  - Reusable TUI frame helpers, text wrapping, sidebar slot registration, keymap layer registration, mode push/pop pattern, popup host pattern, transcript/handoff draft rendering, clipboard attempt, and pulsing braille sprite approach.
   - The sprite host and terminal frame direction match the PRD better than the browser UI does.
 - `opencode_mercury_sidepod/package.json`
-  - Reusable OpenCode TUI plugin packaging metadata: `oc-plugin: ["tui"]`, package export shape, and peer dependency surface.
+  - Reusable OpenCode TUI plugin packaging metadata: `oc-plugin: ["tui"]`, package export shape, build/test commands, and peer dependency surface.
 
 ## Reference-Only Or Throwaway Pieces
 
@@ -53,8 +53,8 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 - Current WebSocket control/event names in `opencode_voice/server.py` and `static/app.js`
   - Current names include `audio.start`, `audio.stop`, `turn.start`, `fork.ready`, `tts.first_audio`, `barge_in`, and generic `error`.
   - These need mapping or replacement with the PRD v0 protocol: `start`, `ptt.start`, `ptt.stop`, `live.set`, `refresh`, `barge_in`, `confirm.response`, plus `ready`, `listening`, `transcript`, `thinking`, `assistant.delta`, `speaking`, `complete`, `interrupted`, and `voice_bridge_issue`.
-- Current sidepod command deck diagnostics in `dist/tui.js`
-  - `runtime mercury-2`, `last`, and `items` are diagnostics/provider details and should not ship in normal UI.
+- Current sidepod command deck diagnostics in `opencode_mercury_sidepod/src/tui.js` and generated `dist/tui.js`
+  - `last` and `items` are diagnostics and should not ship in normal UI.
   - `Clear Lane` should become confirmed `Refresh`.
   - Current PTT key is `p`; PRD requires isolated `M` behavior where OpenCode supports it.
   - Current focus binding is `ctrl+x v`; PRD requires `/mortic` focus without sending a prompt.
@@ -88,8 +88,9 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 
 Start from:
 
-- `opencode_mercury_sidepod/dist/tui.js`
+- `opencode_mercury_sidepod/src/tui.js`
 - `opencode_mercury_sidepod/package.json`
+- `opencode_mercury_sidepod/tests/package.test.mjs`
 - PRD sections for sidepod layout, command deck, COMMS, Transcript, Handoff, Config, `/mortic`, and key isolation
 
 Platform-owned next work:
@@ -164,8 +165,8 @@ Shared-owned next work:
 - Packaged UI mismatch: current browser UI exposes thread selection, typed fallback, model/provider details, and visible browser/iframe surface, all non-goals for packaged v1.
 - Helper mismatch: current bridge is a FastAPI browser app, not yet an invisible helper/runtime artifact.
 - Native mic gap: current mic capture is browser-based; Engine still needs OS-native capture or an approved helper plan.
-- Sidepod source gap: sidepod code is tracked as `dist/` only. If this remains the editable source, tests and maintainability will be thin.
-- Sidepod test gap: there are no TUI fixture or snapshot tests yet.
+- Sidepod source gap: MOR-166 adds `opencode_mercury_sidepod/src/`; keep generated `dist/` synchronized with `npm run build`.
+- Sidepod test gap: MOR-166 adds package fixture tests; deeper TUI snapshot tests are still needed before larger visual changes.
 - Source-thread safety gap: fork cleanup exists, but tests do not yet prove source OpenCode thread remains untouched after a voice turn.
 - Secret/logging audit gap: tests cover config env placeholders, but logs and raw provider/OpenCode payload fields still need a broader redaction review before beta.
 
@@ -176,4 +177,3 @@ Shared-owned next work:
 - `MOR-129`: capture the current browser-backed path as the reference latency baseline using first transcript, first assistant text, first TTS audio, total turn, retry/fallback source, and test conditions.
 - `MOR-135`: freeze the v0 protocol and explicitly map or replace current bridge event names.
 - `MOR-136`: build shared fixtures from the existing unit-tested event shapes plus new PRD v0 examples.
-
