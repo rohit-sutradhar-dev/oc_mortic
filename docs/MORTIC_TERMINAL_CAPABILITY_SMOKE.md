@@ -31,11 +31,22 @@ Smoke hooks emit structured diagnostics with the prefix `[mortic smoke]`. Each f
 1. The prompt slash menu only lists layer commands carrying a flat `slashName` string. The nested `slash: { name }` shape is honored only by the deprecated `api.command` adapter, not by `api.keymap.registerLayer`.
 2. The slash menu queries `getCommandEntries({ visibility: "reachable", namespace: "palette" })`, and a layer pinned to `mode: "base"` is not reachable from the prompt. Internal OpenCode plugins register palette commands on unpinned layers; the sidepod now does the same. Only the focus-mode layer pins `mode: "mortic.sidepod"`.
 
+## Typing Lock And M Release Root Cause (2026-07-02 live run)
+
+The first human run found typing leaking into the OpenCode prompt during focus mode, and hold-M never releasing. Causes and fixes, verified in a PTY-driven live session with emulated Kitty key events:
+
+1. **Typing leak**: pushing the `mortic.sidepod` mode scopes keymap bindings but the prompt input keeps renderable focus, so unbound printables still landed in it. Fixed two ways: `focusMortic` parks `renderer.currentFocusedRenderable` (blur, restore on exit), and a prepended global `keypress` guard calls `preventDefault`/`stopPropagation` on unbound, unmodified keys while focus mode is active (renderable handlers skip defaultPrevented events; ctrl/meta chords and Mortic's own keys pass through).
+2. **M release never fired**: keymap bindings only dispatch on key press — the `{ key: "m", eventType: "release" }` binding was dead code. Release now comes from `api.renderer.keyInput.on("keyrelease", ...)`, which OpenTUI emits when the terminal reports Kitty event types.
+3. **Escape hatch**: if the terminal claims Kitty support but never delivers release events, PTT would stick armed. A second M press now always stops PTT.
+
 ## Local Evidence
 
 - `opencode --version` returned `1.17.13`.
-- PTY-driven live TUI probe: typing `/mortic` shows `/mortic  Focus the Mortic sidepod` in the slash menu; pressing Enter runs the command without sending a model prompt (no session created, prompt resets).
-- `npm run check` (6 tests) verifies package shape, deprecated-API absence, smoke hooks, and the slash reachability rules above in both `src/` and generated `dist/`.
+- PTY-driven live TUI probes (machine-run, emulated Kitty CSI-u key events):
+  - `/mortic` appears in the slash menu and runs without sending a model prompt.
+  - Typing lock: printable probe text does not reach the prompt in focus mode; typing works again after `Esc`.
+  - M press arms (`Hold-M push-to-talk is active.`), Kitty release stops (`Push-to-talk released.`, deck `OFF`), re-arm works, and a second press without release stops (`Push-to-talk stopped.`).
+- `npm run check` (7 tests) locks the slash reachability rules, the keyrelease-listener mechanism, and the typing-lock guards in both `src/` and generated `dist/`.
 - `uv run pytest` remains the repo-wide gate after the sidepod package check.
 
 ## 10-Minute Human Checklist
@@ -55,6 +66,7 @@ Smoke hooks emit structured diagnostics with the prefix `[mortic smoke]`. Each f
 
 | Terminal | Expected Mode | Expected `useKittyKeyboard` | Human Result | Notes |
 | --- | --- | --- | --- | --- |
+| PTY probe (emulated Kitty, machine) | Hold-`M` | `true` | Pass 2026-07-02 | Press arms, release stops, double-press escape hatch stops. |
 | Ghostty | Hold-`M` | `true` | Pending | Verify press and release diagnostics. |
 | Kitty | Hold-`M` | `true` | Pending | Verify press and release diagnostics. |
 | WezTerm | Hold-`M` | `true` | Pending | Verify press and release diagnostics. |

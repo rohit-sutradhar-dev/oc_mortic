@@ -51,8 +51,24 @@ test("source exposes MOR-165 slash and terminal smoke hooks", async () => {
   assert.match(src, /renderer\.useKittyKeyboard/);
   assert.match(src, /\[mortic smoke\]/);
   assert.match(src, /name:\s*"mortic\.ptt\.press"/);
-  assert.match(src, /name:\s*"mortic\.ptt\.release"/);
-  assert.match(src, /key:\s*"m",\s*eventType:\s*"release"/);
+});
+
+test("focus mode locks typing and hears M release via key input stream", async () => {
+  const src = await readText("src/tui.js");
+  const dist = await readText("dist/tui.js");
+
+  for (const body of [src, dist]) {
+    // Keymap bindings never dispatch on key release, so release must come
+    // from the renderer key input stream; a keymap eventType filter is dead code.
+    assert.equal(/eventType:\s*"release",\s*cmd:/.test(body), false);
+    assert.match(body, /keyrelease/);
+    assert.match(body, /keyInput/);
+    // Typing lock swallows unbound keys before the prompt renderable sees them.
+    assert.match(body, /preventDefault/);
+    assert.match(body, /stopPropagation/);
+    // Prompt renderable focus is parked while Mortic focus mode is active.
+    assert.match(body, /currentFocusedRenderable/);
+  }
 });
 
 test("slash registration matches OpenCode 1.17.x reachability rules", async () => {

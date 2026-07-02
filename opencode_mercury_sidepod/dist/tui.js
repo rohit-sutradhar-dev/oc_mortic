@@ -415,11 +415,18 @@ export async function tui(api) {
       setTranscript([...getTranscript(), { role, text: value }].slice(-12));
     };
     let exitMorticMode;
+    let previousFocus;
 
     const focusMortic = (source = "keymap") =>
       mutate(() => {
         if (!exitMorticMode) {
           exitMorticMode = api.mode.push("mortic.sidepod");
+        }
+        // The prompt input keeps renderable focus after /mortic, so blur it
+        // for the duration of Mortic focus mode and restore it on exit.
+        if (!previousFocus) {
+          previousFocus = api.renderer.currentFocusedRenderable ?? undefined;
+          previousFocus?.blur?.();
         }
         setFocused(true);
         recordSmoke("focus", { source, pttMode: keyboardMode(api), typingLockProbe: "type printable keys after focus" });
@@ -431,6 +438,8 @@ export async function tui(api) {
           exitMorticMode();
           exitMorticMode = undefined;
         }
+        previousFocus?.focus?.();
+        previousFocus = undefined;
         setFocused(false);
         setEvent("prompt mode");
       });
@@ -515,12 +524,59 @@ export async function tui(api) {
           return;
         }
 
+        // Escape hatch for terminals that report Kitty support but never
+        // deliver release events: a second M press always stops PTT.
+        if (getArmed()) {
+          setArmed(false);
+          setLive(false);
+          setEvent("m stopped");
+          setUserText("Push-to-talk stopped.");
+          appendTranscript("user", "M stopped.");
+          return;
+        }
+
         setArmed(true);
         setLive(false);
         setEvent("m held");
         setUserText("Hold-M push-to-talk is active.");
         appendTranscript("user", "M hold active.");
       });
+
+    // Typing lock: global key handlers run before renderable handlers and the
+    // prompt input skips defaultPrevented events, so swallowing unbound keys
+    // here keeps focus-mode typing out of the OpenCode prompt. Keys bound by
+    // the mortic.sidepod layer and any ctrl/meta chords pass through untouched.
+    const morticModeKeys = new Set(["m", "p", "l", "c", "t", "h", "j", "k", "g", "x", "up", "down", "escape"]);
+    const swallowGuard = (event) => {
+      if (!getFocused()) return;
+      if (event?.ctrl || event?.meta || event?.super) return;
+      const name = typeof event?.name === "string" ? event.name.toLowerCase() : "";
+      if (morticModeKeys.has(name)) return;
+      recordSmoke("typing.swallow", { key: name || "unknown" });
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+    };
+    // Hold-M release: keymap bindings only dispatch on key press; release
+    // arrives on the renderer key input stream when the terminal reports
+    // Kitty event types. Tap fallback stays press-driven via handlePttKey.
+    const releaseGuard = (event) => {
+      if (!getFocused()) return;
+      const name = typeof event?.name === "string" ? event.name.toLowerCase() : "";
+      if (name !== "m") return;
+      handlePttKey("release", event);
+    };
+    const keyInput = api.renderer.keyInput;
+    if (keyInput?.prependListener) {
+      keyInput.prependListener("keypress", swallowGuard);
+    } else {
+      keyInput?.on?.("keypress", swallowGuard);
+    }
+    keyInput?.on?.("keyrelease", releaseGuard);
+    api.lifecycle.onDispose(() => {
+      keyInput?.off?.("keypress", swallowGuard);
+      keyInput?.off?.("keyrelease", releaseGuard);
+    });
+
     const actions = {
       toggleArmed,
       toggleLive,
@@ -572,7 +628,6 @@ export async function tui(api) {
       bindings: [
         { key: "escape", cmd: "mortic.blur", desc: "Return to prompt" },
         { key: "m", cmd: "mortic.ptt.press", desc: "Hold M PTT" },
-        { key: "m", eventType: "release", cmd: "mortic.ptt.release", desc: "Release M PTT" },
         { key: "p", cmd: "mortic.ptt", desc: "Push to Talk" },
         { key: "l", cmd: "mortic.live", desc: "Toggle Live" },
         { key: "c", cmd: "mortic.clear", desc: "Clear lane" },
