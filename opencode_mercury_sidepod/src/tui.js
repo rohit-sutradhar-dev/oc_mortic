@@ -325,6 +325,52 @@ function copyToClipboard(value) {
   return false;
 }
 
+function keyboardMode(api) {
+  return api.renderer.useKittyKeyboard ? "hold" : "tap";
+}
+
+function keyEventType(input, fallback) {
+  if (input && typeof input === "object") {
+    if (typeof input.eventType === "string") {
+      return input.eventType;
+    }
+    if (typeof input.type === "string") {
+      return input.type;
+    }
+    if (input.key && typeof input.key === "object" && typeof input.key.eventType === "string") {
+      return input.key.eventType;
+    }
+  }
+  return fallback;
+}
+
+function keyName(input, fallback) {
+  if (input && typeof input === "object") {
+    if (typeof input.name === "string") {
+      return input.name;
+    }
+    if (typeof input.key === "string") {
+      return input.key;
+    }
+    if (input.key && typeof input.key === "object" && typeof input.key.name === "string") {
+      return input.key.name;
+    }
+  }
+  return fallback;
+}
+
+function logSmoke(api, event, details = {}) {
+  const payload = {
+    event,
+    mode: api.mode.current?.(),
+    useKittyKeyboard: Boolean(api.renderer.useKittyKeyboard),
+    at: new Date().toISOString(),
+    ...details
+  };
+  console.info("[mortic smoke]", JSON.stringify(payload));
+  return payload;
+}
+
 function renderPod(state, actions, theme) {
   return box(
     {
@@ -370,13 +416,14 @@ const plugin = {
     };
     let exitMorticMode;
 
-    const focusMortic = () =>
+    const focusMortic = (source = "keymap") =>
       mutate(() => {
         if (!exitMorticMode) {
           exitMorticMode = api.mode.push("mortic.sidepod");
         }
         setFocused(true);
-        setEvent("focus mode");
+        recordSmoke("focus", { source, pttMode: keyboardMode(api), typingLockProbe: "type printable keys after focus" });
+        setEvent(source === "slash" ? "slash focus" : "focus mode");
       });
     const blurMortic = () =>
       mutate(() => {
@@ -434,6 +481,46 @@ const plugin = {
       mutate(() => {
         setEvent(copyToClipboard(value) ? "copied" : "copy unavailable");
       });
+    const recordSmoke = (event, details = {}) => {
+      logSmoke(api, event, details);
+    };
+    const handlePttKey = (fallbackEventType, input) =>
+      mutate(() => {
+        const eventType = keyEventType(input, fallbackEventType);
+        const key = keyName(input, "m");
+        const pttMode = keyboardMode(api);
+        recordSmoke("ptt.key", { key, eventType, pttMode });
+
+        if (eventType === "repeat") {
+          setEvent(`m repeat ${pttMode}`);
+          return;
+        }
+
+        if (pttMode === "tap" && eventType === "press") {
+          const next = !getArmed();
+          setArmed(next);
+          setLive(false);
+          setEvent(next ? "m tap armed" : "m tap muted");
+          setUserText(next ? "Tap mode armed. Press M again to stop." : "Tap mode stopped.");
+          appendTranscript("user", next ? "M tap armed." : "M tap stopped.");
+          return;
+        }
+
+        if (eventType === "release") {
+          setArmed(false);
+          setLive(false);
+          setEvent("m released");
+          setUserText("Push-to-talk released.");
+          appendTranscript("user", "M released.");
+          return;
+        }
+
+        setArmed(true);
+        setLive(false);
+        setEvent("m held");
+        setUserText("Hold-M push-to-talk is active.");
+        appendTranscript("user", "M hold active.");
+      });
     const actions = {
       toggleArmed,
       toggleLive,
@@ -452,7 +539,14 @@ const plugin = {
           title: "Mortic: Focus sidepod",
           category: "Mortic",
           namespace: "palette",
-          run: focusMortic
+          run: () => focusMortic("keymap")
+        },
+        {
+          name: "mortic.slash",
+          title: "Mortic: /mortic",
+          category: "Mortic",
+          slash: { name: "mortic" },
+          run: () => focusMortic("slash")
         }
       ],
       bindings: [{ key: "ctrl+x v", cmd: "mortic.focus", desc: "Focus Mortic sidepod" }]
@@ -463,6 +557,8 @@ const plugin = {
       commands: [
         { name: "mortic.blur", title: "Mortic: Return to prompt", category: "Mortic", run: blurMortic },
         { name: "mortic.ptt", title: "Mortic: Push to Talk", category: "Mortic", run: toggleArmed },
+        { name: "mortic.ptt.press", title: "Mortic: Hold M press", category: "Mortic", run: (input) => handlePttKey("press", input) },
+        { name: "mortic.ptt.release", title: "Mortic: Hold M release", category: "Mortic", run: (input) => handlePttKey("release", input) },
         { name: "mortic.live", title: "Mortic: Toggle Live", category: "Mortic", run: toggleLive },
         { name: "mortic.clear", title: "Mortic: Clear lane", category: "Mortic", run: clearLane },
         { name: "mortic.transcript", title: "Mortic: Transcript popup", category: "Mortic", run: openTranscript },
@@ -470,6 +566,8 @@ const plugin = {
       ],
       bindings: [
         { key: "escape", cmd: "mortic.blur", desc: "Return to prompt" },
+        { key: "m", cmd: "mortic.ptt.press", desc: "Hold M PTT" },
+        { key: "m", eventType: "release", cmd: "mortic.ptt.release", desc: "Release M PTT" },
         { key: "p", cmd: "mortic.ptt", desc: "Push to Talk" },
         { key: "l", cmd: "mortic.live", desc: "Toggle Live" },
         { key: "c", cmd: "mortic.clear", desc: "Clear lane" },

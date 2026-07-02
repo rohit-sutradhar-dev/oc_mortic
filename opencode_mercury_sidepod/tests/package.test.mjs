@@ -45,6 +45,17 @@ test("source preserves current sidepod surface hooks", async () => {
   }
 });
 
+test("source exposes MOR-165 slash and terminal smoke hooks", async () => {
+  const src = await readText("src/tui.js");
+
+  assert.match(src, /slash:\s*{\s*name:\s*"mortic"\s*}/);
+  assert.match(src, /renderer\.useKittyKeyboard/);
+  assert.match(src, /\[mortic smoke\]/);
+  assert.match(src, /name:\s*"mortic\.ptt\.press"/);
+  assert.match(src, /name:\s*"mortic\.ptt\.release"/);
+  assert.match(src, /key:\s*"m",\s*eventType:\s*"release"/);
+});
+
 test("normal UI source does not expose provider or runtime names", async () => {
   const src = await readText("src/tui.js");
 
