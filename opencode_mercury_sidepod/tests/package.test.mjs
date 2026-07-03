@@ -25,7 +25,7 @@ test("source avoids deprecated command API", () => {
 });
 
 test("source preserves current sidepod surface hooks", () => {
-  for (const expectedText of ["MORTIC", "COMMAND DECK", "COMMS", "Transcript", "Handoff", "Push to Talk"]) {
+  for (const expectedText of ["MORTIC", "COMMAND DECK", "COMMS", "Transcript", "Handoff", "Microphone"]) {
     assert.match(src, new RegExp(expectedText));
   }
 });
@@ -33,13 +33,12 @@ test("source preserves current sidepod surface hooks", () => {
 test("source exposes MOR-165 slash and terminal smoke hooks", () => {
   assert.match(src, /renderer\.useKittyKeyboard/);
   assert.match(src, /\[mortic smoke\]/);
-  assert.match(src, /name:\s*"mortic\.ptt\.press"/);
+  assert.match(src, /name:\s*"mortic\.mic\.toggle"/);
 });
 
-test("focus mode locks typing and PTT is a plain M toggle", () => {
-  // PTT is a plain M toggle by product decision (2026-07-03): every press
-  // flips armed/stopped. No keyrelease listener, no Kitty flag changes,
-  // no repeat debounce, no event-type handling.
+test("focus mode locks typing and the mic is a plain M toggle", () => {
+  // No hold-to-talk machinery: no keyrelease listener, no Kitty flag
+  // changes, no repeat debounce, no event-type handling.
   assert.equal(/eventType:\s*"release",\s*cmd:/.test(src), false);
   assert.equal(src.includes("keyrelease"), false);
   assert.equal(src.includes("enableKittyKeyboard"), false);
@@ -50,6 +49,21 @@ test("focus mode locks typing and PTT is a plain M toggle", () => {
   assert.match(src, /stopPropagation/);
   // Prompt renderable focus is parked while Mortic focus mode is active.
   assert.match(src, /currentFocusedRenderable/);
+});
+
+test("typing lock and focus state are announced, not silent", () => {
+  // Owner correction 2026-07-03: a collapsed sidebar panel means the pod is
+  // invisible, so indication has to reach the user via toast, not just UI.
+  assert.match(src, /const focusMortic = \(\) => \{[\s\S]*?api\.ui\.toast\(/);
+  assert.match(src, /noteSwallowedKey/);
+  assert.match(src, /const noteSwallowedKey = \([\s\S]*?api\.ui\.toast\(/);
+  // The swallow notice fires once per focus session, reset on focus/blur.
+  assert.match(src, /swallowNoticeShown = false/);
+  assert.match(src, /if \(swallowNoticeShown\) {\s*return;\s*}/);
+  // The hero caption reflects focus/mic state instead of a static label.
+  assert.match(src, /function heroCaption\(state\)/);
+  assert.match(src, /MIC LIVE/);
+  assert.match(src, /MIC MUTED/);
 });
 
 test("popups are centered host dialogs and Esc is never destructive", () => {
@@ -90,15 +104,19 @@ test("focusing without an open session is refused, not silently locked", () => {
   );
 });
 
-test("command deck uses key-true labels and one PTT key", () => {
-  for (const label of ["[M]", "[L]", "[X]", "[T]", "[H]", "[ESC]", "End Session"]) {
+test("command deck uses key-true labels and a single mic control", () => {
+  for (const label of ["[M]", "[X]", "[T]", "[H]", "[ESC]", "End Session", "Microphone"]) {
     assert.ok(src.includes(label), `deck label missing: ${label}`);
   }
-  for (const stale of ["[PTT]", "[LIVE]", "[CLR]", "[TRN]", "[HND]"]) {
+  for (const stale of ["[PTT]", "[LIVE]", "[L]", "[CLR]", "[TRN]", "[HND]", "Push to Talk"]) {
     assert.equal(src.includes(stale), false, `stale deck label present: ${stale}`);
   }
-  // M is the only PTT key; p was dropped as a hidden alias.
+  // PTT and Live were collapsed into one mic toggle (owner decision
+  // 2026-07-03): no separate live key/command, no p alias.
   assert.equal(/key:\s*"p"/.test(src), false);
+  assert.equal(/key:\s*"l",\s*cmd:/.test(src), false);
+  assert.equal(src.includes("mortic.live"), false);
+  assert.equal(src.includes("toggleLive"), false);
   assert.match(src, /key:\s*"x",\s*cmd:\s*"mortic\.clear"/);
   // Noisy status-only rows removed: sprite and row states carry status.
   assert.equal(/row\("focus"/.test(src), false);
@@ -107,20 +125,23 @@ test("command deck uses key-true labels and one PTT key", () => {
   assert.equal(/row\("items"/.test(src), false);
 });
 
-test("plain M toggle emits protocol v0 PTT controls", () => {
+test("the mic toggle emits protocol v0 live.set and drops PTT plumbing", () => {
   assert.match(src, /MORTIC_HELPER_WS_URL/);
   assert.match(src, /new WebSocketCtor\(HELPER_WS_URL\)/);
   assert.match(src, /recordSmoke\("protocol\.send"/);
-  assert.match(src, /protocolBase\("ptt\.start"\)/);
-  assert.match(src, /inputMode:\s*"ptt"/);
-  assert.match(src, /key:\s*"M"/);
-  assert.match(src, /protocolBase\("ptt\.stop"\)/);
-  assert.match(src, /matchingStartEventId:\s*activePttStartEventId/);
-  assert.match(src, /reason:\s*"tap\.toggle"/);
-  assert.match(src, /turnId:\s*activePttTurnId/);
-  assert.match(src, /key:\s*"m",\s*cmd:\s*"mortic\.ptt\.press"/);
-  assert.match(src, /mode:\s*"mortic\.sidepod"[\s\S]*mortic\.ptt\.press/);
-  // The offline send queue is capped so stale PTT events are never replayed
+  assert.match(src, /const toggleMic = \(\) => \{/);
+  assert.match(src, /protocolBase\("live\.set"\)/);
+  assert.match(src, /value:\s*next/);
+  assert.match(src, /reason:\s*"user\.toggle"/);
+  assert.match(src, /recordSmoke\("mic\.state"/);
+  assert.match(src, /key:\s*"m",\s*cmd:\s*"mortic\.mic\.toggle"/);
+  assert.match(src, /mode:\s*"mortic\.sidepod"[\s\S]*mortic\.mic\.toggle/);
+  // Hold-PTT plumbing is fully retired from the UI (still defined in the
+  // protocol doc/engine for a possible future hold interaction).
+  for (const stale of ["ptt.start", "ptt.stop", "handlePttKey", "activePttTurnId", "activePttStartEventId"]) {
+    assert.equal(src.includes(stale), false, `stale PTT plumbing present: ${stale}`);
+  }
+  // The offline send queue is capped so stale events are never replayed
   // in bulk when the helper reconnects.
   assert.match(src, /recordSmoke\("protocol\.drop"/);
 });

@@ -176,13 +176,23 @@ function commandRow(key, label, state, color, onMouseDown) {
   return clickable(`║ ${fit(key, 6)} ${fit(label, 15)} ${fit(state, 9)} ║`, color, onMouseDown);
 }
 
+// One state bit is the entire voice control surface: mic muted or mic live.
+// Turn segmentation is the engine's job (native end-of-turn detection lives
+// server-side); the UI only gates whether the mic may listen.
+function heroCaption(state) {
+  if (!state.focused) {
+    return "/MORTIC TO FOCUS";
+  }
+  return state.micLive ? "MIC LIVE · M TO MUTE" : "MIC MUTED · M TO TALK";
+}
+
 function renderHero(state, theme) {
   // TuiThemeCurrent declares these colors non-optional; no fallbacks needed.
   const accent = theme.accent;
   const muted = theme.textMuted;
   const secondaryAccent = theme.secondary;
   const ok = theme.success;
-  const active = state.live || state.armed;
+  const active = state.micLive;
   const color = active ? ok : muted;
   const border = state.focused ? secondaryAccent : accent;
   return [
@@ -197,7 +207,7 @@ function renderHero(state, theme) {
             : { text: center(item.text, INNER), color: item.color }
         ),
         center("", INNER),
-        center(active ? "VOICE SIGNAL OPEN" : "PRESS PTT OR LIVE", INNER)
+        center(heroCaption(state), INNER)
       ],
       color,
       border,
@@ -209,13 +219,11 @@ function renderHero(state, theme) {
 function renderControlPanel(state, actions, theme) {
   const accent = theme.accent;
   const muted = theme.textMuted;
-  const armColor = state.armed ? theme.success : muted;
-  const liveColor = state.live ? theme.success : muted;
+  const micColor = state.micLive ? theme.success : muted;
   return [
     line("", muted),
     line(`╔ COMMAND DECK${"═".repeat(WIDTH - 15)}╗`, accent),
-    commandRow("[M]", "Push to Talk", state.armed ? "ARMED" : "OFF", armColor, actions.ptt),
-    commandRow("[L]", "Live", state.live ? "ON" : "OFF", liveColor, actions.toggleLive),
+    commandRow("[M]", "Microphone", state.micLive ? "LIVE" : "MUTED", micColor, actions.toggleMic),
     commandRow("[X]", "Clear Lane", "", theme.warning, actions.clear),
     commandRow("[T]", "Transcript", "", accent, actions.openTranscript),
     commandRow("[H]", "Handoff", state.handoffReady ? "READY" : "DRAFT", accent, actions.openHandoff),
@@ -261,12 +269,6 @@ function handoffText(state) {
     "Keep code, commands, paths, diffs, and JSON screen-only."
   ].join("\n");
 }
-
-// PTT is a plain M toggle by product decision (2026-07-03). Terminal
-// key-release reporting is too inconsistent to build on: iTerm2 and
-// Terminal.app never send releases for plain keys, and the Kitty flag
-// escalation needed for the rest added more complexity than the hold
-// interaction was worth for v1.
 
 // console output in a raw TUI is painted over by screen redraws and never
 // reaches opencode.log, so smoke diagnostics only exist behind the durable
@@ -359,26 +361,25 @@ function renderPod(state, actions, theme) {
 const id = "mortic.sidepod";
 
 export async function tui(api) {
-    const [getArmed, setArmed] = createSignal(false);
-    const [getLive, setLive] = createSignal(false);
+    const [getMicLive, setMicLive] = createSignal(false);
     const [getFocused, setFocused] = createSignal(false);
     const [getModal, setModal] = createSignal(null);
     const [getModalScroll, setModalScroll] = createSignal(0);
     const [getPhase, setPhase] = createSignal(0);
     const [getEvent, setEvent] = createSignal("ready");
-    const [getUserText, setUserText] = createSignal("Press PTT or Live. Spoken asks will appear here.");
+    const [getUserText, setUserText] = createSignal("Press M to unmute. Spoken asks will appear here.");
     const [getAssistantText, setAssistantText] = createSignal("Mortic replies with short speakable text. Details stay screen-only.");
     const [getTranscript, setTranscript] = createSignal([
       { role: "system", text: "Mortic sidepod loaded." },
-      { role: "assistant", text: "Ready for push-to-talk." }
+      { role: "assistant", text: "Ready. Tap M to unmute." }
     ]);
 
     const requestRender = () => api.renderer.requestRender();
-    // The orb animation ticks only while the voice lane is active; idle
-    // sessions run no timer at all.
+    // The orb animation ticks only while the mic is live; idle sessions run
+    // no timer at all.
     let animationTimer;
     const syncAnimation = () => {
-      const active = getArmed() || getLive();
+      const active = getMicLive();
       if (active && !animationTimer) {
         animationTimer = setInterval(() => {
           setPhase((getPhase() + 1) % 8);
@@ -400,9 +401,10 @@ export async function tui(api) {
     let exitMorticMode;
     let previousFocus;
     let clientEventSeq = 0;
-    let turnSeq = 0;
-    let activePttTurnId;
-    let activePttStartEventId;
+    // The typing-lock notice fires once per focus session, at the moment a
+    // key actually gets swallowed — that's when the confusion would happen,
+    // and it reaches the user even if the sidebar panel is collapsed.
+    let swallowNoticeShown = false;
 
     const restorePromptFocus = () => {
       if (exitMorticMode) {
@@ -412,6 +414,7 @@ export async function tui(api) {
       previousFocus?.focus?.();
       previousFocus = undefined;
       setFocused(false);
+      swallowNoticeShown = false;
     };
 
     const focusMortic = () => {
@@ -437,12 +440,30 @@ export async function tui(api) {
           previousFocus?.blur?.();
         }
         setFocused(true);
+        swallowNoticeShown = false;
         recordSmoke("focus");
         setEvent("focus mode");
+        // The sidepod may be visually collapsed, so the confirmation that
+        // focus actually engaged has to reach the user outside the panel too.
+        api.ui.toast({
+          variant: "info",
+          message: "Mortic focused — M mic · T transcript · H handoff · Esc exit"
+        });
       });
     };
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
+    };
+    const noteSwallowedKey = (key, modal) => {
+      recordSmoke("typing.swallow", modal ? { key: key || "unknown", modal } : { key: key || "unknown" });
+      if (swallowNoticeShown) {
+        return;
+      }
+      swallowNoticeShown = true;
+      api.ui.toast({
+        variant: "info",
+        message: "Keys go to Mortic while it's focused. Esc returns to the prompt."
+      });
     };
 
     // Modals render as centered host dialogs over the whole TUI (never inside
@@ -460,7 +481,7 @@ export async function tui(api) {
         const items = getTranscript();
         const all = items.length
           ? items.flatMap((item) => wrap(`${item.role}: ${item.text}`, MODAL_INNER))
-          : ["No transcript yet.", "Use PTT or Live to start."];
+          : ["No transcript yet.", "Tap M to unmute and start."];
         const top = Math.min(getModalScroll(), Math.max(0, all.length - MODAL_PAGE));
         return all.slice(top, top + MODAL_PAGE);
       }
@@ -558,8 +579,7 @@ export async function tui(api) {
         recordSmoke("exit.confirmed");
         setModal(null);
         api.ui.dialog.clear();
-        setArmed(false);
-        setLive(false);
+        setMicLive(false);
         setEvent("session ended");
         setUserText("Mortic session ended.");
         setAssistantText("Start Mortic again for a fresh voice lane.");
@@ -582,26 +602,12 @@ export async function tui(api) {
         openModal("exit");
       }
     };
-    const toggleLive = () => {
-      if (getModal()) {
-        return;
-      }
-      mutate(() => {
-        const next = !getLive();
-        setLive(next);
-        setArmed(false);
-        setEvent(next ? "live on" : "live off");
-        setUserText(next ? "Live voice control is on." : "Live voice control is off.");
-        appendTranscript("user", next ? "Live voice enabled." : "Live voice disabled.");
-      });
-    };
     const clearLane = () => {
       if (getModal()) {
         return;
       }
       mutate(() => {
-        setArmed(false);
-        setLive(false);
+        setMicLive(false);
         setEvent("cleared");
         setUserText("Voice lane cleared.");
         setAssistantText("Ready for the next spoken turn.");
@@ -623,65 +629,38 @@ export async function tui(api) {
     };
     const sendProtocol = createProtocolSender(recordSmoke);
     const nextClientEventId = () => `evt_sidepod_${Date.now().toString(36)}_${++clientEventSeq}`;
-    const nextTurnId = () => `turn_${Date.now().toString(36)}_${++turnSeq}`;
     const protocolBase = (type) => ({
       type,
       clientEventId: nextClientEventId(),
       sentAt: new Date().toISOString()
     });
-    // Plain M toggle by product decision (2026-07-03): every M press flips
-    // armed/stopped. No repeat debounce, no event-type handling, no timing.
-    const handlePttKey = () => {
+    // PTT and Live collapsed into a single mic mute/unmute toggle (owner
+    // decision 2026-07-03): the tap-toggle PTT model degenerated into "toggle
+    // listening", which is what Live already was — two controls with no real
+    // difference. M now gates whether the mic may listen; turn segmentation
+    // is the engine's job (native end-of-turn detection lives server-side).
+    const toggleMic = () => {
       if (getModal()) {
         return;
       }
       mutate(() => {
-        if (getArmed()) {
-          const stopEvent = protocolBase("ptt.stop");
-          sendProtocol({
-            ...stopEvent,
-            matchingStartEventId: activePttStartEventId,
-            turnId: activePttTurnId,
-            reason: "tap.toggle",
-            eventType: "tap"
-          });
-          activePttTurnId = undefined;
-          activePttStartEventId = undefined;
-          setArmed(false);
-          setLive(false);
-          setEvent("m stopped");
-          setUserText("Push-to-talk stopped.");
-          appendTranscript("user", "M PTT stopped.");
-          recordSmoke("ptt.state", { armed: false, via: "m-stop" });
-          return;
-        }
-        const startEvent = protocolBase("ptt.start");
-        activePttTurnId = nextTurnId();
-        activePttStartEventId = startEvent.clientEventId;
-        sendProtocol({
-          ...startEvent,
-          turnId: activePttTurnId,
-          inputMode: "ptt",
-          key: "M",
-          eventType: "press"
-        });
-        setArmed(true);
-        setLive(false);
-        setEvent("m armed");
-        setUserText("Push-to-talk on. Tap M again to stop.");
-        appendTranscript("user", "M PTT on.");
-        recordSmoke("ptt.state", { armed: true, via: "m-arm" });
+        const next = !getMicLive();
+        setMicLive(next);
+        sendProtocol({ ...protocolBase("live.set"), value: next, reason: "user.toggle" });
+        setEvent(next ? "mic live" : "mic muted");
+        setUserText(next ? "Mic is live. Speak normally." : "Mic is muted. Tap M to talk.");
+        appendTranscript("user", next ? "Mic unmuted." : "Mic muted.");
+        recordSmoke("mic.state", { live: next, via: next ? "m-unmute" : "m-mute" });
       });
     };
 
-    // One visible key per action (owner spec 2026-07-03): M is the only PTT
-    // key. Modal-scoped keys (c copy, j/k scroll, enter confirm, h from the
-    // End Session dialog) are handled by the swallow guard while a modal is
-    // open, so they never need mode bindings here.
+    // One visible key per action (owner spec 2026-07-03): M is the only mic
+    // control. Modal-scoped keys (c copy, j/k scroll, enter confirm, h from
+    // the End Session dialog) are handled by the swallow guard while a modal
+    // is open, so they never need mode bindings here.
     const modeBindings = [
       { key: "escape", cmd: "mortic.escape", desc: "End session / close modal" },
-      { key: "m", cmd: "mortic.ptt.press", desc: "Push to talk" },
-      { key: "l", cmd: "mortic.live", desc: "Toggle Live" },
+      { key: "m", cmd: "mortic.mic.toggle", desc: "Toggle mic" },
       { key: "x", cmd: "mortic.clear", desc: "Clear lane" },
       { key: "t", cmd: "mortic.transcript", desc: "Transcript" },
       { key: "h", cmd: "mortic.handoff", desc: "Handoff" }
@@ -714,12 +693,12 @@ export async function tui(api) {
         } else if (modal === "transcript" && (name === "k" || name === "up")) {
           scrollModal(-1);
         } else {
-          recordSmoke("typing.swallow", { key: name || "unknown", modal });
+          noteSwallowedKey(name, modal);
         }
         return;
       }
       if (morticModeKeys.has(name)) return;
-      recordSmoke("typing.swallow", { key: name || "unknown" });
+      noteSwallowedKey(name);
       event?.preventDefault?.();
       event?.stopPropagation?.();
     };
@@ -734,8 +713,7 @@ export async function tui(api) {
     });
 
     const actions = {
-      ptt: handlePttKey,
-      toggleLive,
+      toggleMic,
       clear: clearLane,
       openTranscript,
       openHandoff,
@@ -764,8 +742,7 @@ export async function tui(api) {
       mode: "mortic.sidepod",
       commands: [
         { name: "mortic.escape", title: "Mortic: End session / close modal", category: "Mortic", run: handleEscape },
-        { name: "mortic.ptt.press", title: "Mortic: Push-to-talk toggle", category: "Mortic", run: handlePttKey },
-        { name: "mortic.live", title: "Mortic: Toggle Live", category: "Mortic", run: toggleLive },
+        { name: "mortic.mic.toggle", title: "Mortic: Toggle mic", category: "Mortic", run: toggleMic },
         { name: "mortic.clear", title: "Mortic: Clear lane", category: "Mortic", run: clearLane },
         { name: "mortic.transcript", title: "Mortic: Transcript", category: "Mortic", run: openTranscript },
         { name: "mortic.handoff", title: "Mortic: Handoff", category: "Mortic", run: openHandoff }
@@ -786,8 +763,7 @@ export async function tui(api) {
         sidebar_content: () =>
           renderPod(
             {
-              armed: getArmed(),
-              live: getLive(),
+              micLive: getMicLive(),
               focused: getFocused(),
               phase: getPhase(),
               event: getEvent(),
