@@ -68,6 +68,10 @@ test("focus mode locks typing and hears M release via key input stream", async (
     assert.match(body, /stopPropagation/);
     // Prompt renderable focus is parked while Mortic focus mode is active.
     assert.match(body, /currentFocusedRenderable/);
+    // Key repeat arrives as plain presses (iTerm2/Terminal.app cannot mark
+    // repeats; OpenTUI normalizes Kitty repeats to presses), so a deliberate
+    // stop-press must be distinguished from repeat by a timing window.
+    assert.match(body, /PTT_REPEAT_WINDOW_MS/);
   }
 });
 

@@ -401,6 +401,15 @@ function logSmoke(api, event, details = {}) {
     ...details
   };
   console.info("[mortic smoke]", JSON.stringify(payload));
+  // console output in a raw TUI is painted over by screen redraws and never
+  // reaches opencode.log, so smoke runs need a durable sink. Opt-in only:
+  // MORTIC_SMOKE_LOG=/tmp/mortic-smoke.log opencode
+  const sink = globalThis.process?.env?.MORTIC_SMOKE_LOG;
+  if (sink) {
+    import("node:fs")
+      .then((fs) => fs.appendFileSync(sink, JSON.stringify(payload) + "\n"))
+      .catch(() => {});
+  }
   return payload;
 }
 
@@ -528,6 +537,17 @@ export async function tui(api) {
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
     };
+    // Key repeat arrives as plain presses: terminals without Kitty event
+    // types (iTerm2, Terminal.app) can't mark repeats, and OpenTUI also
+    // normalizes Kitty repeat events to presses. Once a session has seen any
+    // real key release, presses while armed are always repeat — the stop
+    // comes from the release. Until then, tap semantics apply and repeat is
+    // distinguished from a deliberate stop-press by timing. The window is
+    // wide because input processing can lag the keyboard under render load
+    // (observed >1.3s between arm and first repeat in a loaded session).
+    const PTT_REPEAT_WINDOW_MS = 1500;
+    let lastPttPressAt = 0;
+    let sawKeyRelease = false;
     const handlePttKey = (fallbackEventType, input) =>
       mutate(() => {
         const eventType = keyEventType(input, fallbackEventType);
@@ -535,46 +555,43 @@ export async function tui(api) {
         const pttMode = keyboardMode(api);
         recordSmoke("ptt.key", { key, eventType, pttMode });
 
-        if (eventType === "repeat") {
-          setEvent(`m repeat ${pttMode}`);
-          return;
-        }
-
-        if (pttMode === "tap" && eventType === "press") {
-          const next = !getArmed();
-          setArmed(next);
-          setLive(false);
-          setEvent(next ? "m tap armed" : "m tap muted");
-          setUserText(next ? "Tap mode armed. Press M again to stop." : "Tap mode stopped.");
-          appendTranscript("user", next ? "M tap armed." : "M tap stopped.");
-          return;
-        }
-
         if (eventType === "release") {
-          setArmed(false);
-          setLive(false);
-          setEvent("m released");
-          setUserText("Push-to-talk released.");
-          appendTranscript("user", "M released.");
+          lastPttPressAt = 0;
+          if (getArmed()) {
+            setArmed(false);
+            setLive(false);
+            setEvent("m released");
+            setUserText("Push-to-talk released.");
+            appendTranscript("user", "M released.");
+            recordSmoke("ptt.state", { armed: false, via: "release-stop" });
+          }
           return;
         }
 
-        // Escape hatch for terminals that report Kitty support but never
-        // deliver release events: a second M press always stops PTT.
+        const sincePrevPress = Date.now() - lastPttPressAt;
+        lastPttPressAt = Date.now();
+        if (eventType === "repeat" || (getArmed() && (sawKeyRelease || sincePrevPress < PTT_REPEAT_WINDOW_MS))) {
+          setEvent(`m repeat ${pttMode}`);
+          recordSmoke("ptt.state", { armed: getArmed(), via: "repeat-ignored" });
+          return;
+        }
+
         if (getArmed()) {
           setArmed(false);
           setLive(false);
           setEvent("m stopped");
           setUserText("Push-to-talk stopped.");
           appendTranscript("user", "M stopped.");
+          recordSmoke("ptt.state", { armed: false, via: "press-stop" });
           return;
         }
 
         setArmed(true);
         setLive(false);
         setEvent("m held");
-        setUserText("Hold-M push-to-talk is active.");
-        appendTranscript("user", "M hold active.");
+        setUserText("Push-to-talk active. Release M or tap M again to stop.");
+        appendTranscript("user", "M PTT active.");
+        recordSmoke("ptt.state", { armed: true, via: "press-arm" });
       });
 
     // Typing lock: global key handlers run before renderable handlers and the
@@ -595,6 +612,9 @@ export async function tui(api) {
     // arrives on the renderer key input stream when the terminal reports
     // Kitty event types. Tap fallback stays press-driven via handlePttKey.
     const releaseGuard = (event) => {
+      // Any real release event proves the terminal honors Kitty event types,
+      // which switches PTT from tap semantics to true hold semantics.
+      sawKeyRelease = true;
       if (!getFocused()) return;
       const name = typeof event?.name === "string" ? event.name.toLowerCase() : "";
       if (name !== "m") return;
