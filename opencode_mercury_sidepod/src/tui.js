@@ -5,6 +5,7 @@ import { createSignal } from "solid-js";
 const WIDTH = 36;
 const INNER = WIDTH - 2;
 const SMOKE_SINK = globalThis.process?.env?.MORTIC_SMOKE_LOG;
+const HELPER_WS_URL = globalThis.process?.env?.MORTIC_HELPER_WS_URL ?? "ws://127.0.0.1:8765/ws/sidepod";
 
 function element(type, props = {}, children = []) {
   const node = createElement(type);
@@ -354,6 +355,48 @@ function logSmoke(api, event, details = {}) {
   }
 }
 
+function createProtocolSender(recordSmoke) {
+  const WebSocketCtor = globalThis.WebSocket;
+  let socket;
+  const queue = [];
+  const flush = () => {
+    while (socket?.readyState === 1 && queue.length) {
+      socket.send(queue.shift());
+    }
+  };
+  const open = () => {
+    if (!WebSocketCtor) {
+      recordSmoke("protocol.unavailable", { reason: "websocket-missing" });
+      return;
+    }
+    if (socket && (socket.readyState === 0 || socket.readyState === 1)) {
+      return;
+    }
+    try {
+      socket = new WebSocketCtor(HELPER_WS_URL);
+      socket.onopen = flush;
+      socket.onclose = () => {
+        socket = undefined;
+      };
+      socket.onerror = () => {
+        recordSmoke("protocol.unavailable", { reason: "websocket-error" });
+      };
+    } catch {
+      recordSmoke("protocol.unavailable", { reason: "websocket-open-failed" });
+    }
+  };
+  return (payload) => {
+    const serialized = JSON.stringify(payload);
+    recordSmoke("protocol.send", { type: payload.type, turnId: payload.turnId });
+    if (socket?.readyState === 1) {
+      socket.send(serialized);
+      return;
+    }
+    queue.push(serialized);
+    open();
+  };
+}
+
 function renderPod(state, actions, theme) {
   return box(
     {
@@ -415,6 +458,10 @@ export async function tui(api) {
     };
     let exitMorticMode;
     let previousFocus;
+    let clientEventSeq = 0;
+    let turnSeq = 0;
+    let activePttTurnId;
+    let activePttStartEventId;
 
     const restorePromptFocus = () => {
       if (exitMorticMode) {
@@ -508,6 +555,14 @@ export async function tui(api) {
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
     };
+    const sendProtocol = createProtocolSender(recordSmoke);
+    const nextClientEventId = () => `evt_sidepod_${Date.now().toString(36)}_${++clientEventSeq}`;
+    const nextTurnId = () => `turn_${Date.now().toString(36)}_${++turnSeq}`;
+    const protocolBase = (type) => ({
+      type,
+      clientEventId: nextClientEventId(),
+      sentAt: new Date().toISOString()
+    });
     const currentPopupText = () => {
       if (getPopup() === "transcript") {
         return transcriptText({ transcript: getTranscript() });
@@ -542,6 +597,16 @@ export async function tui(api) {
     const handlePttKey = () =>
       mutate(() => {
         if (getArmed()) {
+          const stopEvent = protocolBase("ptt.stop");
+          sendProtocol({
+            ...stopEvent,
+            matchingStartEventId: activePttStartEventId,
+            turnId: activePttTurnId,
+            reason: "tap.toggle",
+            eventType: "tap"
+          });
+          activePttTurnId = undefined;
+          activePttStartEventId = undefined;
           setArmed(false);
           setLive(false);
           setEvent("m stopped");
@@ -550,6 +615,16 @@ export async function tui(api) {
           recordSmoke("ptt.state", { armed: false, via: "m-stop" });
           return;
         }
+        const startEvent = protocolBase("ptt.start");
+        activePttTurnId = nextTurnId();
+        activePttStartEventId = startEvent.clientEventId;
+        sendProtocol({
+          ...startEvent,
+          turnId: activePttTurnId,
+          inputMode: "ptt",
+          key: "M",
+          eventType: "press"
+        });
         setArmed(true);
         setLive(false);
         setEvent("m armed");

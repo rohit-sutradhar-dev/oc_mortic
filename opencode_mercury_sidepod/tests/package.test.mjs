@@ -68,6 +68,21 @@ test("exit confirmation and popup keys are scoped", () => {
   assert.match(src, /recordSmoke\("popup\.copy"/);
 });
 
+test("plain M toggle emits protocol v0 PTT controls", () => {
+  assert.match(src, /MORTIC_HELPER_WS_URL/);
+  assert.match(src, /new WebSocketCtor\(HELPER_WS_URL\)/);
+  assert.match(src, /recordSmoke\("protocol\.send"/);
+  assert.match(src, /protocolBase\("ptt\.start"\)/);
+  assert.match(src, /inputMode:\s*"ptt"/);
+  assert.match(src, /key:\s*"M"/);
+  assert.match(src, /protocolBase\("ptt\.stop"\)/);
+  assert.match(src, /matchingStartEventId:\s*activePttStartEventId/);
+  assert.match(src, /reason:\s*"tap\.toggle"/);
+  assert.match(src, /turnId:\s*activePttTurnId/);
+  assert.match(src, /key:\s*"m",\s*cmd:\s*"mortic\.ptt\.press"/);
+  assert.match(src, /mode:\s*"mortic\.sidepod"[\s\S]*mortic\.ptt\.press/);
+});
+
 test("slash registration matches OpenCode 1.17.x reachability rules", () => {
   // Slash menu requires a flat slashName on the layer command; the nested
   // legacy shape `slash: { name }` is only honored by deprecated api.command.
