@@ -1,4 +1,4 @@
-// Runtime validator for the Mortic sidepod <-> engine protocol v0.
+// Wire-message validator for the Mortic sidepod <-> engine protocol v0.
 // Interprets the generated JSON Schema in protocol.gen.mjs (source of truth:
 // protocol/schema.ts). Dependency-free on purpose: the plugin ships src/ only.
 //

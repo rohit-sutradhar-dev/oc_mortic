@@ -131,8 +131,7 @@ test("command deck uses key-true labels and a single mic control", () => {
 });
 
 test("the mic toggle emits protocol v0 live.set and drops PTT plumbing", () => {
-  assert.match(src, /MORTIC_HELPER_WS_URL/);
-  assert.match(src, /new WebSocketCtor\(HELPER_WS_URL\)/);
+  assert.match(src, /new WebSocketCtor\(helperWsUrl\(\)\)/);
   assert.match(src, /recordSmoke\("protocol\.send"/);
   assert.match(src, /const toggleMic = \(\) => \{/);
   assert.match(src, /protocolBase\("live\.set"\)/);
@@ -166,8 +165,63 @@ test("slash registration matches OpenCode 1.17.x reachability rules", () => {
   assert.match(src, /mode:\s*"mortic\.sidepod"/);
 });
 
-test("normal UI source does not expose provider or runtime names", () => {
-  for (const forbidden of ["Mercury", "mercury", "Inception", "Deepgram", "runtime"]) {
-    assert.equal(src.includes(forbidden), false);
+test("normal UI source does not expose provider or runtime names", async () => {
+  // Case-insensitive and across every shipped source module — the earlier
+  // capitalized-only check let a lowercase provider event name slip through
+  // review on an external branch.
+  const sources = [
+    "src/tui.js",
+    "src/index.js",
+    "src/helper-launcher.mjs",
+    "src/lane-reducer.mjs",
+    "src/protocol-validate.mjs",
+    "src/protocol.gen.mjs",
+    "src/host-context.mjs"
+  ];
+  for (const file of sources) {
+    const content = (await readFile(join(rootDir, file), "utf8")).toLowerCase();
+    for (const forbidden of ["mercury", "inception", "deepgram", "runtime", "flux", "aura"]) {
+      assert.equal(content.includes(forbidden), false, `${file} exposes: ${forbidden}`);
+    }
   }
+});
+
+test("focus starts the voice lane bound to the focused thread", () => {
+  // Focus is non-blocking: the helper is discovered/launched asynchronously
+  // while the caption shows CONNECTING/OFFLINE instead of a silent wait.
+  assert.match(src, /recordSmoke\("focus"\);\s*\}\);\s*startVoiceLane\(\)/);
+  assert.match(src, /ensureHelper\(\{/);
+  assert.match(src, /CONNECTING VOICE/);
+  assert.match(src, /VOICE OFFLINE · M TO RETRY/);
+  // start carries the focused thread's session id and pins the engine to the
+  // OpenCode server that owns it.
+  assert.match(src, /protocolBase\("start"\)/);
+  assert.match(src, /sourceSessionId:\s*String\(sessionId\)/);
+  assert.match(src, /keepFork:\s*false/);
+  assert.match(src, /start\.opencodeUrl\s*=/);
+  assert.match(src, /protocolVersion:\s*PROTOCOL_VERSION/);
+  // The helper is only ever launched from the focus path, never at load time.
+  assert.equal(src.match(/ensureHelper\(/g).length, 1);
+  assert.match(src, /const startVoiceLane = \(\) => \{[\s\S]*?ensureHelper\(\{/);
+});
+
+test("the lane client validates both directions against the shared schema", () => {
+  assert.match(src, /checkMessage\("command", payload\)/);
+  assert.match(src, /checkMessage\("event", payload\)/);
+  assert.match(src, /recordSmoke\("protocol\.outbound\.invalid"/);
+  assert.match(src, /recordSmoke\("protocol\.recv\.unknown"/);
+  assert.match(src, /recordSmoke\("protocol\.recv\.invalid"/);
+  assert.match(src, /reduceLaneEvent\(laneState, event\)/);
+  // Reconnect backs off instead of hammering a dead helper.
+  assert.match(src, /backoffMs = Math\.min\(backoffMs \* 2, 8000\)/);
+});
+
+test("end session sends stop and muting mid-reply barges in", () => {
+  assert.match(src, /stopVoiceLane\("user\.end_session"\)/);
+  assert.match(src, /protocolBase\("stop"\)/);
+  assert.match(src, /STOP_ACK_TIMEOUT_MS/);
+  assert.match(src, /event\.type === "stopped" && stopAckTimer/);
+  assert.match(src, /stopVoiceLane\("client\.shutdown"\)/);
+  assert.match(src, /protocolBase\("barge_in"\)/);
+  assert.match(src, /reason:\s*"user\.mute"/);
 });

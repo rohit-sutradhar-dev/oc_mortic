@@ -2,13 +2,19 @@ import { appendFileSync } from "node:fs";
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal } from "solid-js";
 
+import { ensureHelper, helperWsUrl, stopHelper } from "./helper-launcher.mjs";
+import { createLaneState, reduceLaneEvent } from "./lane-reducer.mjs";
+import { checkMessage } from "./protocol-validate.mjs";
+import { PROTOCOL_VERSION } from "./protocol.gen.mjs";
+import { opencodeServerUrl } from "./host-context.mjs";
+
 const WIDTH = 36;
 const INNER = WIDTH - 2;
 // Centered host dialogs are wider than the sidepod column.
 const MODAL_INNER = 60;
 const MODAL_PAGE = 14;
 const SMOKE_SINK = globalThis.process?.env?.MORTIC_SMOKE_LOG;
-const HELPER_WS_URL = globalThis.process?.env?.MORTIC_HELPER_WS_URL ?? "ws://127.0.0.1:8765/ws/sidepod";
+const STOP_ACK_TIMEOUT_MS = 2000;
 
 function element(type, props = {}, children = []) {
   const node = createElement(type);
@@ -173,10 +179,17 @@ function commandRow(key, label, status, color, onMouseDown) {
 
 // One state bit is the entire voice control surface: mic muted or mic live.
 // Turn segmentation is the engine's job (native end-of-turn detection lives
-// server-side); the UI only gates whether the mic may listen.
+// server-side); the UI only gates whether the mic may listen. Lane transport
+// state outranks mic state in the caption so a dead engine is never silent.
 function heroCaption(state) {
   if (!state.focused) {
     return "/MORTIC TO FOCUS";
+  }
+  if (state.laneStatus === "offline") {
+    return "VOICE OFFLINE · M TO RETRY";
+  }
+  if (state.laneStatus === "connecting") {
+    return "CONNECTING VOICE…";
   }
   return state.micLive ? "MIC LIVE · M TO MUTE" : "MIC MUTED · M TO TALK";
 }
@@ -287,16 +300,38 @@ function logSmoke(api, event, details = {}) {
   }
 }
 
-function createProtocolSender(recordSmoke) {
+// Voice-lane protocol client. Socket lifetime = lane lifetime: opened on
+// focus, closed after an acknowledged stop (or its timeout). Both directions
+// are validated against the generated v0 schema — off-contract outbound is
+// dropped before it reaches the wire, off-contract inbound never reaches the
+// reducer, and unknown inbound types are logged and ignored per the
+// compatibility rules.
+function createLaneClient({ recordSmoke, onEvent, onOpen, onDown }) {
   const WebSocketCtor = globalThis.WebSocket;
   let socket;
+  let closedByUs = true;
+  let backoffMs = 500;
+  let reconnectTimer;
   const queue = [];
   const flush = () => {
     while (socket?.readyState === 1 && queue.length) {
       socket.send(queue.shift());
     }
   };
-  const open = () => {
+  const scheduleReconnect = () => {
+    if (closedByUs || reconnectTimer) {
+      return;
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      dial();
+    }, backoffMs);
+    backoffMs = Math.min(backoffMs * 2, 8000);
+  };
+  const dial = () => {
+    if (closedByUs) {
+      return;
+    }
     if (!WebSocketCtor) {
       recordSmoke("protocol.unavailable", { reason: "websocket-missing" });
       return;
@@ -305,33 +340,88 @@ function createProtocolSender(recordSmoke) {
       return;
     }
     try {
-      socket = new WebSocketCtor(HELPER_WS_URL);
-      socket.onopen = flush;
+      socket = new WebSocketCtor(helperWsUrl());
+      socket.onopen = () => {
+        backoffMs = 500;
+        flush();
+        onOpen();
+      };
+      socket.onmessage = (message) => {
+        let payload;
+        try {
+          payload = JSON.parse(message.data);
+        } catch {
+          recordSmoke("protocol.recv.invalid", { reason: "bad-json" });
+          return;
+        }
+        const check = checkMessage("event", payload);
+        if (check.ok) {
+          recordSmoke("protocol.recv", { type: payload.type });
+          onEvent(payload);
+        } else if (check.unknownType) {
+          recordSmoke("protocol.recv.unknown", { type: payload.type });
+        } else {
+          recordSmoke("protocol.recv.invalid", { type: payload.type, errors: check.errors });
+        }
+      };
       socket.onclose = () => {
         socket = undefined;
+        if (!closedByUs) {
+          onDown();
+          scheduleReconnect();
+        }
       };
       socket.onerror = () => {
         recordSmoke("protocol.unavailable", { reason: "websocket-error" });
       };
     } catch {
       recordSmoke("protocol.unavailable", { reason: "websocket-open-failed" });
+      scheduleReconnect();
     }
   };
-  return (payload) => {
-    const serialized = JSON.stringify(payload);
-    recordSmoke("protocol.send", { type: payload.type, turnId: payload.turnId });
-    if (socket?.readyState === 1) {
-      socket.send(serialized);
-      return;
-    }
-    // Never replay a long backlog of stale queued events when the helper
-    // reconnects: keep only a short queue and drop the oldest beyond it.
-    queue.push(serialized);
-    if (queue.length > 16) {
-      queue.shift();
-      recordSmoke("protocol.drop", { reason: "queue-full" });
-    }
-    open();
+  return {
+    connect() {
+      closedByUs = false;
+      backoffMs = 500;
+      dial();
+    },
+    send(payload) {
+      const check = checkMessage("command", payload);
+      if (!check.ok) {
+        recordSmoke("protocol.outbound.invalid", { type: payload?.type, errors: check.errors });
+        return false;
+      }
+      const serialized = JSON.stringify(payload);
+      recordSmoke("protocol.send", { type: payload.type });
+      if (socket?.readyState === 1) {
+        socket.send(serialized);
+        return true;
+      }
+      // Never replay a long backlog of stale queued events when the helper
+      // reconnects: keep only a short queue and drop the oldest beyond it.
+      queue.push(serialized);
+      if (queue.length > 16) {
+        queue.shift();
+        recordSmoke("protocol.drop", { reason: "queue-full" });
+      }
+      dial();
+      return true;
+    },
+    close() {
+      closedByUs = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
+      queue.length = 0;
+      try {
+        socket?.close();
+      } catch {
+        // closing a dead socket is fine
+      }
+      socket = undefined;
+    },
+    isConnected: () => socket?.readyState === 1
   };
 }
 
@@ -344,8 +434,15 @@ function renderPromptAnnex(state, theme) {
   if (!state.focused) {
     return text({}, [""]);
   }
-  const label = state.micLive ? "MIC LIVE" : "MIC MUTED";
-  const color = state.micLive ? theme.success : theme.textMuted;
+  let label = state.micLive ? "MIC LIVE" : "MIC MUTED";
+  let color = state.micLive ? theme.success : theme.textMuted;
+  if (state.laneStatus === "offline") {
+    label = "VOICE OFFLINE";
+    color = theme.error;
+  } else if (state.laneStatus === "connecting") {
+    label = "CONNECTING";
+    color = theme.warning;
+  }
   return text({ fg: color }, [`MORTIC · ${label} — Esc exit`]);
 }
 
@@ -372,6 +469,9 @@ const id = "mortic.sidepod";
 export async function tui(api) {
     const [getMicLive, setMicLive] = createSignal(false);
     const [getFocused, setFocused] = createSignal(false);
+    // idle -> connecting -> ready/thinking/speaking, or offline when the
+    // helper cannot be reached. Drives the hero caption and prompt annex.
+    const [getLaneStatus, setLaneStatus] = createSignal("idle");
     const [getModal, setModal] = createSignal(null);
     const [getModalScroll, setModalScroll] = createSignal(0);
     const [getPhase, setPhase] = createSignal(0);
@@ -445,6 +545,7 @@ export async function tui(api) {
         setFocused(true);
         recordSmoke("focus");
       });
+      startVoiceLane();
     };
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
@@ -560,6 +661,10 @@ export async function tui(api) {
         recordSmoke("exit.confirmed");
         setModal(null);
         api.ui.dialog.clear();
+        // Tell the engine to tear the lane down (stop -> stopped ack closes
+        // the socket; a 2s timeout closes it regardless). UI flush is local
+        // and immediate either way.
+        stopVoiceLane("user.end_session");
         setMicLive(false);
         setUserText("Mortic session ended.");
         setAssistantText("Start Mortic again for a fresh voice lane.");
@@ -606,13 +711,133 @@ export async function tui(api) {
       }
       openModal("handoff");
     };
-    const sendProtocol = createProtocolSender(recordSmoke);
     const nextClientEventId = () => `evt_sidepod_${Date.now().toString(36)}_${++clientEventSeq}`;
     const protocolBase = (type) => ({
       type,
       clientEventId: nextClientEventId(),
       sentAt: new Date().toISOString()
     });
+
+    // --- voice lane ---------------------------------------------------------
+    let laneState = createLaneState();
+    let stopAckTimer;
+    let offlineToastShown = false;
+
+    const applyLaneUi = (ui) => {
+      if (!ui) {
+        return;
+      }
+      mutate(() => {
+        if (ui.status) {
+          setLaneStatus(ui.status === "ended" ? "idle" : ui.status);
+        }
+        if (typeof ui.micLive === "boolean") {
+          setMicLive(ui.micLive);
+        }
+        if (ui.userText !== undefined) {
+          setUserText(ui.userText);
+        }
+        if (ui.assistantText !== undefined) {
+          setAssistantText(ui.assistantText);
+        }
+        for (const item of ui.appendTranscript ?? []) {
+          appendTranscript(item.role, item.text);
+        }
+        if (ui.toast) {
+          api.ui.toast(ui.toast);
+        }
+        if (ui.smoke) {
+          recordSmoke(ui.smoke.event, ui.smoke.details ?? {});
+        }
+      });
+    };
+
+    const laneClient = createLaneClient({
+      recordSmoke,
+      onEvent: (event) => {
+        const result = reduceLaneEvent(laneState, event);
+        laneState = result.state;
+        if (event.type === "stopped" && stopAckTimer) {
+          clearTimeout(stopAckTimer);
+          stopAckTimer = undefined;
+          laneClient.close();
+        }
+        applyLaneUi(result.ui);
+      },
+      onOpen: () => sendStart(),
+      onDown: () => {
+        if (getFocused()) {
+          mutate(() => setLaneStatus("connecting"));
+        }
+      }
+    });
+
+    // The sidepod converses over the thread it was focused from: start carries
+    // that thread's session id, and opencodeUrl pins the engine to the server
+    // that owns it (recorded by the hook entry, env fallback for dev).
+    const sourceSessionId = () => {
+      const params = api.route.current?.params ?? {};
+      return params.sessionID ?? params.sessionId ?? params.session_id ?? params.id;
+    };
+    const sendStart = () => {
+      const sessionId = sourceSessionId();
+      if (!sessionId) {
+        return;
+      }
+      const start = {
+        ...protocolBase("start"),
+        protocolVersion: PROTOCOL_VERSION,
+        sourceSessionId: String(sessionId),
+        keepFork: false
+      };
+      const opencodeUrl = opencodeServerUrl() ?? globalThis.process?.env?.OPENCODE_VOICE_OPENCODE_URL;
+      if (opencodeUrl) {
+        start.opencodeUrl = String(opencodeUrl);
+      }
+      laneClient.send(start);
+    };
+
+    // Non-blocking: focus proceeds immediately while the helper is discovered
+    // or launched; the caption shows CONNECTING/OFFLINE instead of a silent
+    // wait, and M retries from the offline state.
+    const startVoiceLane = () => {
+      if (getLaneStatus() === "connecting") {
+        return;
+      }
+      mutate(() => setLaneStatus("connecting"));
+      ensureHelper({ opencodeUrl: opencodeServerUrl(), log: recordSmoke })
+        .then((result) => {
+          if (!result.ready) {
+            mutate(() => setLaneStatus("offline"));
+            if (!offlineToastShown) {
+              offlineToastShown = true;
+              api.ui.toast({ variant: "error", message: "Voice engine offline. Tap M to retry." });
+            }
+            return;
+          }
+          offlineToastShown = false;
+          laneClient.connect();
+          if (laneClient.isConnected()) {
+            sendStart();
+          }
+        })
+        .catch(() => mutate(() => setLaneStatus("offline")));
+    };
+
+    const stopVoiceLane = (reason) => {
+      laneState = createLaneState();
+      if (laneClient.isConnected()) {
+        laneClient.send({ ...protocolBase("stop"), reason });
+        stopAckTimer = setTimeout(() => {
+          stopAckTimer = undefined;
+          laneClient.close();
+        }, STOP_ACK_TIMEOUT_MS);
+      } else {
+        laneClient.close();
+      }
+      setLaneStatus("idle");
+    };
+    // ------------------------------------------------------------------------
     // PTT and Live collapsed into a single mic mute/unmute toggle (owner
     // decision 2026-07-03): the tap-toggle PTT model degenerated into "toggle
     // listening", which is what Live already was — two controls with no real
@@ -622,10 +847,20 @@ export async function tui(api) {
       if (getModal()) {
         return;
       }
+      // With the lane down, M is the retry control instead of a dead switch.
+      const laneStatus = getLaneStatus();
+      if (laneStatus === "offline" || laneStatus === "idle") {
+        startVoiceLane();
+        return;
+      }
       mutate(() => {
         const next = !getMicLive();
         setMicLive(next);
-        sendProtocol({ ...protocolBase("live.set"), value: next, reason: "user.toggle" });
+        if (!next && laneStatus === "speaking") {
+          // Muting mid-reply is an explicit interruption, not just a gate.
+          laneClient.send({ ...protocolBase("barge_in"), reason: "user.mute" });
+        }
+        laneClient.send({ ...protocolBase("live.set"), value: next, reason: "user.toggle" });
         setUserText(next ? "Mic is live. Speak normally." : "Mic is muted. Tap M to talk.");
         appendTranscript("user", next ? "Mic unmuted." : "Mic muted.");
         recordSmoke("mic.state", { live: next, via: next ? "m-unmute" : "m-mute" });
@@ -734,6 +969,10 @@ export async function tui(api) {
       }
     });
     api.lifecycle.onDispose(() => exitMorticMode?.());
+    api.lifecycle.onDispose(() => {
+      stopVoiceLane("client.shutdown");
+      stopHelper();
+    });
 
     // Memoized so sidebar_content and session_prompt_right (both re-rendered
     // by the host on every requestRender) share one computed state instead of
@@ -745,6 +984,7 @@ export async function tui(api) {
       return {
         micLive: getMicLive(),
         focused: getFocused(),
+        laneStatus: getLaneStatus(),
         phase: getPhase(),
         userText: getUserText(),
         assistantText: getAssistantText(),
@@ -752,7 +992,11 @@ export async function tui(api) {
         handoffReady: transcript.length > 1
       };
     });
-    const getAnnexState = createMemo(() => ({ focused: getFocused(), micLive: getMicLive() }));
+    const getAnnexState = createMemo(() => ({
+      focused: getFocused(),
+      micLive: getMicLive(),
+      laneStatus: getLaneStatus()
+    }));
 
     api.slots.register({
       order: 760,
