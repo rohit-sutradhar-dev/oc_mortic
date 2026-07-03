@@ -52,6 +52,22 @@ test("focus mode locks typing and PTT is a plain M toggle", () => {
   assert.match(src, /currentFocusedRenderable/);
 });
 
+test("exit confirmation and popup keys are scoped", () => {
+  assert.match(src, /setPopup\("exit"\)/);
+  assert.match(src, /getPopup\(\) === "exit"[\s\S]*confirmExit\(\)/);
+  assert.match(src, /setTranscript\(\[\]\)/);
+  assert.match(src, /restorePromptFocus\(\)/);
+  assert.match(src, /key:\s*"escape",\s*cmd:\s*"mortic\.escape"/);
+  assert.match(src, /key:\s*"c",\s*cmd:\s*"mortic\.popup\.copy"/);
+  assert.match(src, /key:\s*"x",\s*cmd:\s*"mortic\.popup\.close"/);
+  assert.equal(/key:\s*"c",\s*cmd:\s*"mortic\.clear"/.test(src), false);
+  assert.match(src, /if \(getPopup\(\)\) {\s*copyPopup\(\);[\s\S]*} else {\s*clearLane\(\);/);
+  assert.match(src, /H HANDOFF[\s\S]*actions\.openHandoff/);
+  assert.match(src, /recordSmoke\("exit\.confirm\.open"\)/);
+  assert.match(src, /recordSmoke\("exit\.confirmed"\)/);
+  assert.match(src, /recordSmoke\("popup\.copy"/);
+});
+
 test("slash registration matches OpenCode 1.17.x reachability rules", () => {
   // Slash menu requires a flat slashName on the layer command; the nested
   // legacy shape `slash: { name }` is only honored by deprecated api.command.

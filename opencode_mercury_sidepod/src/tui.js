@@ -270,13 +270,24 @@ function renderPopup(state, actions, theme) {
   const accent = theme.accent;
   const danger = theme.error;
   const isTranscript = state.popup === "transcript";
-  const title = isTranscript ? "TRANSCRIPT" : "HANDOFF";
-  const lines = isTranscript ? transcriptLines(state) : handoffLines();
+  const isExit = state.popup === "exit";
+  const title = isExit ? "END SESSION" : isTranscript ? "TRANSCRIPT" : "HANDOFF";
+  const lines = isExit ? exitLines() : isTranscript ? transcriptLines(state) : handoffLines();
+  const controls = isExit
+    ? [
+        clickable(`┃  H HANDOFF${" ".repeat(Math.max(0, INNER - 11))}┃`, accent, actions.openHandoff),
+        clickable(`┃  C COPY${" ".repeat(Math.max(0, INNER - 8))}┃`, accent, actions.copyPopup),
+        clickable(`┃  X CLOSE${" ".repeat(Math.max(0, INNER - 9))}┃`, danger, actions.closePopup),
+        clickable(`┃  ESC END${" ".repeat(Math.max(0, INNER - 9))}┃`, danger, actions.confirmExit)
+      ]
+    : [
+        clickable(`┃  C COPY${" ".repeat(Math.max(0, INNER - 8))}┃`, accent, actions.copyPopup),
+        clickable(`┃  X CLOSE${" ".repeat(Math.max(0, INNER - 9))}┃`, danger, actions.closePopup)
+      ];
   return [
     line("", theme.textMuted),
     ...frame(title, lines.slice(0, 9), theme.text, accent, "modal"),
-    clickable(`┃  C COPY${" ".repeat(Math.max(0, INNER - 8))}┃`, accent, () => actions.copy(isTranscript ? transcriptText(state) : handoffText(state))),
-    clickable(`┃  X CLOSE${" ".repeat(Math.max(0, INNER - 9))}┃`, danger, actions.closePopup),
+    ...controls,
     line(`┗${"━".repeat(WIDTH - 2)}┛`, accent)
   ];
 }
@@ -305,6 +316,14 @@ function handoffText(state) {
 
 function handoffLines() {
   return wrap("Handoff draft prepared from the current voice lane. Spoken text stays short; screen-only details stay separate.", INNER);
+}
+
+function exitText() {
+  return "End Mortic session. Current lane is ephemeral; open Handoff first if you want a copy.";
+}
+
+function exitLines() {
+  return wrap(exitText(), INNER);
 }
 
 // PTT is a plain M toggle by product decision (2026-07-03). Terminal
@@ -397,6 +416,16 @@ export async function tui(api) {
     let exitMorticMode;
     let previousFocus;
 
+    const restorePromptFocus = () => {
+      if (exitMorticMode) {
+        exitMorticMode();
+        exitMorticMode = undefined;
+      }
+      previousFocus?.focus?.();
+      previousFocus = undefined;
+      setFocused(false);
+    };
+
     const focusMortic = () =>
       mutate(() => {
         if (!exitMorticMode) {
@@ -412,17 +441,31 @@ export async function tui(api) {
         recordSmoke("focus");
         setEvent("focus mode");
       });
-    const blurMortic = () =>
+    const openExitConfirm = () =>
       mutate(() => {
-        if (exitMorticMode) {
-          exitMorticMode();
-          exitMorticMode = undefined;
-        }
-        previousFocus?.focus?.();
-        previousFocus = undefined;
-        setFocused(false);
-        setEvent("prompt mode");
+        setPopup("exit");
+        setEvent("confirm exit");
+        recordSmoke("exit.confirm.open");
       });
+    const confirmExit = () =>
+      mutate(() => {
+        recordSmoke("exit.confirmed");
+        setPopup(null);
+        setArmed(false);
+        setLive(false);
+        setEvent("session ended");
+        setUserText("Mortic session ended.");
+        setAssistantText("Start Mortic again for a fresh voice lane.");
+        setTranscript([]);
+        restorePromptFocus();
+      });
+    const handleEscape = () => {
+      if (getPopup() === "exit") {
+        confirmExit();
+      } else {
+        openExitConfirm();
+      }
+    };
     const toggleLive = () =>
       mutate(() => {
         const next = !getLive();
@@ -465,6 +508,35 @@ export async function tui(api) {
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
     };
+    const currentPopupText = () => {
+      if (getPopup() === "transcript") {
+        return transcriptText({ transcript: getTranscript() });
+      }
+      if (getPopup() === "handoff") {
+        return handoffText({ userText: getUserText(), assistantText: getAssistantText() });
+      }
+      if (getPopup() === "exit") {
+        return exitText();
+      }
+      return "";
+    };
+    const copyPopup = () => {
+      recordSmoke("popup.copy", { popup: getPopup() || "none" });
+      copyValue(currentPopupText());
+    };
+    const handleCopyOrClear = () => {
+      if (getPopup()) {
+        copyPopup();
+      } else {
+        clearLane();
+      }
+    };
+    const handleClosePopup = () => {
+      if (getPopup()) {
+        recordSmoke("popup.close", { popup: getPopup() });
+        closePopup();
+      }
+    };
     // Plain M toggle by product decision (2026-07-03): every M press flips
     // armed/stopped. No repeat debounce, no event-type handling, no timing.
     const handlePttKey = () =>
@@ -487,11 +559,12 @@ export async function tui(api) {
       });
 
     const modeBindings = [
-      { key: "escape", cmd: "mortic.blur", desc: "Return to prompt" },
+      { key: "escape", cmd: "mortic.escape", desc: "Exit Mortic" },
       { key: "m", cmd: "mortic.ptt.press", desc: "Tap M PTT" },
       { key: "p", cmd: "mortic.ptt.press", desc: "Push to Talk" },
       { key: "l", cmd: "mortic.live", desc: "Toggle Live" },
-      { key: "c", cmd: "mortic.clear", desc: "Clear lane" },
+      { key: "c", cmd: "mortic.popup.copy", desc: "Copy popup or clear lane" },
+      { key: "x", cmd: "mortic.popup.close", desc: "Close popup" },
       { key: "t", cmd: "mortic.transcript", desc: "Transcript popup" },
       { key: "h", cmd: "mortic.handoff", desc: "Handoff popup" }
     ];
@@ -527,7 +600,8 @@ export async function tui(api) {
       openTranscript,
       openHandoff,
       closePopup,
-      copy: copyValue
+      copyPopup,
+      confirmExit
     };
 
     // Palette layer must stay unpinned: mode-pinned layers are not "reachable"
@@ -551,10 +625,11 @@ export async function tui(api) {
     api.keymap.registerLayer({
       mode: "mortic.sidepod",
       commands: [
-        { name: "mortic.blur", title: "Mortic: Return to prompt", category: "Mortic", run: blurMortic },
+        { name: "mortic.escape", title: "Mortic: Exit session", category: "Mortic", run: handleEscape },
         { name: "mortic.ptt.press", title: "Mortic: Push-to-talk toggle", category: "Mortic", run: handlePttKey },
         { name: "mortic.live", title: "Mortic: Toggle Live", category: "Mortic", run: toggleLive },
-        { name: "mortic.clear", title: "Mortic: Clear lane", category: "Mortic", run: clearLane },
+        { name: "mortic.popup.copy", title: "Mortic: Copy popup or clear lane", category: "Mortic", run: handleCopyOrClear },
+        { name: "mortic.popup.close", title: "Mortic: Close popup", category: "Mortic", run: handleClosePopup },
         { name: "mortic.transcript", title: "Mortic: Transcript popup", category: "Mortic", run: openTranscript },
         { name: "mortic.handoff", title: "Mortic: Handoff popup", category: "Mortic", run: openHandoff }
       ],
