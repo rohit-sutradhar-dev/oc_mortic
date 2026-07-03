@@ -57,6 +57,8 @@ test("slash registration matches OpenCode 1.17.x reachability rules", () => {
   // legacy shape `slash: { name }` is only honored by deprecated api.command.
   assert.match(src, /slashName:\s*"mortic"/);
   assert.equal(/slash:\s*{/.test(src), false);
+  assert.match(src, /name:\s*"mortic\.focus"[\s\S]*slashName:\s*"mortic"[\s\S]*run:\s*focusMortic/);
+  assert.equal(/api\.(?:prompt|chat|message)\b/.test(src), false);
 
   // The palette layer must not be mode-pinned or the prompt's slash menu
   // treats its commands as unreachable. Only the focus-mode layer pins a mode.
