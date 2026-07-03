@@ -22,7 +22,7 @@ Platform-owned responsibilities:
 
 - Native sidepod UX, layout, retained Mortic visual language, sprite states, COMMS, Transcript, Handoff, and Config stub.
 - `/mortic` focus entrypoint and prevention of prompt leakage.
-- Focus-mode key handling, including `M` PTT isolation, Live, Refresh, Config, Transcript, Handoff, and Esc behavior.
+- Focus-mode key handling, including `M` mic-toggle isolation (PTT and Live merged 2026-07-03), Clear, Refresh, Config, Transcript, Handoff, and Esc/End Session behavior.
 - Confirmation UX for Refresh and Esc.
 - Protocol client that sends v0 sidepod commands and renders v0 engine events.
 - OpenCode sandboxing, plugin lifecycle, sidebar slots, keymap layers, and install constraints.

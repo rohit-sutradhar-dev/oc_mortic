@@ -86,7 +86,7 @@ All verified against the installed OpenCode 1.17.11 SDK/binary, current vendor d
 - **Churn risk:** official docs cover hook plugins only; the TUI sidebar API (slots/keymap/modes) is typed but underdocumented, and `api.command` is already marked "Remove in v2." Pin the tested OpenCode version; use `api.keymap.registerLayer` exclusively.
 
 ### PRD §25 open questions — recommended answers
-1. **PTT key**: `M` per PRD; hold-to-talk gated on Kitty-protocol detection (`renderer.useKittyKeyboard`), tap-to-arm/tap-to-stop fallback elsewhere; `Space` optional alias.
+1. **PTT key**: `M` per PRD; hold-to-talk gated on Kitty-protocol detection (`renderer.useKittyKeyboard`), tap-to-arm/tap-to-stop fallback elsewhere; `Space` optional alias. *[Superseded 2026-07-03: live investigation showed no real terminal delivers key releases for plain keys, and the tap-toggle fallback then merged with Live into a single `M` mic mute/unmute toggle emitting `live.set` — see `docs/MORTIC_TERMINAL_CAPABILITY_SMOKE.md` and the PRD Revision section.]*
 2. **Handoff generation**: helper-side direct Mercury call over the local turn log (not an OpenCode agent turn) — cheaper, faster, no fork dependency; the transcript is the PRD-specified source anyway.
 3. **Debug mode**: logs-only in v1; no hidden panel.
 4. **Config stub**: placeholder popup (`Config coming later`) — reuses the existing popup host.

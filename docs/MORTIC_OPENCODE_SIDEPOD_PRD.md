@@ -6,6 +6,17 @@ Date: 2026-06-30
 Primary surface: Native OpenCode TUI sidebar plugin
 Backend direction: For now - Mercury Inception Key to be configured for local dev-server. Later we will build proxy to serve through our key without user visibility on what model we are running to get this done.
 
+## Revision: Interaction Model (2026-07-03, owner-directed after live testing)
+
+The shipped v1 interaction model supersedes the PTT/Live design throughout this document. Where text below conflicts with this section, this section wins; mockups and state machines below are kept for design-language reference only.
+
+1. **PTT and Live are merged into a single mic mute/unmute toggle.** Hold-to-talk proved terminal-infeasible (no key-release events for plain keys in real terminals — full investigation in `docs/MORTIC_TERMINAL_CAPABILITY_SMOKE.md`), and the tap-toggle fallback had degenerated into "toggle listening", which is what Live already was. One state bit remains: mic muted or mic live. `M` toggles it. There is no separate `L Live` control. Turn segmentation (where a spoken turn starts and ends) belongs to the engine's end-of-turn detection, not to a UI key.
+2. **Protocol**: the sidepod sends `live.set { value }` on every `M` press. `ptt.start`/`ptt.stop` remain defined in protocol v0 for a possible future hold-to-talk client but are not sent by the v1 sidepod.
+3. **Command deck (shipped)**: `[M] Microphone` (LIVE/MUTED), `[X] Clear Lane`, `[T] Transcript`, `[H] Handoff`, `[ESC] End Session`. `C Config` is deferred (MOR-100); confirmed Refresh (`R`, engine fork reset) lands with the engine integration (MOR-96).
+4. **Esc is never destructive.** Esc opens a centered End Session dialog (Mortic sessions are ephemeral per thread/fork to avoid stale-context sync); ending requires an explicit `enter` confirm inside that dialog, with `h` offered to open Handoff first. Esc inside any dialog closes/cancels only.
+5. **Popups are centered host dialogs** (OpenCode's own dialog surface), not in-sidepod panels. Focus/typing-lock state renders persistently beside the OpenCode prompt row while Mortic is focused.
+6. `/mortic` refuses to focus when no OpenCode session is open (the sidepod cannot render there) and explains why via toast, rather than silently locking typing.
+
 ## 1. Executive Summary
 
 Mortic should become a native OpenCode sidepod that lets a user speak to an isolated ephemeral fork of the current OpenCode thread with minimal friction. The user should be able to push-to-talk, leave live voice enabled, refresh/reset the voice fork, inspect the current spoken turn, open a transcript popup, and generate/copy a handoff without leaving the keyboard.
@@ -279,10 +290,13 @@ Avoid:
 
 The command deck should expose exactly the controls a voice user expects:
 
+> Revised 2026-07-03 (see the Revision section at the top): the shipped deck is `[M] Microphone`, `[X] Clear Lane`, `[T] Transcript`, `[H] Handoff`, `[ESC] End Session`. The Microphone row replaces both PTT and Live below.
+
 | Command | Primary Key | Mouse Label | Behavior |
 | --- | --- | --- | --- |
-| Push to Talk | `M` hold preferred | `Hold M` / `PTT` | Starts capture while active; sends final transcript on release/end-of-turn. |
-| Live Voice | `L` | `Live` | Toggles continuous listening with barge-in behavior. |
+| Microphone (shipped) | `M` | `Microphone` | Toggles the mic live/muted; sends `live.set`. Turn boundaries come from engine end-of-turn detection. |
+| ~~Push to Talk~~ (superseded) | `M` hold preferred | `Hold M` / `PTT` | Starts capture while active; sends final transcript on release/end-of-turn. |
+| ~~Live Voice~~ (superseded) | `L` | `Live` | Toggles continuous listening with barge-in behavior. |
 | Refresh | `R` | `Refresh` | Opens a confirmation prompt. On confirm, stops any active voice turn, discards the current ephemeral voice fork, creates a fresh fork from the active OpenCode thread, and resets COMMS to Ready. |
 | Config | `C` | `C Config` | Non-functional stub for future account/API key/subscription settings. Included now to keep the command deck visually balanced and to reserve the product surface. |
 | Transcript | `T` | `Transcript` | Opens transcript popup. |
@@ -329,15 +343,14 @@ Base mode:
 
 - `/mortic`: focus Mortic sidepod without sending a conversation turn to the model.
 
-Mortic focus mode:
+Mortic focus mode (revised 2026-07-03; shipped set):
 
-- `m`: push-to-talk.
-- `l`: toggle Live.
-- `r`: ask for confirmation to Refresh/reset the voice lane.
-- `c`: Config stub.
-- `t`: open Transcript popup.
-- `h`: open Handoff popup.
-- `escape`: close popup if open; otherwise ask for confirmation to exit/reset Mortic focus and return to the OpenCode prompt.
+- `m`: toggle mic live/muted (replaces push-to-talk and Live).
+- `x`: clear the voice lane.
+- `t`: open Transcript dialog.
+- `h`: open Handoff dialog.
+- `escape`: close dialog if open; otherwise open the End Session dialog (ending requires explicit `enter` confirm).
+- `r` (confirmed Refresh) and `c` (Config stub) are deferred to the engine integration and MOR-100 respectively.
 
 The `/mortic` slash command is the preferred entrypoint because it creates a clear interaction boundary. While Mortic focus mode is active, ordinary typing should not advance the main OpenCode conversation. This prevents conflicts where the user is speaking to Mortic and accidentally sending a parallel typed instruction to the thread.
 
@@ -578,7 +591,9 @@ Design decision: Refresh absorbs the old "Clear" concept. It clears the current 
 
 ## 14. Voice Interaction Model
 
-### 14.1 Push-to-Talk
+> Revised 2026-07-03: 14.1 and 14.2 are merged in the shipped product — one mic toggle (`M`), continuous listening while live, engine end-of-turn detection segments turns, barge-in per 14.3. The subsections below record the original design.
+
+### 14.1 Push-to-Talk (superseded)
 
 Preferred user experience:
 
@@ -592,7 +607,7 @@ Preferred user experience:
 8. TTS begins as soon as safe speakable chunks are available.
 9. Turn completes; transcript is persisted locally for popup/handoff.
 
-### 14.2 Live Mode
+### 14.2 Live Mode (superseded — now the only mode, gated by `M`)
 
 Live mode is for longer conversational flow:
 

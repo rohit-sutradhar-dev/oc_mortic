@@ -4,6 +4,8 @@ Status: Draft
 Owners: Platform Track, Engine Track
 Source context: `docs/MORTIC_OPENCODE_SIDEPOD_PRD.md`
 
+> Revised 2026-07-03 (owner-directed after live testing; see the Revision section at the top of the PRD): PTT and Live are merged into a single mic mute/unmute toggle on `M`, emitting `live.set`. `ptt.start`/`ptt.stop` stay defined in protocol v0 but are not sent by the v1 sidepod. The shipped command deck is `[M] Microphone`, `[X] Clear Lane`, `[T] Transcript`, `[H] Handoff`, `[ESC] End Session` (`C Config` deferred to MOR-100; confirmed `R` Refresh lands with the engine integration). Esc is never destructive — ending a session is an explicit confirm inside the End Session dialog. Lines below that conflict are superseded.
+
 ## 1. Shared Product Requirements
 
 Both tracks must align on these requirements before implementation.
@@ -11,8 +13,8 @@ Both tracks must align on these requirements before implementation.
 - Mortic is a native OpenCode sidepod.
 - `/mortic` focuses the sidepod and is not sent as a model prompt.
 - While Mortic is focused, normal typing must not advance the OpenCode thread.
-- `M` PTT must be isolated from other OpenCode keymaps.
-- Command deck is: `M Hold PTT`, `L Live`, `R Refresh`, `C Config`, `T Transcript`, `H Handoff`.
+- `M` (mic toggle; revised 2026-07-03) must be isolated from other OpenCode keymaps.
+- Command deck (revised 2026-07-03): `[M] Microphone`, `[X] Clear Lane`, `[T] Transcript`, `[H] Handoff`, `[ESC] End Session`.
 - `R` and `Esc` must ask for confirmation before reset/exit actions run.
 - `C Config` is a non-functional stub in v1.
 - No visible browser UI ships in the packaged main path.
@@ -37,16 +39,16 @@ The Sidepod <-> Engine protocol is owned jointly. Changes require both owners to
 - Sent when `/mortic` focuses the sidepod and the sidepod needs an active voice lane.
 - Payload: active OpenCode session id, keep-fork flag, optional sidepod protocol version.
 
-`ptt.start`
-- Sent on isolated `M` press in Mortic focus mode.
+`ptt.start` (defined in v0; not sent by the v1 sidepod — revised 2026-07-03)
+- Original: sent on isolated `M` press in Mortic focus mode.
 - Payload: turn id or client event id, timestamp.
 
-`ptt.stop`
-- Sent on `M` release or PTT cancellation.
+`ptt.stop` (defined in v0; not sent by the v1 sidepod — revised 2026-07-03)
+- Original: sent on `M` release or PTT cancellation.
 - Payload: matching turn/client event id, timestamp.
 
 `live.set`
-- Sent when user toggles Live.
+- Sent on every `M` press — the sole voice-capture control in v1 (mic mute/unmute; revised 2026-07-03).
 - Payload: `{ "value": true | false }`, timestamp.
 
 `refresh`
@@ -126,7 +128,7 @@ Deliverables:
 User acceptance criteria:
 - User sees a Mortic sidepod inside OpenCode.
 - Sidepod looks like the existing extension, not a redesigned product.
-- User sees `M Hold PTT`, `L Live`, `R Refresh`, `C Config`, `T Transcript`, `H Handoff`.
+- User sees `[M] Microphone`, `[X] Clear Lane`, `[T] Transcript`, `[H] Handoff`, `[ESC] End Session` (revised 2026-07-03).
 
 Engine-owner acceptance criteria:
 - Platform exposes a stable place to render engine state.
@@ -145,7 +147,7 @@ Deliverables:
 
 User acceptance criteria:
 - User types `/mortic` and focus moves to Mortic.
-- User can hold `M` for PTT without side effects in OpenCode.
+- User can tap `M` to toggle the mic without side effects in OpenCode (revised 2026-07-03; hold model retired).
 - User cannot accidentally send a parallel typed instruction while speaking to Mortic.
 
 Engine-owner acceptance criteria:

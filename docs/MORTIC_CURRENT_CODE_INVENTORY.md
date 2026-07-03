@@ -53,11 +53,11 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 - Current WebSocket control/event names in `opencode_voice/server.py` and `static/app.js`
   - Current names include `audio.start`, `audio.stop`, `turn.start`, `fork.ready`, `tts.first_audio`, `barge_in`, and generic `error`.
   - These need mapping or replacement with the PRD v0 protocol: `start`, `ptt.start`, `ptt.stop`, `live.set`, `refresh`, `barge_in`, `confirm.response`, plus `ready`, `listening`, `transcript`, `thinking`, `assistant.delta`, `speaking`, `complete`, `interrupted`, and `voice_bridge_issue`.
-- Current sidepod command deck diagnostics in `opencode_mercury_sidepod/src/tui.js`
-  - `last` and `items` are diagnostics and should not ship in normal UI.
-  - `Clear Lane` should become confirmed `Refresh`.
-  - Current PTT key is `p`; PRD requires isolated `M` behavior where OpenCode supports it.
-  - Current focus binding is `ctrl+x v`; PRD requires `/mortic` focus without sending a prompt.
+- Current sidepod command deck in `opencode_mercury_sidepod/src/tui.js` (this block updated 2026-07-03; the original inventory notes are resolved)
+  - `last`/`items` diagnostics rows: removed.
+  - `Clear Lane` is `[X]`; confirmed `Refresh` lands with the engine integration (MOR-96).
+  - Voice control is a single `M` mic mute/unmute toggle (PTT and Live merged, owner decision 2026-07-03), isolated in Mortic focus mode.
+  - `/mortic` focuses without sending a prompt; `ctrl+x v` remains as a secondary binding.
 - `opencode_mercury_sidepod/src/index.js`
   - Empty server stub. It does not launch, discover, or connect to the bridge/helper.
 - `runs/voice/`, local logs, `.env`, `.venv/`, `node_modules/`, and local run artifacts
@@ -95,11 +95,11 @@ Start from:
 
 Platform-owned next work:
 
-- Replace diagnostics/provider labels with PRD-safe UI.
-- Change command deck to `M Hold PTT`, `L Live`, `R Refresh`, `C Config`, `T Transcript`, `H Handoff`.
-- Add confirmation states for `R` and `Esc`.
-- Make `/mortic` the focus entrypoint if OpenCode exposes the needed command interception.
-- Capture `M` keydown/repeat/keyup in Mortic focus mode or document the supported fallback if key release is unavailable.
+- Replace diagnostics/provider labels with PRD-safe UI. *(Done.)*
+- Command deck (revised 2026-07-03): `[M] Microphone`, `[X] Clear Lane`, `[T] Transcript`, `[H] Handoff`, `[ESC] End Session`. *(Done; `C Config` deferred to MOR-100, confirmed `R` Refresh with the engine integration.)*
+- Esc/End Session confirmation. *(Done — explicit confirm dialog; `R` confirm pending engine.)*
+- Make `/mortic` the focus entrypoint. *(Done, including refusal without an open session.)*
+- `M` key capture: hold model retired (no terminal key releases); `M` is a plain mic mute/unmute toggle, isolated in focus mode. *(Done; documented in `docs/MORTIC_TERMINAL_CAPABILITY_SMOKE.md`.)*
 - Implement a v0 protocol client against Engine-provided fixtures/helper.
 - Render `Voice Bridge Issue` for bridge failures without provider/model/runtime detail.
 
