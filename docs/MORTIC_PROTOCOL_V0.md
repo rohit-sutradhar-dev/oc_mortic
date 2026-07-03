@@ -85,7 +85,7 @@ Example:
 
 ### `ptt.start`
 
-Sent on isolated `M` press in Mortic focus mode. Key repeat must not emit duplicate active PTT starts for the same press.
+**Not sent by the shipped v1 sidepod.** Owner decision 2026-07-03 merged the separate PTT and Live controls into a single mic mute/unmute toggle on `M`, which emits `live.set` instead (see `live.set` below and `docs/MORTIC_TERMINAL_CAPABILITY_SMOKE.md` for the interaction history). This message type stays defined, fixture-covered, and engine-handled for a possible future hold-to-talk client. Original semantics: sent on isolated `M` press in Mortic focus mode. Key repeat must not emit duplicate active PTT starts for the same press.
 
 Required fields:
 
@@ -118,7 +118,7 @@ Example:
 
 ### `ptt.stop`
 
-Sent on `M` release, PTT cancellation, or tap-mode stop.
+**Not sent by the shipped v1 sidepod** (see the `ptt.start` note above — same supersession). Original semantics: sent on `M` release, PTT cancellation, or tap-mode stop.
 
 Required fields:
 
@@ -149,7 +149,7 @@ Example:
 
 ### `live.set`
 
-Sent when the user toggles Live voice mode.
+Sent when the user toggles the mic. This is the sidepod's sole voice-capture control in v1 — `M` sends this on every press, mute or unmute (owner decision 2026-07-03 merged the earlier separate PTT and Live controls into this one toggle; see the `ptt.start` note above).
 
 Required fields:
 
