@@ -7,9 +7,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-import webbrowser
 from pathlib import Path
-from threading import Timer
 
 import uvicorn
 
@@ -67,8 +65,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     app = create_app(config)
-    if args.open:
-        Timer(1.0, lambda: webbrowser.open(config.browser_url)).start()
     try:
         uvicorn.run(app, host=config.bridge_host, port=config.bridge_port, log_level=args.log_level)
     finally:
@@ -82,13 +78,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Speak with an OpenCode thread through Mercury 2 and Deepgram.")
+    parser = argparse.ArgumentParser(description="Run the Mortic local helper for OpenCode voice sessions.")
     parser.add_argument("--opencode-url", help="Existing OpenCode server URL. Auto-detected when omitted.")
     parser.add_argument("--managed-opencode", action="store_true", help="Start a clean managed OpenCode server.")
     parser.add_argument("--opencode-dir", help="Working directory for a managed OpenCode server.")
     parser.add_argument("--host", default="127.0.0.1", help="Voice bridge host.")
     parser.add_argument("--port", type=int, default=8765, help="Voice bridge port.")
-    parser.add_argument("--open", action="store_true", help="Open the browser UI after startup.")
     parser.add_argument("--model", default="inception/mercury-2", help="OpenCode model in provider/model form.")
     parser.add_argument("--model-variant", default="high", help="OpenCode model variant.")
     parser.add_argument("--agent", default="voice-build", help="OpenCode agent for voice turns.")
@@ -98,8 +93,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Markdown prompt used for the ephemeral managed-server voice agent.",
     )
     parser.add_argument("--context-threshold", type=int, default=70_000, help="Token threshold for proactive compaction.")
-    parser.add_argument("--stt-model", default="flux-general-en", help="Deepgram Flux STT model.")
-    parser.add_argument("--tts-model", default="aura-2-thalia-en", help="Deepgram Aura TTS model.")
+    parser.add_argument("--stt-model", default="flux-general-en", help="Speech-to-text model id.")
+    parser.add_argument("--tts-model", default="aura-2-thalia-en", help="Text-to-speech model id.")
     parser.add_argument("--sample-rate", type=int, default=16_000, help="PCM sample rate for STT and TTS.")
     parser.add_argument("--eager-eot-threshold", type=float, help="Enable experimental Flux eager end-of-turn.")
     parser.add_argument("--keep-fork", action="store_true", help="Keep ephemeral forks by default.")

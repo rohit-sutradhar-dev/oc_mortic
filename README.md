@@ -24,24 +24,38 @@ export INCEPTION_API_KEY="..."
 export DEEPGRAM_API_KEY="..."
 ```
 
-## Run The Voice Bridge
+## Run The Helper
 
 ```bash
 source .venv/bin/activate
-opencode-voice --managed-opencode --open
+mortic-helper --managed-opencode
 ```
 
-`--managed-opencode` starts a clean `opencode serve` process with a runtime config overlay for the Inception provider and Mercury model. If a running OpenCode server is detected, managed mode borrows that server's project directory so the clean server can still see the same threads.
+`--managed-opencode` starts a clean `opencode serve` process with a runtime config overlay for the current voice model. If a running OpenCode server is detected, managed mode borrows that server's project directory so the clean server can still see the same threads.
 
 Useful options:
 
 ```bash
-opencode-voice --help
-opencode-voice --managed-opencode --opencode-dir "/path/to/project" --open
-opencode-voice --context-threshold 70000 --tts-model aura-2-phoebe-en --open
-opencode-voice --model-variant low --open
-opencode-voice --eager-eot-threshold 0.5 --open
+mortic-helper --help
+mortic-helper --managed-opencode --opencode-dir "/path/to/project"
+mortic-helper --context-threshold 70000 --model-variant low
+mortic-helper --eager-eot-threshold 0.5
 ```
+
+## Helper Distribution Contract
+
+The v1 helper distribution target is the `mortic-helper` Python package. The owner publishes to PyPI; local verification uses a built wheel or sdist.
+
+```bash
+uvx --from dist/mortic_helper-0.1.0-py3-none-any.whl mortic-helper --help
+python -m venv /tmp/mortic-helper-venv
+/tmp/mortic-helper-venv/bin/pip install dist/mortic_helper-0.1.0-py3-none-any.whl
+/tmp/mortic-helper-venv/bin/mortic-helper --help
+```
+
+Platform should launch or discover the helper on `127.0.0.1:8765` unless overridden. Readiness is `GET /api/health`; a ready helper returns `ready: true`, otherwise it reports `Voice Bridge Issue` details. The sidepod v0 control/event transport is `ws://127.0.0.1:8765/ws/sidepod` and starts with a `start` command carrying `protocolVersion: "mortic.sidepod.v0"`. The helper responds with `ready` carrying the same protocol version before the sidepod treats the lane as connected.
+
+No PyInstaller or app bundle is part of v1; the terminal process that launches `mortic-helper` keeps macOS mic permission attribution clear. Local keys stay in environment variables or `.env`; packages must not contain secrets.
 
 ## Native Sidepod Reference
 
