@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from opencode_voice.config import redact_secrets
+
 
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -23,4 +25,4 @@ class RunLogger:
             **fields,
         }
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            handle.write(json.dumps(redact_secrets(record), ensure_ascii=False, default=str) + "\n")

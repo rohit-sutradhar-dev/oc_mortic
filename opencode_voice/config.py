@@ -1,10 +1,92 @@
 from __future__ import annotations
 
+"""Config and credential loading for the Mortic helper.
+
+V1 reads local development credentials from process environment, with optional
+`.env` support for local runs. Future BYOK/proxy work should replace the
+credential source behind `load_voice_credentials()` while keeping the same
+capability/issue interface for helper readiness and sidepod-safe diagnostics.
+"""
+
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, MutableMapping
+
+VOICE_BRIDGE_USER_MESSAGE = "Voice Bridge Issue"
+REDACTED = "[redacted]"
+SENSITIVE_FIELD_NAMES = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+}
+
+
+@dataclass(frozen=True)
+class CredentialSpec:
+    env_var: str
+    capability: str
+    diagnostic_code: str
+    safe_detail: str
+
+
+REQUIRED_CREDENTIALS = (
+    CredentialSpec(
+        env_var="DEEPGRAM_API_KEY",
+        capability="voice_audio",
+        diagnostic_code="missing_voice_audio_key",
+        safe_detail="Voice audio unavailable",
+    ),
+    CredentialSpec(
+        env_var="INCEPTION_API_KEY",
+        capability="voice_turns",
+        diagnostic_code="missing_voice_turn_key",
+        safe_detail="Voice turns unavailable",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class VoiceCredentialIssue:
+    capability: str
+    diagnostic_code: str
+    safe_detail: str
+    retryable: bool = True
+
+    def to_voice_bridge_issue(
+        self,
+        *,
+        sent_at: str | None = None,
+        debug_ref: str | None = None,
+        voice_lane_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "type": "voice_bridge_issue",
+            "sentAt": sent_at or iso_utc_now(),
+            "userMessage": VOICE_BRIDGE_USER_MESSAGE,
+            "safeDetail": self.safe_detail,
+            "diagnosticCode": self.diagnostic_code,
+            "retryable": self.retryable,
+            "capability": self.capability,
+        }
+        if voice_lane_id:
+            payload["voiceLaneId"] = voice_lane_id
+        if debug_ref:
+            payload["debugRef"] = debug_ref
+        return payload
+
+
+@dataclass(frozen=True)
+class VoiceCredentials:
+    has_voice_audio_key: bool
+    has_voice_turn_key: bool
+    issues: tuple[VoiceCredentialIssue, ...]
 
 
 @dataclass(frozen=True)
@@ -62,6 +144,121 @@ class VoiceConfig:
     @property
     def has_inception_key(self) -> bool:
         return bool(os.environ.get("INCEPTION_API_KEY"))
+
+    @property
+    def credential_issues(self) -> tuple[VoiceCredentialIssue, ...]:
+        return load_voice_credentials().issues
+
+    def credential_issue_for(self, capability: str) -> VoiceCredentialIssue | None:
+        for issue in self.credential_issues:
+            if issue.capability == capability:
+                return issue
+        return None
+
+
+def iso_utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def load_local_dotenv(
+    path: str | Path = ".env",
+    environ: MutableMapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    target = environ if environ is not None else os.environ
+    dotenv_path = Path(path)
+    if not dotenv_path.exists():
+        return ()
+
+    loaded: list[str] = []
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in target:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        target[key] = value
+        loaded.append(key)
+    return tuple(loaded)
+
+
+def load_voice_credentials(
+    *,
+    environ: MutableMapping[str, str] | None = None,
+    dotenv_path: str | Path = ".env",
+) -> VoiceCredentials:
+    target = environ if environ is not None else os.environ
+    load_local_dotenv(dotenv_path, target)
+    missing = [
+        VoiceCredentialIssue(
+            capability=spec.capability,
+            diagnostic_code=spec.diagnostic_code,
+            safe_detail=spec.safe_detail,
+        )
+        for spec in REQUIRED_CREDENTIALS
+        if not target.get(spec.env_var)
+    ]
+    return VoiceCredentials(
+        has_voice_audio_key=bool(target.get("DEEPGRAM_API_KEY")),
+        has_voice_turn_key=bool(target.get("INCEPTION_API_KEY")),
+        issues=tuple(missing),
+    )
+
+
+def secret_values(
+    *,
+    environ: MutableMapping[str, str] | None = None,
+    extra: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    target = environ if environ is not None else os.environ
+    values = [
+        value
+        for value in (target.get(spec.env_var) for spec in REQUIRED_CREDENTIALS)
+        if value and len(value) > 3
+    ]
+    values.extend(value for value in extra if value and len(value) > 3)
+    return tuple(dict.fromkeys(values))
+
+
+def is_sensitive_field_name(value: str) -> bool:
+    normalized = value.replace("-", "_").lower()
+    return (
+        normalized in SENSITIVE_FIELD_NAMES
+        or normalized.endswith("_api_key")
+        or normalized.endswith("_token")
+        or normalized.endswith("_secret")
+        or normalized.endswith("_password")
+    )
+
+
+def redact_secrets(value: Any, *, secrets: tuple[str, ...] | None = None) -> Any:
+    known_secrets = secrets if secrets is not None else secret_values()
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            if is_sensitive_field_name(str(key)):
+                redacted[key] = REDACTED if item else item
+            else:
+                redacted[key] = redact_secrets(item, secrets=known_secrets)
+        return redacted
+    if isinstance(value, list):
+        return [redact_secrets(item, secrets=known_secrets) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_secrets(item, secrets=known_secrets) for item in value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<{len(value)} bytes redacted>"
+    if isinstance(value, str):
+        text = value
+        for secret in known_secrets:
+            text = text.replace(secret, REDACTED)
+        return text
+    return value
 
 
 def render_opencode_config(

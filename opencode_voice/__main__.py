@@ -13,11 +13,18 @@ from threading import Timer
 
 import uvicorn
 
-from opencode_voice.config import VoiceConfig, load_voice_agent_prompt, parse_model_ref, render_opencode_config_content
+from opencode_voice.config import (
+    VoiceConfig,
+    load_local_dotenv,
+    load_voice_agent_prompt,
+    parse_model_ref,
+    render_opencode_config_content,
+)
 from opencode_voice.server import create_app
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_local_dotenv()
     args = parse_args(argv)
     model = parse_model_ref(args.model, variant=args.model_variant)
     opencode_process: subprocess.Popen[str] | None = None

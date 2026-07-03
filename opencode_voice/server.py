@@ -12,7 +12,7 @@ import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from opencode_voice.config import VoiceConfig
+from opencode_voice.config import VoiceConfig, load_voice_credentials, redact_secrets
 from opencode_voice.deepgram import (
     FlushLimiter,
     SpeechTextFilter,
@@ -59,6 +59,7 @@ class OpenCodeEventFallback(Exception):
 
 def create_app(config: VoiceConfig) -> FastAPI:
     app = FastAPI(title="OpenCode Mercury Voice Bridge")
+    load_voice_credentials()
     logger = RunLogger(config.run_root)
 
     @app.on_event("startup")
@@ -88,6 +89,7 @@ def create_app(config: VoiceConfig) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> JSONResponse:
+        credentials = load_voice_credentials()
         client = OpenCodeClient(config.opencode_url, timeout_sec=10)
         try:
             opencode_health = await client.health()
@@ -101,6 +103,9 @@ def create_app(config: VoiceConfig) -> FastAPI:
                 "run_dir": str(logger.run_dir),
                 "model": config.model.opencode_name,
                 "context_threshold_tokens": config.context_threshold_tokens,
+                "credential_issues": [
+                    issue.to_voice_bridge_issue(debug_ref=str(logger.run_dir)) for issue in credentials.issues
+                ],
                 "deepgram": {
                     "enabled": config.has_deepgram_key,
                     "stt_model": config.deepgram_stt_model,
@@ -178,6 +183,8 @@ class VoiceConnection:
 
     async def run(self) -> None:
         await self.send_json({"type": "ready", "run_dir": str(self.logger.run_dir)})
+        for issue in self.config.credential_issues:
+            await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
         while True:
             message = await self.websocket.receive()
             if message.get("type") == "websocket.disconnect":
@@ -317,8 +324,9 @@ class VoiceConnection:
         await self.send_json({"type": "stopped"})
 
     async def start_audio(self) -> None:
-        if not os.environ.get("DEEPGRAM_API_KEY"):
-            await self.send_json({"type": "error", "message": "DEEPGRAM_API_KEY is not set; typed fallback is active."})
+        issue = self.config.credential_issue_for("voice_audio")
+        if issue:
+            await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
             return
         if self.flux:
             return
@@ -346,6 +354,10 @@ class VoiceConnection:
                 await self.enqueue_text_turn(transcript, source="voice", eager=bool(event.get("eager")))
 
     async def enqueue_text_turn(self, text: str, source: str, eager: bool = False) -> None:
+        issue = self.config.credential_issue_for("voice_turns")
+        if issue:
+            await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
+            return
         if not self.fork_session_id:
             await self.send_json({"type": "error", "message": "Start a voice fork before sending a prompt."})
             return
@@ -665,8 +677,9 @@ class VoiceConnection:
                 tracker = AssistantTextTracker(await self.client.messages(session_id))
 
     async def speak(self, text: str, turn_id: int) -> None:
-        if not os.environ.get("DEEPGRAM_API_KEY"):
-            await self.send_json({"type": "tts.skipped", "turn_id": turn_id, "reason": "missing_deepgram_key"})
+        issue = self.config.credential_issue_for("voice_audio")
+        if issue:
+            await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
             return
         if self.speaker is None:
             speaker = DeepgramSpeakSession(
@@ -804,7 +817,7 @@ class VoiceConnection:
             return
         async with self.send_lock:
             try:
-                await self.websocket.send_text(json.dumps(payload, ensure_ascii=False))
+                await self.websocket.send_text(json.dumps(redact_secrets(payload), ensure_ascii=False))
             except WebSocketDisconnect:
                 self.closed = True
 

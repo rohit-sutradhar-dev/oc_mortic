@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from opencode_voice.config import ModelRef, render_opencode_config
+from opencode_voice.config import (
+    REDACTED,
+    ModelRef,
+    load_local_dotenv,
+    load_voice_credentials,
+    redact_secrets,
+    render_opencode_config,
+)
 from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
+from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import SSEParser
 from opencode_voice.state import (
     AssistantTextTracker,
@@ -38,6 +50,74 @@ class MercuryConfigTests(unittest.TestCase):
         self.assertEqual(config["agent"]["voice-build"]["prompt"], "Do not speak code.")
         self.assertEqual(config["agent"]["voice-build"]["mode"], "primary")
         self.assertEqual(config["agent"]["voice-build"]["model"], "inception/mercury-2")
+
+
+class CredentialConfigTests(unittest.TestCase):
+    def test_local_dotenv_loads_missing_values_without_overriding_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dotenv_path = Path(tmp) / ".env"
+            dotenv_path.write_text(
+                "\n".join(
+                    [
+                        "DEEPGRAM_API_KEY=dotenv-audio",
+                        "export INCEPTION_API_KEY='dotenv-turns'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            environ = {"DEEPGRAM_API_KEY": "env-audio"}
+
+            loaded = load_local_dotenv(dotenv_path, environ)
+
+        self.assertEqual(loaded, ("INCEPTION_API_KEY",))
+        self.assertEqual(environ["DEEPGRAM_API_KEY"], "env-audio")
+        self.assertEqual(environ["INCEPTION_API_KEY"], "dotenv-turns")
+
+    def test_missing_credentials_build_sidepod_safe_voice_bridge_issues(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            credentials = load_voice_credentials(dotenv_path="/tmp/mortic-missing-dotenv")
+
+        events = [issue.to_voice_bridge_issue(sent_at="2026-07-03T00:00:00.000Z") for issue in credentials.issues]
+        serialized = json.dumps(events)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual({event["type"] for event in events}, {"voice_bridge_issue"})
+        self.assertEqual({event["userMessage"] for event in events}, {"Voice Bridge Issue"})
+        self.assertIn("voice_audio", {event["capability"] for event in events})
+        self.assertIn("voice_turns", {event["capability"] for event in events})
+        self.assertNotIn("DEEPGRAM_API_KEY", serialized)
+        self.assertNotIn("INCEPTION_API_KEY", serialized)
+        self.assertNotIn("Deepgram", serialized)
+        self.assertNotIn("Mercury", serialized)
+
+    def test_redacts_raw_keys_recursively(self) -> None:
+        raw_key = "sk-test-secret-123"
+        with patch.dict(os.environ, {"DEEPGRAM_API_KEY": raw_key}, clear=True):
+            payload = redact_secrets(
+                {
+                    "headers": {"Authorization": f"Token {raw_key}"},
+                    "apiKey": raw_key,
+                    "audio": b"abc",
+                    "safe": "hello",
+                }
+            )
+
+        serialized = json.dumps(payload)
+        self.assertNotIn(raw_key, serialized)
+        self.assertEqual(payload["headers"]["Authorization"], REDACTED)
+        self.assertEqual(payload["apiKey"], REDACTED)
+        self.assertEqual(payload["audio"], "<3 bytes redacted>")
+        self.assertEqual(payload["safe"], "hello")
+
+    def test_run_logger_redacts_known_secret_values(self) -> None:
+        raw_key = "sk-run-secret-456"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"INCEPTION_API_KEY": raw_key}, clear=True):
+            logger = RunLogger(root=tmp)
+            logger.write("credential.check", nested={"token": raw_key}, text=f"prefix {raw_key} suffix")
+            content = logger.path.read_text(encoding="utf-8")
+
+        self.assertNotIn(raw_key, content)
+        self.assertIn(REDACTED, content)
 
 
 class TokenTests(unittest.TestCase):
