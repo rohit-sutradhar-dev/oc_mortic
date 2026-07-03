@@ -53,12 +53,12 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 - Current WebSocket control/event names in `opencode_voice/server.py` and `static/app.js`
   - Current names include `audio.start`, `audio.stop`, `turn.start`, `fork.ready`, `tts.first_audio`, `barge_in`, and generic `error`.
   - These need mapping or replacement with the PRD v0 protocol: `start`, `ptt.start`, `ptt.stop`, `live.set`, `refresh`, `barge_in`, `confirm.response`, plus `ready`, `listening`, `transcript`, `thinking`, `assistant.delta`, `speaking`, `complete`, `interrupted`, and `voice_bridge_issue`.
-- Current sidepod command deck diagnostics in `opencode_mercury_sidepod/src/tui.js` and generated `dist/tui.js`
+- Current sidepod command deck diagnostics in `opencode_mercury_sidepod/src/tui.js`
   - `last` and `items` are diagnostics and should not ship in normal UI.
   - `Clear Lane` should become confirmed `Refresh`.
   - Current PTT key is `p`; PRD requires isolated `M` behavior where OpenCode supports it.
   - Current focus binding is `ctrl+x v`; PRD requires `/mortic` focus without sending a prompt.
-- `opencode_mercury_sidepod/dist/index.js`
+- `opencode_mercury_sidepod/src/index.js`
   - Empty server stub. It does not launch, discover, or connect to the bridge/helper.
 - `runs/voice/`, local logs, `.env`, `.venv/`, `node_modules/`, and local run artifacts
   - These are ignored/local-only and must remain out of packaged output.
@@ -165,7 +165,7 @@ Shared-owned next work:
 - Packaged UI mismatch: current browser UI exposes thread selection, typed fallback, model/provider details, and visible browser/iframe surface, all non-goals for packaged v1.
 - Helper mismatch: current bridge is a FastAPI browser app, not yet an invisible helper/runtime artifact.
 - Native mic gap: current mic capture is browser-based; Engine still needs OS-native capture or an approved helper plan.
-- Sidepod source gap: MOR-166 adds `opencode_mercury_sidepod/src/`; keep generated `dist/` synchronized with `npm run build`.
+- Sidepod source gap: MOR-166 added `opencode_mercury_sidepod/src/`; the package now ships `src/` directly (no build step, no `dist/`).
 - Sidepod test gap: MOR-166 adds package fixture tests; deeper TUI snapshot tests are still needed before larger visual changes.
 - Source-thread safety gap: fork cleanup exists, but tests do not yet prove source OpenCode thread remains untouched after a voice turn.
 - Secret/logging audit gap: tests cover config env placeholders, but logs and raw provider/OpenCode payload fields still need a broader redaction review before beta.

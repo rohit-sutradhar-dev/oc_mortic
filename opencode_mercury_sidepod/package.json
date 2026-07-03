@@ -4,29 +4,28 @@
   "private": true,
   "description": "Native OpenCode TUI sidebar proof for Mortic voice control.",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "src/index.js",
   "oc-plugin": [
     "tui"
   ],
   "scripts": {
-    "build": "node scripts/build.mjs",
     "test": "node --test tests/*.test.mjs",
-    "check": "npm run build && npm test"
+    "check": "npm test"
   },
   "exports": {
     ".": {
-      "import": "./dist/index.js"
+      "import": "./src/index.js"
     },
     "./tui": {
-      "import": "./dist/tui.js"
+      "import": "./src/tui.js"
     }
   },
   "files": [
-    "dist",
+    "src",
     "README.md"
   ],
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.4.0",
+    "@opencode-ai/plugin": ">=1.17.0 <2",
     "@opentui/solid": "^0.4.2",
     "solid-js": "^1.9.12"
   }

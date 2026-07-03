@@ -1,8 +1,10 @@
+import { appendFileSync } from "node:fs";
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createSignal } from "solid-js";
 
 const WIDTH = 36;
 const INNER = WIDTH - 2;
+const SMOKE_SINK = globalThis.process?.env?.MORTIC_SMOKE_LOG;
 
 function element(type, props = {}, children = []) {
   const node = createElement(type);
@@ -110,10 +112,6 @@ function statusGlyph(state) {
   return "IDLE";
 }
 
-function sphereSprite(phase, active, captionColor) {
-  return renderBrailleOrb(phase, active, captionColor);
-}
-
 function renderBrailleOrb(phase, active, captionColor) {
   const cols = 12;
   const rows = 6;
@@ -141,7 +139,7 @@ function renderBrailleOrb(phase, active, captionColor) {
           const airPocket = active && dist < radius - 1.9 && texture(x, y, phase) < 0.03;
           const halo = active && dist > radius && dist <= haloRadius && radiates(x, y, phase, dist, radius, cx, cy);
           if ((stableShell && (protectedEdge || !airPocket)) || halo) {
-            bits |= brailleBit(localX, localY);
+            bits |= BRAILLE_BITS[localY][localX];
           }
         }
       }
@@ -167,15 +165,12 @@ function overlayCentered(base, label) {
   return `${base.slice(0, start)}${label}${base.slice(start + label.length)}`;
 }
 
-function brailleBit(x, y) {
-  const map = [
-    [0x01, 0x08],
-    [0x02, 0x10],
-    [0x04, 0x20],
-    [0x40, 0x80]
-  ];
-  return map[y][x];
-}
+const BRAILLE_BITS = [
+  [0x01, 0x08],
+  [0x02, 0x10],
+  [0x04, 0x20],
+  [0x40, 0x80]
+];
 
 function texture(x, y, phase) {
   return ((x * 53 + y * 31 + phase * 17 + ((x * y) % 29)) % 1000) / 1000;
@@ -194,10 +189,11 @@ function commandRow(key, label, state, color, onMouseDown) {
 }
 
 function renderHero(state, theme) {
-  const accent = theme.accent ?? theme.primary ?? theme.text;
-  const muted = theme.textMuted ?? theme.text;
-  const secondaryAccent = theme.secondaryAccent ?? theme.accentSecondary ?? theme.secondary ?? theme.warning ?? theme.info ?? accent;
-  const ok = theme.success ?? accent;
+  // TuiThemeCurrent declares these colors non-optional; no fallbacks needed.
+  const accent = theme.accent;
+  const muted = theme.textMuted;
+  const secondaryAccent = theme.secondary;
+  const ok = theme.success;
   const active = state.live || state.armed;
   const color = active ? ok : muted;
   const border = state.focused ? secondaryAccent : accent;
@@ -209,7 +205,7 @@ function renderHero(state, theme) {
         row("focus", state.focused ? "sidepod" : "prompt"),
         row("voice lane", statusGlyph(state)),
         center("", INNER),
-        ...sphereSprite(state.phase, active, secondaryAccent).map((item) =>
+        ...renderBrailleOrb(state.phase, active, secondaryAccent).map((item) =>
           typeof item === "string"
             ? center(item, INNER)
             : { text: center(item.text, INNER), color: item.color }
@@ -225,21 +221,19 @@ function renderHero(state, theme) {
 }
 
 function renderControlPanel(state, actions, theme) {
-  const accent = theme.accent ?? theme.primary ?? theme.text;
-  const muted = theme.textMuted ?? theme.text;
-  const ok = theme.success ?? accent;
-  const warn = theme.warning ?? accent;
-  const armColor = state.armed ? ok : muted;
-  const liveColor = state.live ? ok : muted;
+  const accent = theme.accent;
+  const muted = theme.textMuted;
+  const armColor = state.armed ? theme.success : muted;
+  const liveColor = state.live ? theme.success : muted;
   return [
     line("", muted),
-    line(`╔ COMMAND DECK${"═".repeat(WIDTH - 16)}╗`, accent),
+    line(`╔ COMMAND DECK${"═".repeat(WIDTH - 15)}╗`, accent),
     line(`║${fit(row("last", state.event), INNER)}║`, muted),
     line(`║${fit(row("items", String(state.transcript.length)), INNER)}║`, muted),
     separator(accent),
-    commandRow("[PTT]", "Push to Talk", state.armed ? "ARMED" : "OFF", armColor, actions.toggleArmed),
+    commandRow("[PTT]", "Push to Talk", state.armed ? "ARMED" : "OFF", armColor, actions.ptt),
     commandRow("[LIVE]", "Voice Control", state.live ? "ON" : "OFF", liveColor, actions.toggleLive),
-    commandRow("[CLR]", "Clear Lane", "RESET", warn, actions.clear),
+    commandRow("[CLR]", "Clear Lane", "RESET", theme.warning, actions.clear),
     commandRow("[TRN]", "Transcript", "POPUP/C", accent, actions.openTranscript),
     commandRow("[HND]", "Handoff", state.handoffReady ? "READY" : "DRAFT", accent, actions.openHandoff),
     line(`╚${"═".repeat(WIDTH - 2)}╝`, accent)
@@ -247,8 +241,8 @@ function renderControlPanel(state, actions, theme) {
 }
 
 function renderConversation(state, theme) {
-  const accent = theme.accent ?? theme.primary ?? theme.text;
-  const muted = theme.textMuted ?? theme.text;
+  const accent = theme.accent;
+  const muted = theme.textMuted;
   const userLines = wrap(state.userText, INNER);
   const assistantLines = wrap(state.assistantText, INNER);
   return [
@@ -273,13 +267,13 @@ function renderPopup(state, actions, theme) {
   if (!state.popup) {
     return [];
   }
-  const accent = theme.accent ?? theme.primary ?? theme.text;
-  const danger = theme.error ?? accent;
+  const accent = theme.accent;
+  const danger = theme.error;
   const isTranscript = state.popup === "transcript";
   const title = isTranscript ? "TRANSCRIPT" : "HANDOFF";
-  const lines = isTranscript ? transcriptLines(state) : handoffLines(state);
+  const lines = isTranscript ? transcriptLines(state) : handoffLines();
   return [
-    line("", theme.textMuted ?? theme.text),
+    line("", theme.textMuted),
     ...frame(title, lines.slice(0, 9), theme.text, accent, "modal"),
     clickable(`┃  C COPY${" ".repeat(Math.max(0, INNER - 8))}┃`, accent, () => actions.copy(isTranscript ? transcriptText(state) : handoffText(state))),
     clickable(`┃  X CLOSE${" ".repeat(Math.max(0, INNER - 9))}┃`, danger, actions.closePopup),
@@ -309,30 +303,23 @@ function handoffText(state) {
   ].join("\n");
 }
 
-function handoffLines(state) {
+function handoffLines() {
   return wrap("Handoff draft prepared from the current voice lane. Spoken text stays short; screen-only details stay separate.", INNER);
 }
 
-function copyToClipboard(value) {
-  try {
-    if (globalThis.Bun?.spawnSync) {
-      globalThis.Bun.spawnSync(["pbcopy"], { stdin: value });
-      return true;
-    }
-  } catch {
-    return false;
-  }
-  return false;
-}
+// PTT is a plain M toggle by product decision (2026-07-03). Terminal
+// key-release reporting is too inconsistent to build on: iTerm2 and
+// Terminal.app never send releases for plain keys, and the Kitty flag
+// escalation needed for the rest added more complexity than the hold
+// interaction was worth for v1.
 
-// PTT is tap-to-talk / tap-to-stop everywhere by product decision
-// (2026-07-03). Terminal key-release reporting is too inconsistent to build
-// on: iTerm2 and Terminal.app never send releases for plain keys, and the
-// Kitty flag escalation needed for the rest added more complexity than the
-// hold interaction was worth for v1.
-
-
+// console output in a raw TUI is painted over by screen redraws and never
+// reaches opencode.log, so smoke diagnostics only exist behind the durable
+// opt-in sink: MORTIC_SMOKE_LOG=/tmp/mortic-smoke.log opencode
 function logSmoke(api, event, details = {}) {
+  if (!SMOKE_SINK) {
+    return;
+  }
   const payload = {
     event,
     mode: api.mode.current?.(),
@@ -341,16 +328,11 @@ function logSmoke(api, event, details = {}) {
     ...details
   };
   console.info("[mortic smoke]", JSON.stringify(payload));
-  // console output in a raw TUI is painted over by screen redraws and never
-  // reaches opencode.log, so smoke runs need a durable sink. Opt-in only:
-  // MORTIC_SMOKE_LOG=/tmp/mortic-smoke.log opencode
-  const sink = globalThis.process?.env?.MORTIC_SMOKE_LOG;
-  if (sink) {
-    import("node:fs")
-      .then((fs) => fs.appendFileSync(sink, JSON.stringify(payload) + "\n"))
-      .catch(() => {});
+  try {
+    appendFileSync(SMOKE_SINK, JSON.stringify(payload) + "\n");
+  } catch {
+    // the smoke sink must never break the TUI
   }
-  return payload;
 }
 
 function renderPod(state, actions, theme) {
@@ -389,8 +371,24 @@ export async function tui(api) {
     ]);
 
     const requestRender = () => api.renderer.requestRender();
+    // The orb animation ticks only while the voice lane is active; idle
+    // sessions run no timer at all.
+    let animationTimer;
+    const syncAnimation = () => {
+      const active = getArmed() || getLive();
+      if (active && !animationTimer) {
+        animationTimer = setInterval(() => {
+          setPhase((getPhase() + 1) % 8);
+          requestRender();
+        }, 135);
+      } else if (!active && animationTimer) {
+        clearInterval(animationTimer);
+        animationTimer = undefined;
+      }
+    };
     const mutate = (fn) => {
       fn();
+      syncAnimation();
       requestRender();
     };
     const appendTranscript = (role, value) => {
@@ -399,7 +397,7 @@ export async function tui(api) {
     let exitMorticMode;
     let previousFocus;
 
-    const focusMortic = (source = "keymap") =>
+    const focusMortic = () =>
       mutate(() => {
         if (!exitMorticMode) {
           exitMorticMode = api.mode.push("mortic.sidepod");
@@ -411,8 +409,8 @@ export async function tui(api) {
           previousFocus?.blur?.();
         }
         setFocused(true);
-        recordSmoke("focus", { source, pttMode: "tap", typingLockProbe: "type printable keys after focus" });
-        setEvent(source === "slash" ? "slash focus" : "focus mode");
+        recordSmoke("focus");
+        setEvent("focus mode");
       });
     const blurMortic = () =>
       mutate(() => {
@@ -424,15 +422,6 @@ export async function tui(api) {
         previousFocus = undefined;
         setFocused(false);
         setEvent("prompt mode");
-      });
-    const toggleArmed = () =>
-      mutate(() => {
-        const next = !getArmed();
-        setArmed(next);
-        setLive(false);
-        setEvent(next ? "ptt armed" : "ptt muted");
-        setUserText(next ? "Listening while push-to-talk is held." : "Push-to-talk released.");
-        appendTranscript("user", next ? "Push-to-talk armed." : "Push-to-talk released.");
       });
     const toggleLive = () =>
       mutate(() => {
@@ -470,7 +459,8 @@ export async function tui(api) {
       });
     const copyValue = (value) =>
       mutate(() => {
-        setEvent(copyToClipboard(value) ? "copied" : "copy unavailable");
+        // OSC 52 works in any terminal, including over SSH.
+        setEvent(api.renderer.copyToClipboardOSC52?.(value) ? "copied" : "copy unavailable");
       });
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
@@ -496,11 +486,21 @@ export async function tui(api) {
         recordSmoke("ptt.state", { armed: true, via: "m-arm" });
       });
 
+    const modeBindings = [
+      { key: "escape", cmd: "mortic.blur", desc: "Return to prompt" },
+      { key: "m", cmd: "mortic.ptt.press", desc: "Tap M PTT" },
+      { key: "p", cmd: "mortic.ptt.press", desc: "Push to Talk" },
+      { key: "l", cmd: "mortic.live", desc: "Toggle Live" },
+      { key: "c", cmd: "mortic.clear", desc: "Clear lane" },
+      { key: "t", cmd: "mortic.transcript", desc: "Transcript popup" },
+      { key: "h", cmd: "mortic.handoff", desc: "Handoff popup" }
+    ];
+
     // Typing lock: global key handlers run before renderable handlers and the
     // prompt input skips defaultPrevented events, so swallowing unbound keys
     // here keeps focus-mode typing out of the OpenCode prompt. Keys bound by
     // the mortic.sidepod layer and any ctrl/meta chords pass through untouched.
-    const morticModeKeys = new Set(["m", "p", "l", "c", "t", "h", "j", "k", "g", "x", "up", "down", "escape"]);
+    const morticModeKeys = new Set(modeBindings.map((binding) => binding.key.toLowerCase()));
     const swallowGuard = (event) => {
       if (!getFocused()) return;
       if (event?.ctrl || event?.meta || event?.super) return;
@@ -521,7 +521,7 @@ export async function tui(api) {
     });
 
     const actions = {
-      toggleArmed,
+      ptt: handlePttKey,
       toggleLive,
       clear: clearLane,
       openTranscript,
@@ -541,16 +541,8 @@ export async function tui(api) {
           desc: "Focus the Mortic sidepod",
           category: "Mortic",
           namespace: "palette",
-          run: () => focusMortic("keymap")
-        },
-        {
-          name: "mortic.slash",
-          title: "Mortic: /mortic",
-          desc: "Focus the Mortic sidepod",
-          category: "Mortic",
-          namespace: "palette",
           slashName: "mortic",
-          run: () => focusMortic("slash")
+          run: focusMortic
         }
       ],
       bindings: [{ key: "ctrl+x v", cmd: "mortic.focus", desc: "Focus Mortic sidepod" }]
@@ -560,32 +552,20 @@ export async function tui(api) {
       mode: "mortic.sidepod",
       commands: [
         { name: "mortic.blur", title: "Mortic: Return to prompt", category: "Mortic", run: blurMortic },
-        { name: "mortic.ptt", title: "Mortic: Push to Talk", category: "Mortic", run: toggleArmed },
-        { name: "mortic.ptt.press", title: "Mortic: M push-to-talk toggle", category: "Mortic", run: () => handlePttKey() },
+        { name: "mortic.ptt.press", title: "Mortic: Push-to-talk toggle", category: "Mortic", run: handlePttKey },
         { name: "mortic.live", title: "Mortic: Toggle Live", category: "Mortic", run: toggleLive },
         { name: "mortic.clear", title: "Mortic: Clear lane", category: "Mortic", run: clearLane },
         { name: "mortic.transcript", title: "Mortic: Transcript popup", category: "Mortic", run: openTranscript },
         { name: "mortic.handoff", title: "Mortic: Handoff popup", category: "Mortic", run: openHandoff }
       ],
-      bindings: [
-        { key: "escape", cmd: "mortic.blur", desc: "Return to prompt" },
-        { key: "m", cmd: "mortic.ptt.press", desc: "Tap M PTT" },
-        { key: "p", cmd: "mortic.ptt", desc: "Push to Talk" },
-        { key: "l", cmd: "mortic.live", desc: "Toggle Live" },
-        { key: "c", cmd: "mortic.clear", desc: "Clear lane" },
-        { key: "t", cmd: "mortic.transcript", desc: "Transcript popup" },
-        { key: "h", cmd: "mortic.handoff", desc: "Handoff popup" }
-      ]
+      bindings: modeBindings
     });
 
-    const timer = setInterval(() => {
-      if (getArmed() || getLive()) {
-        setPhase((getPhase() + 1) % 8);
-        requestRender();
+    api.lifecycle.onDispose(() => {
+      if (animationTimer) {
+        clearInterval(animationTimer);
       }
-    }, 135);
-
-    api.lifecycle.onDispose(() => clearInterval(timer));
+    });
     api.lifecycle.onDispose(() => exitMorticMode?.());
 
     api.slots.register({

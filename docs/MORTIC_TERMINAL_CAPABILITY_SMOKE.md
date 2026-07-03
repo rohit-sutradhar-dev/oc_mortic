@@ -17,10 +17,10 @@ This smoke confirms the native sidepod entrypoint and key handling behavior that
 
 The sidepod source registers:
 
-- `mortic.slash` with a flat `slashName: "mortic"` on an unpinned palette layer.
+- `mortic.focus` with a flat `slashName: "mortic"` on an unpinned palette layer (also bound to `ctrl+x v`).
 - `mortic.ptt.press` for `M` in `mortic.sidepod` mode — a plain toggle, no release handling.
 
-Smoke hooks emit structured diagnostics with the prefix `[mortic smoke]`. Set `MORTIC_SMOKE_LOG=<path>` to also durably append them to a file — console output in a raw TUI is painted over by screen redraws and never reaches `opencode.log`.
+Smoke diagnostics (prefix `[mortic smoke]`) are emitted only when `MORTIC_SMOKE_LOG=<path>` is set; they append durably to that file — console output in a raw TUI is painted over by screen redraws and never reaches `opencode.log`.
 
 ## Slash Registration Root Cause (2026-07-02)
 
@@ -56,7 +56,7 @@ Machine-verified in a live session (PTY, `MORTIC_SMOKE_LOG` sink): `m-arm → m-
   - Typing lock: printable probe text does not reach the prompt in focus mode; typing works again after `Esc`.
   - `M` toggles cleanly: `m-arm → m-stop → m-arm → m-stop`, one state flip per press, no repeat flicker in the toggle logic itself.
 - Live human diagnostic in iTerm2 (`MORTIC_SMOKE_LOG` sink) confirmed `useKittyKeyboard: true`, zero release events for plain keys, and key repeat arriving as plain presses — the evidence behind rolling back every release-dependent model above.
-- `npm run check` (7 tests) locks the slash reachability rules, the typing-lock guards, and the absence of release/Kitty-flag/debounce machinery in both `src/` and generated `dist/`.
+- `npm run check` (7 tests) locks the slash reachability rules, the typing-lock guards, and the absence of release/Kitty-flag/debounce machinery in `src/` (the package ships `src/` directly; there is no build step or `dist/`).
 - `uv run pytest` (27 tests) remains the repo-wide gate after the sidepod package check.
 
 ## 10-Minute Human Checklist
@@ -71,7 +71,7 @@ Machine-verified in a live session (PTY, `MORTIC_SMOKE_LOG` sink): `m-arm → m-
 
    Inspect afterwards with `cat ~/mortic-smoke.log`.
 4. Type `/mortic`.
-5. Confirm the Mortic sidepod focuses, the command is not sent as a model prompt, and `[mortic smoke]` logs a `focus` event with `source: "slash"`.
+5. Confirm the Mortic sidepod focuses, the command is not sent as a model prompt, and the smoke log records a `focus` event.
 6. While Mortic focus mode is active, type printable probe text such as `abcxyz`.
 7. Confirm the probe text does not appear in the OpenCode prompt. If it leaks, record the terminal and details here.
 8. Tap `M`, confirm the command deck shows `ARMED`. Tap `M` again, confirm it shows `OFF`.
