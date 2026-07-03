@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import time
@@ -12,7 +13,7 @@ import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from opencode_voice.config import VoiceConfig, load_voice_credentials, redact_secrets
+from opencode_voice.config import VoiceConfig, load_voice_credentials, redact_secrets, voice_bridge_issue_payload
 from opencode_voice.deepgram import (
     FlushLimiter,
     SpeechTextFilter,
@@ -36,6 +37,7 @@ from opencode_voice.state import (
 
 STATIC_DIR = Path(__file__).with_name("static")
 EPHEMERAL_PREFIX = "[voice tmp]"
+AUDIO_DEPENDENCY_MODULE = "sounddevice"
 CONTEXT_OVERFLOW_MARKERS = (
     "maximum context length",
     "context length",
@@ -48,6 +50,41 @@ CONTEXT_OVERFLOW_MARKERS = (
 def is_context_overflow_error(exc: Exception) -> bool:
     text = repr(exc).lower()
     return any(marker in text for marker in CONTEXT_OVERFLOW_MARKERS)
+
+
+def audio_dependency_available(module_name: str = AUDIO_DEPENDENCY_MODULE) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def helper_readiness_issues(
+    transport_ready: bool,
+    *,
+    audio_ready: bool | None = None,
+    debug_ref: str | None = None,
+    dotenv_path: str | Path = ".env",
+) -> tuple[dict[str, Any], ...]:
+    issues: list[dict[str, Any]] = []
+    if not transport_ready:
+        issues.append(
+            voice_bridge_issue_payload(
+                capability="helper_transport",
+                diagnostic_code="transport_unavailable",
+                safe_detail="Helper transport unavailable",
+                debug_ref=debug_ref,
+            )
+        )
+    if not (audio_dependency_available() if audio_ready is None else audio_ready):
+        issues.append(
+            voice_bridge_issue_payload(
+                capability="voice_audio",
+                diagnostic_code="audio_dependency_unavailable",
+                safe_detail="Audio capture unavailable",
+                debug_ref=debug_ref,
+            )
+        )
+    credentials = load_voice_credentials(dotenv_path=dotenv_path)
+    issues.extend(issue.to_voice_bridge_issue(debug_ref=debug_ref) for issue in credentials.issues)
+    return tuple(issues)
 
 
 class OpenCodeEventFallback(Exception):
@@ -64,6 +101,7 @@ def create_app(config: VoiceConfig) -> FastAPI:
 
     @app.on_event("startup")
     async def _startup() -> None:
+        readiness_issues = helper_readiness_issues(transport_ready=True, debug_ref=str(logger.run_dir))
         logger.write(
             "bridge.start",
             opencode_url=config.opencode_url,
@@ -72,7 +110,14 @@ def create_app(config: VoiceConfig) -> FastAPI:
             deepgram_tts_model=config.deepgram_tts_model,
             has_deepgram_key=config.has_deepgram_key,
             has_inception_key=config.has_inception_key,
+            ready=not readiness_issues,
+            diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
             run_dir=str(logger.run_dir),
+        )
+        logger.state_transition(
+            "starting",
+            "ready" if not readiness_issues else "voice_bridge_issue",
+            diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
         )
 
     @app.get("/")
@@ -90,6 +135,7 @@ def create_app(config: VoiceConfig) -> FastAPI:
     @app.get("/api/health")
     async def health() -> JSONResponse:
         credentials = load_voice_credentials()
+        readiness_issues = helper_readiness_issues(transport_ready=True, debug_ref=str(logger.run_dir))
         client = OpenCodeClient(config.opencode_url, timeout_sec=10)
         try:
             opencode_health = await client.health()
@@ -97,7 +143,8 @@ def create_app(config: VoiceConfig) -> FastAPI:
             await client.close()
         return JSONResponse(
             {
-                "ok": True,
+                "ok": not readiness_issues,
+                "ready": not readiness_issues,
                 "opencode": opencode_health,
                 "opencode_url": config.opencode_url,
                 "run_dir": str(logger.run_dir),
@@ -106,6 +153,7 @@ def create_app(config: VoiceConfig) -> FastAPI:
                 "credential_issues": [
                     issue.to_voice_bridge_issue(debug_ref=str(logger.run_dir)) for issue in credentials.issues
                 ],
+                "issues": list(readiness_issues),
                 "deepgram": {
                     "enabled": config.has_deepgram_key,
                     "stt_model": config.deepgram_stt_model,
@@ -182,9 +230,21 @@ class VoiceConnection:
         self.tts_first_audio_seen = False
 
     async def run(self) -> None:
-        await self.send_json({"type": "ready", "run_dir": str(self.logger.run_dir)})
-        for issue in self.config.credential_issues:
-            await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
+        readiness_issues = helper_readiness_issues(
+            transport_ready=True,
+            debug_ref=str(self.logger.run_dir),
+        )
+        if readiness_issues:
+            self.logger.state_transition(
+                "transport.connected",
+                "voice_bridge_issue",
+                diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
+            )
+            for issue in readiness_issues:
+                await self.send_json(issue)
+        else:
+            self.logger.state_transition("transport.connected", "ready")
+            await self.send_json({"type": "ready", "run_dir": str(self.logger.run_dir)})
         while True:
             message = await self.websocket.receive()
             if message.get("type") == "websocket.disconnect":
@@ -378,6 +438,7 @@ class VoiceConnection:
         before_messages = await self.client.messages(session_id)
         tracker = AssistantTextTracker(before_messages)
         await self.send_json({"type": "turn.start", "turn_id": turn_id, "source": source, "text": text, "eager": eager})
+        self.logger.state_transition("ready", "thinking", turn_id=turn_id, source=source)
         self.logger.write(
             "turn.start",
             turn_id=turn_id,
@@ -426,6 +487,7 @@ class VoiceConnection:
             tracker = await self.prompt_with_overflow_retry(session_id, text, tracker, turn_id)
         except Exception as exc:  # noqa: BLE001 - keep the WebSocket alive and make the failure visible.
             self.active_turn_id = None
+            self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
             self.logger.write("turn.request.error", turn_id=turn_id, error=repr(exc))
             await self.send_json({"type": "turn.error", "turn_id": turn_id, "message": repr(exc)})
             return
@@ -485,6 +547,7 @@ class VoiceConnection:
                     response_chars=len(update.full_text or full_text),
                     stream_source=stream_source,
                 )
+                self.logger.state_transition("thinking", "ready", turn_id=turn_id)
                 self.active_turn_id = None
                 await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
                 return
@@ -493,6 +556,7 @@ class VoiceConnection:
         if self.active_turn_id == turn_id:
             await self.send_json({"type": "turn.timeout", "turn_id": turn_id})
             self.logger.write("turn.timeout", turn_id=turn_id, latency_ms=elapsed_ms(started))
+            self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
             self.active_turn_id = None
 
     async def run_event_text_turn(
@@ -577,6 +641,7 @@ class VoiceConnection:
             if self.active_turn_id == turn_id:
                 await self.send_json({"type": "turn.timeout", "turn_id": turn_id})
                 self.logger.write("turn.timeout", turn_id=turn_id, latency_ms=elapsed_ms(started), stream_source="event")
+                self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
                 self.active_turn_id = None
         finally:
             reader_task.cancel()
@@ -637,6 +702,7 @@ class VoiceConnection:
             response_chars=len(final_text),
             stream_source="event",
         )
+        self.logger.state_transition("thinking", "ready", turn_id=turn_id)
         self.active_turn_id = None
         await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
 

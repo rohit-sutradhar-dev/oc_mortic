@@ -18,6 +18,7 @@ from opencode_voice.config import (
 from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import SSEParser
+from opencode_voice.server import helper_readiness_issues
 from opencode_voice.state import (
     AssistantTextTracker,
     OpenCodeEventTurnTracker,
@@ -118,6 +119,52 @@ class CredentialConfigTests(unittest.TestCase):
 
         self.assertNotIn(raw_key, content)
         self.assertIn(REDACTED, content)
+
+
+class HelperReadinessTests(unittest.TestCase):
+    def test_readiness_reports_issues_until_audio_and_keys_are_available(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            issues = helper_readiness_issues(
+                transport_ready=True,
+                audio_ready=False,
+                dotenv_path="/tmp/mortic-missing-dotenv",
+            )
+
+        codes = {issue["diagnosticCode"] for issue in issues}
+        serialized = json.dumps(issues)
+        self.assertEqual(
+            codes,
+            {
+                "audio_dependency_unavailable",
+                "missing_voice_audio_key",
+                "missing_voice_turn_key",
+            },
+        )
+        self.assertNotIn("DEEPGRAM_API_KEY", serialized)
+        self.assertNotIn("INCEPTION_API_KEY", serialized)
+        self.assertNotIn("Deepgram", serialized)
+        self.assertNotIn("Mercury", serialized)
+
+    def test_readiness_has_no_issues_when_runtime_checks_pass(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DEEPGRAM_API_KEY": "audio-key", "INCEPTION_API_KEY": "turn-key"},
+            clear=True,
+        ):
+            issues = helper_readiness_issues(transport_ready=True, audio_ready=True)
+
+        self.assertEqual(issues, ())
+
+    def test_run_logger_summarizes_prompt_content_but_keeps_turn_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = RunLogger(root=tmp)
+            logger.write("turn.debug", turn_id=7, text="do not persist this prompt", raw={"payload": "large"})
+            record = json.loads(logger.path.read_text(encoding="utf-8").splitlines()[-1])
+
+        self.assertEqual(record["turn_id"], 7)
+        self.assertEqual(record["text"]["kind"], "text")
+        self.assertEqual(record["text"]["chars"], len("do not persist this prompt"))
+        self.assertEqual(record["raw"]["kind"], "dict")
 
 
 class TokenTests(unittest.TestCase):

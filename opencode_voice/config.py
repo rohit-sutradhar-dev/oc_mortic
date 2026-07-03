@@ -66,20 +66,15 @@ class VoiceCredentialIssue:
         debug_ref: str | None = None,
         voice_lane_id: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "type": "voice_bridge_issue",
-            "sentAt": sent_at or iso_utc_now(),
-            "userMessage": VOICE_BRIDGE_USER_MESSAGE,
-            "safeDetail": self.safe_detail,
-            "diagnosticCode": self.diagnostic_code,
-            "retryable": self.retryable,
-            "capability": self.capability,
-        }
-        if voice_lane_id:
-            payload["voiceLaneId"] = voice_lane_id
-        if debug_ref:
-            payload["debugRef"] = debug_ref
-        return payload
+        return voice_bridge_issue_payload(
+            capability=self.capability,
+            diagnostic_code=self.diagnostic_code,
+            safe_detail=self.safe_detail,
+            retryable=self.retryable,
+            sent_at=sent_at,
+            debug_ref=debug_ref,
+            voice_lane_id=voice_lane_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -158,6 +153,32 @@ class VoiceConfig:
 
 def iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def voice_bridge_issue_payload(
+    *,
+    capability: str,
+    diagnostic_code: str,
+    safe_detail: str,
+    retryable: bool = True,
+    sent_at: str | None = None,
+    debug_ref: str | None = None,
+    voice_lane_id: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "voice_bridge_issue",
+        "sentAt": sent_at or iso_utc_now(),
+        "userMessage": VOICE_BRIDGE_USER_MESSAGE,
+        "safeDetail": safe_detail,
+        "diagnosticCode": diagnostic_code,
+        "retryable": retryable,
+        "capability": capability,
+    }
+    if voice_lane_id:
+        payload["voiceLaneId"] = voice_lane_id
+    if debug_ref:
+        payload["debugRef"] = debug_ref
+    return payload
 
 
 def load_local_dotenv(
