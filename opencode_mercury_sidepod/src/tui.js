@@ -4,6 +4,9 @@ import { createSignal } from "solid-js";
 
 const WIDTH = 36;
 const INNER = WIDTH - 2;
+// Centered host dialogs are wider than the sidepod column.
+const MODAL_INNER = 60;
+const MODAL_PAGE = 14;
 const SMOKE_SINK = globalThis.process?.env?.MORTIC_SMOKE_LOG;
 const HELPER_WS_URL = globalThis.process?.env?.MORTIC_HELPER_WS_URL ?? "ws://127.0.0.1:8765/ws/sidepod";
 
@@ -82,11 +85,9 @@ function wrap(value, width = INNER) {
 
 function frame(title, children, color, borderColor, style = "heavy") {
   const chars =
-    style === "modal"
-      ? { tl: "┏", tr: "┓", bl: "┗", br: "┛", h: "━", v: "┃" }
-      : style === "soft"
-        ? { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│" }
-        : { tl: "╔", tr: "╗", bl: "╚", br: "╝", h: "═", v: "║" };
+    style === "soft"
+      ? { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│" }
+      : { tl: "╔", tr: "╗", bl: "╚", br: "╝", h: "═", v: "║" };
   const label = title ? ` ${title} ` : "";
   const topFill = chars.h.repeat(Math.max(0, WIDTH - 2 - label.length));
   const lines = [{ text: `${chars.tl}${label}${topFill}${chars.tr}`, color: borderColor }];
@@ -97,20 +98,6 @@ function frame(title, children, color, borderColor, style = "heavy") {
   }
   lines.push({ text: `${chars.bl}${chars.h.repeat(WIDTH - 2)}${chars.br}`, color: borderColor });
   return lines.map((item) => line(item.text, item.color));
-}
-
-function separator(color, left = "╟", fill = "─", right = "╢") {
-  return line(`${left}${fill.repeat(WIDTH - 2)}${right}`, color);
-}
-
-function statusGlyph(state) {
-  if (state.live) {
-    return "LIVE";
-  }
-  if (state.armed) {
-    return "ARM";
-  }
-  return "IDLE";
 }
 
 function renderBrailleOrb(phase, active, captionColor) {
@@ -203,8 +190,6 @@ function renderHero(state, theme) {
       "MORTIC",
       [
         center("M O R T I C", INNER),
-        row("focus", state.focused ? "sidepod" : "prompt"),
-        row("voice lane", statusGlyph(state)),
         center("", INNER),
         ...renderBrailleOrb(state.phase, active, secondaryAccent).map((item) =>
           typeof item === "string"
@@ -229,14 +214,12 @@ function renderControlPanel(state, actions, theme) {
   return [
     line("", muted),
     line(`╔ COMMAND DECK${"═".repeat(WIDTH - 15)}╗`, accent),
-    line(`║${fit(row("last", state.event), INNER)}║`, muted),
-    line(`║${fit(row("items", String(state.transcript.length)), INNER)}║`, muted),
-    separator(accent),
-    commandRow("[PTT]", "Push to Talk", state.armed ? "ARMED" : "OFF", armColor, actions.ptt),
-    commandRow("[LIVE]", "Voice Control", state.live ? "ON" : "OFF", liveColor, actions.toggleLive),
-    commandRow("[CLR]", "Clear Lane", "RESET", theme.warning, actions.clear),
-    commandRow("[TRN]", "Transcript", "POPUP/C", accent, actions.openTranscript),
-    commandRow("[HND]", "Handoff", state.handoffReady ? "READY" : "DRAFT", accent, actions.openHandoff),
+    commandRow("[M]", "Push to Talk", state.armed ? "ARMED" : "OFF", armColor, actions.ptt),
+    commandRow("[L]", "Live", state.live ? "ON" : "OFF", liveColor, actions.toggleLive),
+    commandRow("[X]", "Clear Lane", "", theme.warning, actions.clear),
+    commandRow("[T]", "Transcript", "", accent, actions.openTranscript),
+    commandRow("[H]", "Handoff", state.handoffReady ? "READY" : "DRAFT", accent, actions.openHandoff),
+    commandRow("[ESC]", "End Session", "", theme.error, actions.requestEnd),
     line(`╚${"═".repeat(WIDTH - 2)}╝`, accent)
   ];
 }
@@ -264,44 +247,8 @@ function renderConversation(state, theme) {
   ];
 }
 
-function renderPopup(state, actions, theme) {
-  if (!state.popup) {
-    return [];
-  }
-  const accent = theme.accent;
-  const danger = theme.error;
-  const isTranscript = state.popup === "transcript";
-  const isExit = state.popup === "exit";
-  const title = isExit ? "END SESSION" : isTranscript ? "TRANSCRIPT" : "HANDOFF";
-  const lines = isExit ? exitLines() : isTranscript ? transcriptLines(state) : handoffLines();
-  const controls = isExit
-    ? [
-        clickable(`┃  H HANDOFF${" ".repeat(Math.max(0, INNER - 11))}┃`, accent, actions.openHandoff),
-        clickable(`┃  C COPY${" ".repeat(Math.max(0, INNER - 8))}┃`, accent, actions.copyPopup),
-        clickable(`┃  X CLOSE${" ".repeat(Math.max(0, INNER - 9))}┃`, danger, actions.closePopup),
-        clickable(`┃  ESC END${" ".repeat(Math.max(0, INNER - 9))}┃`, danger, actions.confirmExit)
-      ]
-    : [
-        clickable(`┃  C COPY${" ".repeat(Math.max(0, INNER - 8))}┃`, accent, actions.copyPopup),
-        clickable(`┃  X CLOSE${" ".repeat(Math.max(0, INNER - 9))}┃`, danger, actions.closePopup)
-      ];
-  return [
-    line("", theme.textMuted),
-    ...frame(title, lines.slice(0, 9), theme.text, accent, "modal"),
-    ...controls,
-    line(`┗${"━".repeat(WIDTH - 2)}┛`, accent)
-  ];
-}
-
 function transcriptText(state) {
   return state.transcript.map((item) => `${item.role}: ${item.text}`).join("\n");
-}
-
-function transcriptLines(state) {
-  if (!state.transcript.length) {
-    return ["No transcript yet.", "Use PTT or Live to start."];
-  }
-  return state.transcript.flatMap((item) => wrap(`${item.role}: ${item.text}`, INNER));
 }
 
 function handoffText(state) {
@@ -313,18 +260,6 @@ function handoffText(state) {
     "",
     "Keep code, commands, paths, diffs, and JSON screen-only."
   ].join("\n");
-}
-
-function handoffLines() {
-  return wrap("Handoff draft prepared from the current voice lane. Spoken text stays short; screen-only details stay separate.", INNER);
-}
-
-function exitText() {
-  return "End Mortic session. Current lane is ephemeral; open Handoff first if you want a copy.";
-}
-
-function exitLines() {
-  return wrap(exitText(), INNER);
 }
 
 // PTT is a plain M toggle by product decision (2026-07-03). Terminal
@@ -392,7 +327,13 @@ function createProtocolSender(recordSmoke) {
       socket.send(serialized);
       return;
     }
+    // Never replay a long backlog of stale PTT events when the helper
+    // reconnects: keep only a short queue and drop the oldest beyond it.
     queue.push(serialized);
+    if (queue.length > 16) {
+      queue.shift();
+      recordSmoke("protocol.drop", { reason: "queue-full" });
+    }
     open();
   };
 }
@@ -410,8 +351,7 @@ function renderPod(state, actions, theme) {
     [
       ...renderHero(state, theme),
       ...renderControlPanel(state, actions, theme),
-      ...renderConversation(state, theme),
-      ...renderPopup(state, actions, theme)
+      ...renderConversation(state, theme)
     ]
   );
 }
@@ -422,7 +362,8 @@ export async function tui(api) {
     const [getArmed, setArmed] = createSignal(false);
     const [getLive, setLive] = createSignal(false);
     const [getFocused, setFocused] = createSignal(false);
-    const [getPopup, setPopup] = createSignal(null);
+    const [getModal, setModal] = createSignal(null);
+    const [getModalScroll, setModalScroll] = createSignal(0);
     const [getPhase, setPhase] = createSignal(0);
     const [getEvent, setEvent] = createSignal("ready");
     const [getUserText, setUserText] = createSignal("Press PTT or Live. Spoken asks will appear here.");
@@ -488,16 +429,123 @@ export async function tui(api) {
         recordSmoke("focus");
         setEvent("focus mode");
       });
-    const openExitConfirm = () =>
+    const recordSmoke = (event, details = {}) => {
+      logSmoke(api, event, details);
+    };
+
+    // Modals render as centered host dialogs over the whole TUI (never inside
+    // the sidepod). Owner spec 2026-07-03: Esc is never destructive; ending a
+    // session is an explicit confirm action inside the End Session dialog.
+    const MODAL_TITLES = { transcript: "TRANSCRIPT", handoff: "HANDOFF", exit: "END SESSION" };
+    const MODAL_FOOTERS = {
+      transcript: "j/k scroll · c copy · esc close",
+      handoff: "c copy · esc close",
+      exit: "enter end session · h handoff · esc cancel"
+    };
+    const modalBodyLines = () => {
+      const kind = getModal();
+      if (kind === "transcript") {
+        const items = getTranscript();
+        const all = items.length
+          ? items.flatMap((item) => wrap(`${item.role}: ${item.text}`, MODAL_INNER))
+          : ["No transcript yet.", "Use PTT or Live to start."];
+        const top = Math.min(getModalScroll(), Math.max(0, all.length - MODAL_PAGE));
+        return all.slice(top, top + MODAL_PAGE);
+      }
+      if (kind === "handoff") {
+        return handoffText({ userText: getUserText(), assistantText: getAssistantText() })
+          .split("\n")
+          .flatMap((item) => (item ? wrap(item, MODAL_INNER) : [""]));
+      }
+      if (kind === "exit") {
+        return [
+          "This voice lane is ephemeral.",
+          "Ending clears the transcript and returns focus to the prompt.",
+          "Open Handoff first if you want a copy."
+        ].flatMap((item) => wrap(item, MODAL_INNER));
+      }
+      return [];
+    };
+    const onHostClose = () =>
       mutate(() => {
-        setPopup("exit");
-        setEvent("confirm exit");
-        recordSmoke("exit.confirm.open");
+        if (getModal()) {
+          recordSmoke("modal.close", { modal: getModal() });
+          setModal(null);
+        }
       });
-    const confirmExit = () =>
+    const renderModalContent = () => {
+      const kind = getModal();
+      const theme = api.theme.current;
+      return api.ui.Dialog({
+        size: "medium",
+        onClose: onHostClose,
+        children: box({ flexDirection: "column", paddingLeft: 1, paddingRight: 1 }, [
+          text({ fg: theme.accent }, [MODAL_TITLES[kind] ?? ""]),
+          text({ fg: theme.text }, [""]),
+          ...modalBodyLines().map((item) => text({ fg: theme.text }, [item])),
+          text({ fg: theme.text }, [""]),
+          text({ fg: theme.textMuted }, [MODAL_FOOTERS[kind] ?? ""])
+        ])
+      });
+    };
+    const openModal = (kind) =>
+      mutate(() => {
+        setModal(kind);
+        setModalScroll(0);
+        if (kind === "exit") {
+          recordSmoke("exit.confirm.open");
+          setEvent("confirm exit");
+        } else {
+          recordSmoke("modal.open", { modal: kind });
+          setEvent(kind);
+        }
+        api.ui.dialog.replace(renderModalContent, onHostClose);
+      });
+    const closeModal = () =>
+      mutate(() => {
+        if (!getModal()) {
+          return;
+        }
+        recordSmoke("modal.close", { modal: getModal() });
+        setModal(null);
+        api.ui.dialog.clear();
+      });
+    const refreshModal = () => {
+      if (getModal()) {
+        api.ui.dialog.replace(renderModalContent, onHostClose);
+      }
+    };
+    const scrollModal = (delta) =>
+      mutate(() => {
+        setModalScroll(Math.max(0, getModalScroll() + delta));
+        refreshModal();
+      });
+    const modalCopyText = () => {
+      if (getModal() === "transcript") {
+        return transcriptText({ transcript: getTranscript() });
+      }
+      if (getModal() === "handoff") {
+        return handoffText({ userText: getUserText(), assistantText: getAssistantText() });
+      }
+      return "";
+    };
+    const copyModal = () =>
+      mutate(() => {
+        const value = modalCopyText();
+        if (!value) {
+          return;
+        }
+        recordSmoke("popup.copy", { popup: getModal() });
+        // OSC 52 works in any terminal, including over SSH.
+        const ok = api.renderer.copyToClipboardOSC52?.(value);
+        api.ui.toast({ variant: ok ? "success" : "error", message: ok ? "Copied" : "Copy unavailable" });
+        setEvent(ok ? "copied" : "copy unavailable");
+      });
+    const endSession = () =>
       mutate(() => {
         recordSmoke("exit.confirmed");
-        setPopup(null);
+        setModal(null);
+        api.ui.dialog.clear();
         setArmed(false);
         setLive(false);
         setEvent("session ended");
@@ -505,15 +553,27 @@ export async function tui(api) {
         setAssistantText("Start Mortic again for a fresh voice lane.");
         setTranscript([]);
         restorePromptFocus();
+        api.ui.toast({ variant: "success", message: "Mortic session ended" });
       });
+    // Esc is never destructive: inside a modal it closes the modal; outside it
+    // opens the End Session confirmation. Only the explicit confirm action in
+    // that dialog ends the session.
     const handleEscape = () => {
-      if (getPopup() === "exit") {
-        confirmExit();
-      } else {
-        openExitConfirm();
+      if (getModal()) {
+        closeModal();
+        return;
+      }
+      openModal("exit");
+    };
+    const requestEnd = () => {
+      if (!getModal()) {
+        openModal("exit");
       }
     };
-    const toggleLive = () =>
+    const toggleLive = () => {
+      if (getModal()) {
+        return;
+      }
       mutate(() => {
         const next = !getLive();
         setLive(next);
@@ -522,9 +582,12 @@ export async function tui(api) {
         setUserText(next ? "Live voice control is on." : "Live voice control is off.");
         appendTranscript("user", next ? "Live voice enabled." : "Live voice disabled.");
       });
-    const clearLane = () =>
+    };
+    const clearLane = () => {
+      if (getModal()) {
+        return;
+      }
       mutate(() => {
-        setPopup(null);
         setArmed(false);
         setLive(false);
         setEvent("cleared");
@@ -532,28 +595,19 @@ export async function tui(api) {
         setAssistantText("Ready for the next spoken turn.");
         setTranscript([{ role: "system", text: "Voice lane cleared." }]);
       });
-    const openTranscript = () =>
-      mutate(() => {
-        setPopup(getPopup() === "transcript" ? null : "transcript");
-        setEvent("transcript");
-      });
-    const openHandoff = () =>
-      mutate(() => {
-        setPopup(getPopup() === "handoff" ? null : "handoff");
-        setEvent("handoff");
-      });
-    const closePopup = () =>
-      mutate(() => {
-        setPopup(null);
-        setEvent("closed");
-      });
-    const copyValue = (value) =>
-      mutate(() => {
-        // OSC 52 works in any terminal, including over SSH.
-        setEvent(api.renderer.copyToClipboardOSC52?.(value) ? "copied" : "copy unavailable");
-      });
-    const recordSmoke = (event, details = {}) => {
-      logSmoke(api, event, details);
+    };
+    const openTranscript = () => {
+      if (getModal()) {
+        return;
+      }
+      openModal("transcript");
+    };
+    const openHandoff = () => {
+      // Reachable from idle focus mode and from the End Session dialog.
+      if (getModal() && getModal() !== "exit") {
+        return;
+      }
+      openModal("handoff");
     };
     const sendProtocol = createProtocolSender(recordSmoke);
     const nextClientEventId = () => `evt_sidepod_${Date.now().toString(36)}_${++clientEventSeq}`;
@@ -563,38 +617,12 @@ export async function tui(api) {
       clientEventId: nextClientEventId(),
       sentAt: new Date().toISOString()
     });
-    const currentPopupText = () => {
-      if (getPopup() === "transcript") {
-        return transcriptText({ transcript: getTranscript() });
-      }
-      if (getPopup() === "handoff") {
-        return handoffText({ userText: getUserText(), assistantText: getAssistantText() });
-      }
-      if (getPopup() === "exit") {
-        return exitText();
-      }
-      return "";
-    };
-    const copyPopup = () => {
-      recordSmoke("popup.copy", { popup: getPopup() || "none" });
-      copyValue(currentPopupText());
-    };
-    const handleCopyOrClear = () => {
-      if (getPopup()) {
-        copyPopup();
-      } else {
-        clearLane();
-      }
-    };
-    const handleClosePopup = () => {
-      if (getPopup()) {
-        recordSmoke("popup.close", { popup: getPopup() });
-        closePopup();
-      }
-    };
     // Plain M toggle by product decision (2026-07-03): every M press flips
     // armed/stopped. No repeat debounce, no event-type handling, no timing.
-    const handlePttKey = () =>
+    const handlePttKey = () => {
+      if (getModal()) {
+        return;
+      }
       mutate(() => {
         if (getArmed()) {
           const stopEvent = protocolBase("ptt.stop");
@@ -632,16 +660,19 @@ export async function tui(api) {
         appendTranscript("user", "M PTT on.");
         recordSmoke("ptt.state", { armed: true, via: "m-arm" });
       });
+    };
 
+    // One visible key per action (owner spec 2026-07-03): M is the only PTT
+    // key. Modal-scoped keys (c copy, j/k scroll, enter confirm, h from the
+    // End Session dialog) are handled by the swallow guard while a modal is
+    // open, so they never need mode bindings here.
     const modeBindings = [
-      { key: "escape", cmd: "mortic.escape", desc: "Exit Mortic" },
-      { key: "m", cmd: "mortic.ptt.press", desc: "Tap M PTT" },
-      { key: "p", cmd: "mortic.ptt.press", desc: "Push to Talk" },
+      { key: "escape", cmd: "mortic.escape", desc: "End session / close modal" },
+      { key: "m", cmd: "mortic.ptt.press", desc: "Push to talk" },
       { key: "l", cmd: "mortic.live", desc: "Toggle Live" },
-      { key: "c", cmd: "mortic.popup.copy", desc: "Copy popup or clear lane" },
-      { key: "x", cmd: "mortic.popup.close", desc: "Close popup" },
-      { key: "t", cmd: "mortic.transcript", desc: "Transcript popup" },
-      { key: "h", cmd: "mortic.handoff", desc: "Handoff popup" }
+      { key: "x", cmd: "mortic.clear", desc: "Clear lane" },
+      { key: "t", cmd: "mortic.transcript", desc: "Transcript" },
+      { key: "h", cmd: "mortic.handoff", desc: "Handoff" }
     ];
 
     // Typing lock: global key handlers run before renderable handlers and the
@@ -653,6 +684,28 @@ export async function tui(api) {
       if (!getFocused()) return;
       if (event?.ctrl || event?.meta || event?.super) return;
       const name = typeof event?.name === "string" ? event.name.toLowerCase() : "";
+      const modal = getModal();
+      if (modal) {
+        // Modal-scoped keys. Esc passes through so the host dialog and the
+        // mortic.escape binding can close the modal (closeModal is idempotent).
+        if (name === "escape") return;
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        if (name === "c") {
+          copyModal();
+        } else if (modal === "exit" && name === "h") {
+          openHandoff();
+        } else if (modal === "exit" && (name === "enter" || name === "return")) {
+          endSession();
+        } else if (modal === "transcript" && (name === "j" || name === "down")) {
+          scrollModal(1);
+        } else if (modal === "transcript" && (name === "k" || name === "up")) {
+          scrollModal(-1);
+        } else {
+          recordSmoke("typing.swallow", { key: name || "unknown", modal });
+        }
+        return;
+      }
       if (morticModeKeys.has(name)) return;
       recordSmoke("typing.swallow", { key: name || "unknown" });
       event?.preventDefault?.();
@@ -674,9 +727,7 @@ export async function tui(api) {
       clear: clearLane,
       openTranscript,
       openHandoff,
-      closePopup,
-      copyPopup,
-      confirmExit
+      requestEnd
     };
 
     // Palette layer must stay unpinned: mode-pinned layers are not "reachable"
@@ -700,13 +751,12 @@ export async function tui(api) {
     api.keymap.registerLayer({
       mode: "mortic.sidepod",
       commands: [
-        { name: "mortic.escape", title: "Mortic: Exit session", category: "Mortic", run: handleEscape },
+        { name: "mortic.escape", title: "Mortic: End session / close modal", category: "Mortic", run: handleEscape },
         { name: "mortic.ptt.press", title: "Mortic: Push-to-talk toggle", category: "Mortic", run: handlePttKey },
         { name: "mortic.live", title: "Mortic: Toggle Live", category: "Mortic", run: toggleLive },
-        { name: "mortic.popup.copy", title: "Mortic: Copy popup or clear lane", category: "Mortic", run: handleCopyOrClear },
-        { name: "mortic.popup.close", title: "Mortic: Close popup", category: "Mortic", run: handleClosePopup },
-        { name: "mortic.transcript", title: "Mortic: Transcript popup", category: "Mortic", run: openTranscript },
-        { name: "mortic.handoff", title: "Mortic: Handoff popup", category: "Mortic", run: openHandoff }
+        { name: "mortic.clear", title: "Mortic: Clear lane", category: "Mortic", run: clearLane },
+        { name: "mortic.transcript", title: "Mortic: Transcript", category: "Mortic", run: openTranscript },
+        { name: "mortic.handoff", title: "Mortic: Handoff", category: "Mortic", run: openHandoff }
       ],
       bindings: modeBindings
     });
@@ -727,7 +777,6 @@ export async function tui(api) {
               armed: getArmed(),
               live: getLive(),
               focused: getFocused(),
-              popup: getPopup(),
               phase: getPhase(),
               event: getEvent(),
               userText: getUserText(),

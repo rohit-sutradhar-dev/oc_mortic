@@ -52,20 +52,46 @@ test("focus mode locks typing and PTT is a plain M toggle", () => {
   assert.match(src, /currentFocusedRenderable/);
 });
 
-test("exit confirmation and popup keys are scoped", () => {
-  assert.match(src, /setPopup\("exit"\)/);
-  assert.match(src, /getPopup\(\) === "exit"[\s\S]*confirmExit\(\)/);
+test("popups are centered host dialogs and Esc is never destructive", () => {
+  // Owner spec 2026-07-03: Transcript, Handoff, and End Session render as
+  // centered host dialogs, never inside the sidepod under COMMS.
+  assert.match(src, /api\.ui\.dialog\.replace/);
+  assert.match(src, /api\.ui\.dialog\.clear/);
+  assert.match(src, /api\.ui\.Dialog\(/);
+  assert.match(src, /api\.ui\.toast\(/);
+  assert.equal(src.includes("renderPopup"), false);
+
+  // Esc closes the modal or opens the End Session confirm — it never ends the
+  // session itself. Ending is only the explicit confirm action in the dialog.
+  assert.match(src, /if \(getModal\(\)\) \{\s*closeModal\(\);\s*return;\s*\}\s*openModal\("exit"\)/);
+  assert.match(src, /name === "enter" \|\| name === "return"[\s\S]{0,40}endSession\(\)/);
+  assert.equal(/handleEscape[\s\S]{0,200}endSession\(\)/.test(src), false);
+
   assert.match(src, /setTranscript\(\[\]\)/);
   assert.match(src, /restorePromptFocus\(\)/);
   assert.match(src, /key:\s*"escape",\s*cmd:\s*"mortic\.escape"/);
-  assert.match(src, /key:\s*"c",\s*cmd:\s*"mortic\.popup\.copy"/);
-  assert.match(src, /key:\s*"x",\s*cmd:\s*"mortic\.popup\.close"/);
-  assert.equal(/key:\s*"c",\s*cmd:\s*"mortic\.clear"/.test(src), false);
-  assert.match(src, /if \(getPopup\(\)\) {\s*copyPopup\(\);[\s\S]*} else {\s*clearLane\(\);/);
-  assert.match(src, /H HANDOFF[\s\S]*actions\.openHandoff/);
-  assert.match(src, /recordSmoke\("exit\.confirm\.open"\)/);
+  assert.match(src, /recordSmoke\("exit\.confirm\.open"/);
   assert.match(src, /recordSmoke\("exit\.confirmed"\)/);
   assert.match(src, /recordSmoke\("popup\.copy"/);
+  assert.match(src, /recordSmoke\("modal\.open"/);
+  assert.match(src, /recordSmoke\("modal\.close"/);
+});
+
+test("command deck uses key-true labels and one PTT key", () => {
+  for (const label of ["[M]", "[L]", "[X]", "[T]", "[H]", "[ESC]", "End Session"]) {
+    assert.ok(src.includes(label), `deck label missing: ${label}`);
+  }
+  for (const stale of ["[PTT]", "[LIVE]", "[CLR]", "[TRN]", "[HND]"]) {
+    assert.equal(src.includes(stale), false, `stale deck label present: ${stale}`);
+  }
+  // M is the only PTT key; p was dropped as a hidden alias.
+  assert.equal(/key:\s*"p"/.test(src), false);
+  assert.match(src, /key:\s*"x",\s*cmd:\s*"mortic\.clear"/);
+  // Noisy status-only rows removed: sprite and row states carry status.
+  assert.equal(/row\("focus"/.test(src), false);
+  assert.equal(/row\("voice lane"/.test(src), false);
+  assert.equal(/row\("last"/.test(src), false);
+  assert.equal(/row\("items"/.test(src), false);
 });
 
 test("plain M toggle emits protocol v0 PTT controls", () => {
@@ -81,6 +107,9 @@ test("plain M toggle emits protocol v0 PTT controls", () => {
   assert.match(src, /turnId:\s*activePttTurnId/);
   assert.match(src, /key:\s*"m",\s*cmd:\s*"mortic\.ptt\.press"/);
   assert.match(src, /mode:\s*"mortic\.sidepod"[\s\S]*mortic\.ptt\.press/);
+  // The offline send queue is capped so stale PTT events are never replayed
+  // in bulk when the helper reconnects.
+  assert.match(src, /recordSmoke\("protocol\.drop"/);
 });
 
 test("slash registration matches OpenCode 1.17.x reachability rules", () => {
