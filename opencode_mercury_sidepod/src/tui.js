@@ -414,7 +414,18 @@ export async function tui(api) {
       setFocused(false);
     };
 
-    const focusMortic = () =>
+    const focusMortic = () => {
+      // sidebar_content only mounts on the session route (it requires a
+      // session_id). Focusing without a session would lock the keyboard
+      // against a sidepod that never renders — refuse and say why instead.
+      if (api.route.current.name !== "session") {
+        recordSmoke("focus.blocked", { reason: "no-session" });
+        api.ui.toast({
+          variant: "error",
+          message: "Mortic needs an open chat session. Start one first."
+        });
+        return;
+      }
       mutate(() => {
         if (!exitMorticMode) {
           exitMorticMode = api.mode.push("mortic.sidepod");
@@ -429,6 +440,7 @@ export async function tui(api) {
         recordSmoke("focus");
         setEvent("focus mode");
       });
+    };
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
     };

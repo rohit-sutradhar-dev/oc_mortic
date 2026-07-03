@@ -77,6 +77,19 @@ test("popups are centered host dialogs and Esc is never destructive", () => {
   assert.match(src, /recordSmoke\("modal\.close"/);
 });
 
+test("focusing without an open session is refused, not silently locked", () => {
+  // sidebar_content only mounts on the session route; focusing anyway would
+  // engage the typing lock against a sidepod that never renders anything.
+  assert.match(src, /const focusMortic = \(\) => \{/);
+  assert.match(src, /api\.route\.current\.name !== "session"[\s\S]{0,300}api\.ui\.toast\(/);
+  assert.match(src, /recordSmoke\("focus\.blocked"/);
+  // The blocked path must return before any mode push / focus lock.
+  assert.match(
+    src,
+    /if \(api\.route\.current\.name !== "session"\) \{[\s\S]*?return;\s*\}\s*mutate\(\(\) => \{\s*if \(!exitMorticMode\)/
+  );
+});
+
 test("command deck uses key-true labels and one PTT key", () => {
   for (const label of ["[M]", "[L]", "[X]", "[T]", "[H]", "[ESC]", "End Session"]) {
     assert.ok(src.includes(label), `deck label missing: ${label}`);
