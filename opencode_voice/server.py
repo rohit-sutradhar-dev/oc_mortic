@@ -30,6 +30,9 @@ from opencode_voice.deepgram import (
 )
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import OpenCodeClient
+from opencode_voice.protocol import check_command as check_sidepod_command
+from opencode_voice.protocol import check_event as check_sidepod_event
+from opencode_voice.protocol import schema_document as sidepod_schema_document
 from opencode_voice.state import (
     AssistantTextTracker,
     OpenCodeEventTurnTracker,
@@ -45,6 +48,9 @@ STATIC_DIR = Path(__file__).with_name("static")
 EPHEMERAL_PREFIX = "[voice tmp]"
 AUDIO_DEPENDENCY_MODULE = "sounddevice"
 SIDEPOD_PROTOCOL_VERSION = "mortic.sidepod.v0"
+# Live capture that produces zero frames within this window is treated as a
+# silently denied mic (macOS TCC denies without any error on some terminals).
+MIC_WATCHDOG_SEC = 4.0
 CONTEXT_OVERFLOW_MARKERS = (
     "maximum context length",
     "context length",
@@ -99,6 +105,258 @@ class OpenCodeEventFallback(Exception):
         super().__init__(reason)
         self.reason = reason
         self.prompt_sent = prompt_sent
+
+
+class NativeMicSession:
+    def __init__(
+        self,
+        config: VoiceConfig,
+        logger: RunLogger,
+        on_audio: Callable[[bytes], Awaitable[None]],
+        on_issue: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        self.config = config
+        self.logger = logger
+        self.on_audio = on_audio
+        self.on_issue = on_issue
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.queue: asyncio.Queue[bytes] | None = None
+        self.stream: Any | None = None
+        self.pump_task: asyncio.Task[None] | None = None
+        self.closed = False
+        self.dropped_chunks = 0
+
+    async def start(self) -> bool:
+        try:
+            import sounddevice as sd  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001 - optional runtime dependency.
+            self.logger.write("native_audio.start.error", error=repr(exc), reason="import_failed")
+            await self.on_issue(
+                voice_bridge_issue_payload(
+                    capability="voice_audio",
+                    diagnostic_code="audio_dependency_unavailable",
+                    safe_detail="Audio capture unavailable",
+                    debug_ref=str(self.logger.run_dir),
+                )
+            )
+            return False
+
+        self.loop = asyncio.get_running_loop()
+        self.queue = asyncio.Queue(maxsize=64)
+        blocksize = max(1, int(self.config.deepgram_sample_rate * 0.08))
+
+        def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+            if self.closed:
+                return
+            if status:
+                self.logger.write("native_audio.status", status=str(status))
+            data = bytes(indata)
+            if self.loop:
+                self.loop.call_soon_threadsafe(self.enqueue_audio, data)
+
+        try:
+            self.stream = sd.RawInputStream(
+                samplerate=self.config.deepgram_sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=blocksize,
+                callback=callback,
+            )
+            self.stream.start()
+        except Exception as exc:  # noqa: BLE001 - device/permission failures become safe UI issues.
+            self.logger.write("native_audio.start.error", error=repr(exc), reason="stream_start_failed")
+            await self.on_issue(
+                voice_bridge_issue_payload(
+                    capability="voice_audio",
+                    diagnostic_code="audio_capture_unavailable",
+                    safe_detail="Audio capture unavailable",
+                    debug_ref=str(self.logger.run_dir),
+                )
+            )
+            return False
+
+        self.pump_task = asyncio.create_task(self.pump())
+        self.logger.write(
+            "native_audio.start",
+            sample_rate=self.config.deepgram_sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=blocksize,
+        )
+        return True
+
+    def enqueue_audio(self, data: bytes) -> None:
+        if not self.queue:
+            return
+        try:
+            self.queue.put_nowait(data)
+        except asyncio.QueueFull:
+            self.dropped_chunks += 1
+            if self.dropped_chunks == 1 or self.dropped_chunks % 50 == 0:
+                self.logger.write("native_audio.drop", dropped_chunks=self.dropped_chunks)
+
+    async def pump(self) -> None:
+        if not self.queue:
+            return
+        while not self.closed:
+            data = await self.queue.get()
+            await self.on_audio(data)
+
+    async def close(self) -> None:
+        self.closed = True
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as exc:  # noqa: BLE001 - close is best-effort.
+                self.logger.write("native_audio.close.error", error=repr(exc))
+            self.stream = None
+        if self.pump_task and not self.pump_task.done():
+            self.pump_task.cancel()
+            try:
+                await self.pump_task
+            except asyncio.CancelledError:
+                pass
+        self.logger.write("native_audio.stop", dropped_chunks=self.dropped_chunks)
+
+
+class NativeSpeakerSession:
+    def __init__(
+        self,
+        config: VoiceConfig,
+        logger: RunLogger,
+        on_issue: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        self.config = config
+        self.logger = logger
+        self.on_issue = on_issue
+        self.queue: asyncio.Queue[bytes] | None = None
+        self.stream: Any | None = None
+        self.pump_task: asyncio.Task[None] | None = None
+        self.closed = False
+        self.dropped_chunks = 0
+        self.played_chunks = 0
+        self.played_bytes = 0
+        self.started_at: float | None = None
+        self.last_summary_log = 0.0
+
+    async def start(self) -> bool:
+        try:
+            import sounddevice as sd  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001 - optional runtime dependency.
+            self.logger.write("native_tts.start.error", error=repr(exc), reason="import_failed")
+            await self.on_issue(
+                voice_bridge_issue_payload(
+                    capability="voice_audio",
+                    diagnostic_code="audio_dependency_unavailable",
+                    safe_detail="Audio playback unavailable",
+                    debug_ref=str(self.logger.run_dir),
+                )
+            )
+            return False
+
+        self.queue = asyncio.Queue(maxsize=128)
+        try:
+            self.stream = sd.RawOutputStream(
+                samplerate=self.config.deepgram_sample_rate,
+                channels=1,
+                dtype="int16",
+            )
+            self.stream.start()
+        except Exception as exc:  # noqa: BLE001 - device/permission failures become safe UI issues.
+            self.logger.write("native_tts.start.error", error=repr(exc), reason="stream_start_failed")
+            await self.on_issue(
+                voice_bridge_issue_payload(
+                    capability="voice_audio",
+                    diagnostic_code="audio_playback_unavailable",
+                    safe_detail="Audio playback unavailable",
+                    debug_ref=str(self.logger.run_dir),
+                )
+            )
+            return False
+
+        self.pump_task = asyncio.create_task(self.pump())
+        self.logger.write(
+            "native_tts.start",
+            sample_rate=self.config.deepgram_sample_rate,
+            channels=1,
+            dtype="int16",
+        )
+        return True
+
+    async def play(self, data: bytes, turn_id: int | None) -> bool:
+        if not self.queue or self.closed:
+            return False
+        try:
+            self.queue.put_nowait(data)
+            if self.started_at is None:
+                self.started_at = time.perf_counter()
+                self.last_summary_log = self.started_at
+                self.logger.write("native_tts.first_chunk", bytes=len(data), turn_id=turn_id)
+            return True
+        except asyncio.QueueFull:
+            self.dropped_chunks += 1
+            if self.dropped_chunks == 1 or self.dropped_chunks % 50 == 0:
+                self.logger.write("native_tts.drop", dropped_chunks=self.dropped_chunks, turn_id=turn_id)
+            return False
+
+    async def pump(self) -> None:
+        if not self.queue:
+            return
+        while not self.closed:
+            data = await self.queue.get()
+            try:
+                await asyncio.to_thread(self.write_output, data)
+            except Exception as exc:  # noqa: BLE001 - surface playback failures but keep transport alive.
+                self.logger.write("native_tts.write.error", error=repr(exc))
+                await self.on_issue(
+                    voice_bridge_issue_payload(
+                        capability="voice_audio",
+                        diagnostic_code="audio_playback_unavailable",
+                        safe_detail="Audio playback unavailable",
+                        debug_ref=str(self.logger.run_dir),
+                    )
+                )
+                self.closed = True
+                break
+            self.played_chunks += 1
+            self.played_bytes += len(data)
+            now = time.perf_counter()
+            if self.started_at is not None and now - self.last_summary_log >= 5:
+                self.last_summary_log = now
+                self.logger.write(
+                    "native_tts.summary",
+                    chunks=self.played_chunks,
+                    bytes=self.played_bytes,
+                    dropped_chunks=self.dropped_chunks,
+                    duration_ms=elapsed_ms(self.started_at),
+                )
+
+    def write_output(self, data: bytes) -> None:
+        if self.stream:
+            self.stream.write(data)
+
+    async def close(self) -> None:
+        self.closed = True
+        if self.pump_task and not self.pump_task.done():
+            self.pump_task.cancel()
+            try:
+                await self.pump_task
+            except asyncio.CancelledError:
+                pass
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as exc:  # noqa: BLE001 - close is best-effort.
+                self.logger.write("native_tts.close.error", error=repr(exc))
+            self.stream = None
+        self.logger.write(
+            "native_tts.stop",
+            chunks=self.played_chunks,
+            bytes=self.played_bytes,
+            dropped_chunks=self.dropped_chunks,
+        )
 
 
 def create_app(
@@ -215,12 +473,19 @@ def create_app(
     async def sidepod_socket(websocket: WebSocket) -> None:
         await websocket.accept()
         client = client_factory(config.opencode_url, 60)
-        connection = SidepodConnection(config=config, client=client, logger=logger, websocket=websocket)
+        connection = SidepodConnection(
+            config=config,
+            client=client,
+            logger=logger,
+            websocket=websocket,
+            client_factory=client_factory,
+        )
         try:
             await connection.run()
         finally:
             await connection.close()
-            await client.close()
+            # start.opencodeUrl may have rebound the client; close the live one.
+            await connection.client.close()
 
     return app
 
@@ -251,8 +516,15 @@ class VoiceConnection:
         self.sidepod_readiness_issues: tuple[dict[str, Any], ...] = ()
         self.flux: DeepgramFluxSession | None = None
         self.speaker: DeepgramSpeakSession | None = None
+        self.native_mic: NativeMicSession | None = None
+        self.native_speaker: NativeSpeakerSession | None = None
+        self.native_speaker_unavailable = False
         self.final_transcript = ""
         self.tts_first_audio_seen = False
+        self.audio_input_chunks = 0
+        self.audio_input_bytes = 0
+        self.audio_input_started: float | None = None
+        self.audio_input_last_log = 0.0
 
     async def run(self) -> None:
         readiness_issues = helper_readiness_issues(
@@ -290,10 +562,16 @@ class VoiceConnection:
 
     async def close(self) -> None:
         self.closed = True
+        if self.native_mic:
+            await self.native_mic.close()
+            self.native_mic = None
         if self.flux:
             await self.flux.close()
         if self.speaker:
             await self.speaker.close()
+        if self.native_speaker:
+            await self.native_speaker.close()
+            self.native_speaker = None
         if self.turn_task and not self.turn_task.done():
             self.turn_task.cancel()
         if self.compaction_task and not self.compaction_task.done():
@@ -411,19 +689,96 @@ class VoiceConnection:
         self.voice_lane_id = None
         await self.send_json({"type": "stopped"})
 
-    async def start_audio(self) -> None:
+    async def start_audio(self, notify_ready: bool = True) -> None:
         issue = self.config.credential_issue_for("voice_audio")
         if issue:
             await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
             return
         if self.flux:
             return
+        self.reset_audio_input_counters()
         self.flux = DeepgramFluxSession(self.config, on_event=self.handle_flux_event)
         await self.flux.start()
-        await self.send_json({"type": "audio.ready"})
+        if notify_ready:
+            await self.send_json({"type": "audio.ready"})
+
+    async def start_native_audio(self) -> bool:
+        await self.start_audio(notify_ready=False)
+        if self.closed or self.flux is None or self.native_mic:
+            return bool(self.native_mic)
+        native_mic = NativeMicSession(
+            config=self.config,
+            logger=self.logger,
+            on_audio=self.handle_native_audio,
+            on_issue=self.send_json,
+        )
+        if not await native_mic.start():
+            if self.flux:
+                await self.flux.close()
+                self.flux = None
+            return False
+        self.native_mic = native_mic
+        return True
+
+    async def stop_audio(self, reason: str) -> None:
+        if self.native_mic:
+            await self.native_mic.close()
+            self.native_mic = None
+        self.log_audio_input_summary(reason=reason)
+        if self.flux:
+            await self.flux.close()
+            self.flux = None
+
+    async def handle_native_audio(self, data: bytes) -> None:
+        await self.record_audio_input(data)
+        if self.flux:
+            await self.flux.send_audio(data)
+
+    def reset_audio_input_counters(self) -> None:
+        self.audio_input_chunks = 0
+        self.audio_input_bytes = 0
+        self.audio_input_started = None
+        self.audio_input_last_log = 0.0
+
+    async def record_audio_input(self, data: bytes) -> None:
+        now = time.perf_counter()
+        if self.audio_input_started is None:
+            self.audio_input_started = now
+            self.audio_input_last_log = now
+            self.logger.write("audio.input.first_chunk", bytes=len(data), flux_active=bool(self.flux))
+            await self.send_json({"type": "audio.input", "status": "receiving"})
+        self.audio_input_chunks += 1
+        self.audio_input_bytes += len(data)
+        if now - self.audio_input_last_log >= 5:
+            self.audio_input_last_log = now
+            self.logger.write(
+                "audio.input.summary",
+                chunks=self.audio_input_chunks,
+                bytes=self.audio_input_bytes,
+                duration_ms=elapsed_ms(self.audio_input_started),
+                flux_active=bool(self.flux),
+            )
+
+    def log_audio_input_summary(self, reason: str) -> None:
+        if not self.audio_input_chunks or self.audio_input_started is None:
+            self.logger.write("audio.input.none", reason=reason, flux_active=bool(self.flux))
+            return
+        self.logger.write(
+            "audio.input.summary",
+            reason=reason,
+            chunks=self.audio_input_chunks,
+            bytes=self.audio_input_bytes,
+            duration_ms=elapsed_ms(self.audio_input_started),
+            flux_active=bool(self.flux),
+        )
+
+    async def forward_flux_event(self, event: dict[str, Any]) -> None:
+        # The browser lane forwards raw STT events; the sidepod lane overrides
+        # this seam to translate them into protocol v0 `transcript` events.
+        await self.send_json(event)
 
     async def handle_flux_event(self, event: dict[str, Any]) -> None:
-        await self.send_json(event)
+        await self.forward_flux_event(event)
         if event["type"] == "speech.start":
             self.logger.write("speech.start")
             await self.barge_in(reason="speech_start")
@@ -917,6 +1272,33 @@ class VoiceConnection:
 
 
 class SidepodConnection(VoiceConnection):
+    """Protocol v0 lane. Every outbound message funnels through the send_json
+    override: legacy engine vocabulary is translated to v0, schema-validated,
+    and anything off-contract is kept off the wire (fail closed)."""
+
+    def __init__(
+        self,
+        config: VoiceConfig,
+        client: OpenCodeClient,
+        logger: RunLogger,
+        websocket: WebSocket,
+        client_factory: Callable[[str, float], OpenCodeClient] = OpenCodeClient,
+    ) -> None:
+        super().__init__(config=config, client=client, logger=logger, websocket=websocket)
+        self.client_factory = client_factory
+        self.lane_event_types = frozenset(sidepod_schema_document()["events"])
+        self.mic_watchdog_task: asyncio.Task[None] | None = None
+        self.lane_turn_counter = 0
+        self.pending_turn_id: str | None = None
+        self.transcript_seq = 0
+        self.speech_started_at: float | None = None
+        self.pending_latency: dict[str, Any] = {}
+        self.legacy_turn_ids: dict[int, str] = {}
+        self.turn_started_at: dict[int, float] = {}
+        self.turn_latency: dict[int, dict[str, Any]] = {}
+        self.turn_stream_source: dict[int, str] = {}
+        self.assistant_seq: dict[int, int] = {}
+
     async def run(self) -> None:
         readiness_issues = helper_readiness_issues(
             transport_ready=True,
@@ -949,20 +1331,41 @@ class SidepodConnection(VoiceConnection):
                     safe_detail="Invalid sidepod message",
                 )
                 continue
-            if not isinstance(payload, dict):
-                await self.send_protocol_issue(
-                    diagnostic_code="protocol_invalid_message",
-                    safe_detail="Invalid sidepod message",
-                )
-                continue
             await self.handle_control(payload)
 
-    async def handle_control(self, payload: dict[str, Any]) -> None:
-        kind = str(payload.get("type") or "")
+    async def handle_control(self, payload: Any) -> None:
+        # Lane negotiation outranks shape validation: a start for a version we
+        # do not speak must answer protocol_version_unsupported, not invalid.
+        if isinstance(payload, dict) and payload.get("type") == "start":
+            version = payload.get("protocolVersion")
+            if isinstance(version, str) and version != SIDEPOD_PROTOCOL_VERSION:
+                await self.send_protocol_issue(
+                    diagnostic_code="protocol_version_unsupported",
+                    safe_detail="Sidepod protocol unsupported",
+                    retryable=False,
+                )
+                return
+        check = check_sidepod_command(payload)
+        if check.unknown_type:
+            # Compatibility rule: unknown message types are logged and ignored.
+            self.logger.write("sidepod.command.unknown", message_type=payload.get("type"))
+            return
+        if not check.ok:
+            self.logger.write(
+                "sidepod.command.invalid",
+                message_type=payload.get("type") if isinstance(payload, dict) else None,
+                errors=list(check.errors),
+            )
+            await self.send_protocol_issue(
+                diagnostic_code="protocol_invalid_message",
+                safe_detail="Invalid sidepod command",
+            )
+            return
+        kind = payload["type"]
         if kind == "start":
             await self.handle_start(payload)
         elif kind == "stop":
-            await self.stop()
+            await self.handle_stop(payload)
         elif kind == "refresh":
             await self.handle_refresh(payload)
         elif kind == "ptt.start":
@@ -970,10 +1373,7 @@ class SidepodConnection(VoiceConnection):
         elif kind == "ptt.stop":
             await self.handle_ptt_stop(payload)
         elif kind == "live.set":
-            await self.send_protocol_issue(
-                diagnostic_code="native_audio_capture_unavailable",
-                safe_detail="Audio capture unavailable",
-            )
+            await self.handle_live_set(payload)
         elif kind == "barge_in":
             await self.barge_in(reason=str(payload.get("reason") or "sidepod"))
         elif kind == "confirm.response":
@@ -983,11 +1383,6 @@ class SidepodConnection(VoiceConnection):
                 action_id=payload.get("actionId"),
                 confirmed=bool(payload.get("confirmed")),
                 voice_lane_id=self.voice_lane_id,
-            )
-        else:
-            await self.send_protocol_issue(
-                diagnostic_code="protocol_invalid_message",
-                safe_detail="Unsupported sidepod command",
             )
 
     async def handle_start(self, payload: dict[str, Any]) -> None:
@@ -1011,6 +1406,12 @@ class SidepodConnection(VoiceConnection):
             for issue in self.sidepod_readiness_issues:
                 await self.send_json(issue)
             return
+
+        opencode_url = str(payload.get("opencodeUrl") or "").strip().rstrip("/")
+        if opencode_url and opencode_url != getattr(self.client, "base_url", None):
+            await self.client.close()
+            self.client = self.client_factory(opencode_url, 60)
+            self.logger.write("sidepod.opencode.rebind", opencode_url=opencode_url)
 
         if self.fork_session_id:
             await self.stop()
@@ -1037,6 +1438,7 @@ class SidepodConnection(VoiceConnection):
                 "forkSessionId": fork["fork_session_id"],
             }
         )
+        await self.maybe_start_compaction(reason="session_start", run_in_background=True)
 
     async def handle_refresh(self, payload: dict[str, Any]) -> None:
         source_session_id = str(payload.get("sourceSessionId") or self.source_session_id or "")
@@ -1054,6 +1456,57 @@ class SidepodConnection(VoiceConnection):
                 "sourceSessionId": source_session_id,
                 "keepFork": self.keep_fork,
             }
+        )
+
+    async def handle_live_set(self, payload: dict[str, Any]) -> None:
+        if not self.fork_session_id or not self.voice_lane_id:
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_not_started",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+        if bool(payload.get("value")):
+            if await self.start_native_audio():
+                self.start_mic_watchdog()
+                await self.send_json(
+                    {
+                        "type": "listening",
+                        "sentAt": iso_utc_now(),
+                        "voiceLaneId": self.voice_lane_id,
+                        "mode": "live",
+                    }
+                )
+        else:
+            self.cancel_mic_watchdog()
+            await self.stop_audio(reason=str(payload.get("reason") or "live.set.false"))
+
+    def start_mic_watchdog(self) -> None:
+        self.cancel_mic_watchdog()
+        self.mic_watchdog_task = asyncio.create_task(self.mic_watchdog())
+
+    def cancel_mic_watchdog(self) -> None:
+        if self.mic_watchdog_task and not self.mic_watchdog_task.done():
+            self.mic_watchdog_task.cancel()
+        self.mic_watchdog_task = None
+
+    async def mic_watchdog(self) -> None:
+        try:
+            await asyncio.sleep(MIC_WATCHDOG_SEC)
+        except asyncio.CancelledError:
+            return
+        if not self.native_mic or self.audio_input_chunks:
+            return
+        self.logger.write("native_audio.silent", window_sec=MIC_WATCHDOG_SEC)
+        await self.stop_audio(reason="mic_watchdog_silent")
+        await self.send_json(
+            voice_bridge_issue_payload(
+                capability="voice_audio",
+                diagnostic_code="mic_permission_needed",
+                safe_detail="Mic permission needed",
+                retryable=True,
+                debug_ref=str(self.logger.run_dir),
+                voice_lane_id=self.voice_lane_id,
+            )
         )
 
     async def handle_ptt_start(self, payload: dict[str, Any]) -> None:
@@ -1076,7 +1529,34 @@ class SidepodConnection(VoiceConnection):
             await self.barge_in(reason=str(payload.get("reason") or "ptt.stop"))
             self.protocol_turn_id = ""
 
+    async def handle_stop(self, payload: dict[str, Any]) -> None:
+        reason = str(payload.get("reason") or "user.end_session")
+        lane_id = self.voice_lane_id
+        fork_deleted = bool(self.fork_session_id and not self.keep_fork)
+        await self.stop()
+        stopped: dict[str, Any] = {
+            "type": "stopped",
+            "sentAt": iso_utc_now(),
+            "reason": reason,
+            "forkDeleted": fork_deleted,
+        }
+        if lane_id:
+            stopped["voiceLaneId"] = lane_id
+        await self.send_json(stopped)
+
     async def stop(self) -> None:
+        self.cancel_mic_watchdog()
+        await self.stop_audio(reason="sidepod_stop")
+        if self.turn_task and not self.turn_task.done():
+            self.turn_task.cancel()
+        self.active_turn_id = None
+        if self.speaker:
+            await self.speaker.close()
+            self.speaker = None
+        if self.native_speaker:
+            await self.native_speaker.close()
+            self.native_speaker = None
+            self.native_speaker_unavailable = False
         if self.fork_session_id and not self.keep_fork:
             fork_id = self.fork_session_id
             await self.client.delete_session(fork_id)
@@ -1084,15 +1564,49 @@ class SidepodConnection(VoiceConnection):
         self.fork_session_id = None
         self.voice_lane_id = None
         self.protocol_turn_id = ""
+        self.pending_turn_id = None
+
+    async def close(self) -> None:
+        self.cancel_mic_watchdog()
+        await super().close()
+
+    async def send_tts_audio(self, data: bytes, turn_id: int | None) -> None:
+        if not self.tts_first_audio_seen:
+            self.tts_first_audio_seen = True
+            await self.send_json({"type": "tts.first_audio", "turn_id": turn_id})
+            self.logger.write("tts.first_audio", turn_id=turn_id)
+        if self.native_speaker_unavailable:
+            return
+        if self.native_speaker is None:
+            speaker = NativeSpeakerSession(
+                config=self.config,
+                logger=self.logger,
+                on_issue=self.send_json,
+            )
+            if not await speaker.start():
+                self.native_speaker_unavailable = True
+                return
+            self.native_speaker = speaker
+        if not await self.native_speaker.play(data, turn_id):
+            self.logger.write("native_tts.play.unavailable", turn_id=turn_id, bytes=len(data))
 
     async def barge_in(self, reason: str) -> None:
         turn_id = getattr(self, "protocol_turn_id", "") or None
+        # `interrupted` means something was actually cut off; a speech.start
+        # with no active turn or speech is just the user starting to talk.
+        interrupted_something = self.active_turn_id is not None or bool(self.speaker or self.native_speaker)
         if self.active_turn_id is not None:
             self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
         self.active_turn_id = None
         if self.speaker:
             await self.speaker.close()
             self.speaker = None
+        if self.native_speaker:
+            await self.native_speaker.close()
+            self.native_speaker = None
+            self.native_speaker_unavailable = False
+        if not interrupted_something:
+            return
         if self.fork_session_id:
             try:
                 await self.client.abort(self.fork_session_id)
@@ -1104,6 +1618,192 @@ class SidepodConnection(VoiceConnection):
         if turn_id:
             payload["turnId"] = turn_id
         await self.send_json(payload)
+
+    async def forward_flux_event(self, event: dict[str, Any]) -> None:
+        etype = str(event.get("type") or "")
+        if etype == "speech.start":
+            self.speech_started_at = time.perf_counter()
+            return
+        if etype == "speech.transcript":
+            text = str(event.get("transcript") or "")
+            if text.strip():
+                await self.send_lane_transcript(text, final=False, confidence=event.get("confidence"))
+            return
+        if etype == "speech.end":
+            text = str(event.get("transcript") or self.final_transcript or "").strip()
+            if text:
+                await self.send_lane_transcript(text, final=True, confidence=event.get("confidence"))
+            return
+        # Other raw STT events (speech.resumed, socket notices) stay off the lane.
+
+    async def send_lane_transcript(self, text: str, final: bool, confidence: Any = None) -> None:
+        turn_id = self.ensure_pending_turn()
+        if "firstTranscriptMs" not in self.pending_latency and self.speech_started_at is not None:
+            self.pending_latency["firstTranscriptMs"] = elapsed_ms(self.speech_started_at)
+        self.transcript_seq += 1
+        payload: dict[str, Any] = {
+            "type": "transcript",
+            "sentAt": iso_utc_now(),
+            "turnId": turn_id,
+            "sequence": self.transcript_seq,
+            "text": text,
+            "final": final,
+        }
+        if isinstance(confidence, (int, float)):
+            payload["confidence"] = float(confidence)
+        await self.send_json(payload)
+
+    def ensure_pending_turn(self) -> str:
+        if not self.pending_turn_id:
+            self.lane_turn_counter += 1
+            self.pending_turn_id = f"turn_{self.lane_turn_counter:04d}"
+            self.transcript_seq = 0
+            self.pending_latency = {}
+        return self.pending_turn_id
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        outbound = self.translate_to_v0(payload)
+        if outbound is None:
+            self.logger.write("sidepod.lane.internal", message_type=payload.get("type"))
+            return
+        check = check_sidepod_event(outbound)
+        if not check.ok:
+            self.logger.write(
+                "sidepod.lane.violation",
+                message_type=str(outbound.get("type")),
+                errors=list(check.errors),
+            )
+            return
+        await super().send_json(outbound)
+
+    def translate_to_v0(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        message_type = str(payload.get("type") or "")
+        if message_type in self.lane_event_types and "sentAt" in payload:
+            return payload
+        if message_type == "turn.start":
+            return self.translate_turn_start(payload)
+        if message_type == "assistant.delta":
+            return self.translate_assistant_delta(payload)
+        if message_type == "assistant.first_text":
+            legacy_id = int(payload.get("turn_id") or 0)
+            latency_ms = payload.get("latency_ms")
+            if isinstance(latency_ms, (int, float)):
+                self.turn_latency.setdefault(legacy_id, {})["firstAssistantTextMs"] = latency_ms
+            return None
+        if message_type == "tts.first_audio":
+            return self.translate_tts_first_audio(payload)
+        if message_type == "turn.complete":
+            return self.translate_turn_complete(payload)
+        if message_type in ("turn.error", "turn.timeout"):
+            return self.translate_turn_failure(payload)
+        if message_type == "opencode.stream.fallback":
+            legacy_id = int(payload.get("turn_id") or 0)
+            self.turn_stream_source[legacy_id] = "poll_after_event" if payload.get("prompt_sent") else "poll"
+            return None
+        if message_type == "error":
+            return voice_bridge_issue_payload(
+                capability="sidepod_transport",
+                diagnostic_code="engine_error",
+                safe_detail="Voice engine error",
+                debug_ref=str(self.logger.run_dir),
+                voice_lane_id=self.voice_lane_id,
+            )
+        return None
+
+    def lane_turn_id(self, legacy_id: int) -> str:
+        return self.legacy_turn_ids.get(legacy_id) or f"turn_legacy_{legacy_id}"
+
+    def translate_turn_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        lane_id = self.ensure_pending_turn()
+        self.legacy_turn_ids[legacy_id] = lane_id
+        self.pending_turn_id = None
+        self.protocol_turn_id = lane_id
+        self.turn_started_at[legacy_id] = time.perf_counter()
+        self.turn_latency[legacy_id] = dict(self.pending_latency)
+        self.pending_latency = {}
+        self.assistant_seq[legacy_id] = 0
+        self.turn_stream_source[legacy_id] = "event"
+        out: dict[str, Any] = {
+            "type": "thinking",
+            "sentAt": iso_utc_now(),
+            "turnId": lane_id,
+            "sourceMode": "live",
+            "submittedTextChars": len(str(payload.get("text") or "")),
+        }
+        if self.voice_lane_id:
+            out["voiceLaneId"] = self.voice_lane_id
+        return out
+
+    def translate_assistant_delta(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        self.assistant_seq[legacy_id] = self.assistant_seq.get(legacy_id, 0) + 1
+        return {
+            "type": "assistant.delta",
+            "sentAt": iso_utc_now(),
+            "turnId": self.lane_turn_id(legacy_id),
+            "sequence": self.assistant_seq[legacy_id],
+            "delta": str(payload.get("delta") or ""),
+        }
+
+    def translate_tts_first_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        started = self.turn_started_at.get(legacy_id)
+        out: dict[str, Any] = {
+            "type": "speaking",
+            "sentAt": iso_utc_now(),
+            "turnId": self.lane_turn_id(legacy_id),
+        }
+        if self.voice_lane_id:
+            out["voiceLaneId"] = self.voice_lane_id
+        if started is not None:
+            first_audio_ms = elapsed_ms(started)
+            self.turn_latency.setdefault(legacy_id, {})["firstAudioMs"] = first_audio_ms
+            out["firstAudioLatencyMs"] = first_audio_ms
+        return out
+
+    def translate_turn_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        lane_id = self.lane_turn_id(legacy_id)
+        latency = {
+            key: value
+            for key, value in self.turn_latency.get(legacy_id, {}).items()
+            if isinstance(value, (int, float))
+        }
+        total_ms = payload.get("latency_ms")
+        if isinstance(total_ms, (int, float)):
+            latency["totalMs"] = total_ms
+        stream_source = self.turn_stream_source.get(legacy_id, "event")
+        self.cleanup_turn_state(legacy_id)
+        self.logger.write("sidepod.turn.latency", turn_id=lane_id, stream_source=stream_source, **latency)
+        return {
+            "type": "complete",
+            "sentAt": iso_utc_now(),
+            "turnId": lane_id,
+            "latency": latency,
+            "streamSource": stream_source,
+        }
+
+    def translate_turn_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        timed_out = payload.get("type") == "turn.timeout"
+        if timed_out:
+            # A timed-out turn gets no turn.complete, so drop its seam state here.
+            self.cleanup_turn_state(legacy_id)
+        return voice_bridge_issue_payload(
+            capability="voice_turns",
+            diagnostic_code="turn_timeout" if timed_out else "turn_failed",
+            safe_detail="Voice turn timed out" if timed_out else "Voice turn failed",
+            debug_ref=str(self.logger.run_dir),
+            voice_lane_id=self.voice_lane_id,
+        )
+
+    def cleanup_turn_state(self, legacy_id: int) -> None:
+        self.turn_started_at.pop(legacy_id, None)
+        self.turn_latency.pop(legacy_id, None)
+        self.turn_stream_source.pop(legacy_id, None)
+        self.assistant_seq.pop(legacy_id, None)
+        self.legacy_turn_ids.pop(legacy_id, None)
 
     async def send_protocol_issue(
         self,

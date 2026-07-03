@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,11 @@ from typing import Any
 from opencode_voice.config import redact_secrets
 
 CONTENT_SUMMARY_FIELDS = {"audio", "delta", "prompt", "raw", "text", "transcript"}
+EVENT_LOG_ENV = "MORTIC_HELPER_EVENT_LOG"
+
+
+def helper_event_log_path() -> str | None:
+    return os.environ.get(EVENT_LOG_ENV)
 
 
 def utc_timestamp() -> str:
@@ -52,8 +58,16 @@ class RunLogger:
             "event": event,
             **fields,
         }
+        line = json.dumps(redact_secrets(safe_log_fields(record)), ensure_ascii=False, default=str) + "\n"
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(redact_secrets(safe_log_fields(record)), ensure_ascii=False, default=str) + "\n")
+            handle.write(line)
+        mirror_path = helper_event_log_path()
+        if mirror_path:
+            try:
+                with Path(mirror_path).open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            except OSError:
+                pass
 
     def state_transition(self, from_state: str, to_state: str, **fields: Any) -> None:
         self.write("state.transition", from_state=from_state, to_state=to_state, **fields)
