@@ -30,6 +30,15 @@ def main(argv: list[str] | None = None) -> int:
     detected_url = detect_opencode_url()
     if not args.managed_opencode:
         opencode_url = args.opencode_url or os.environ.get("OPENCODE_VOICE_OPENCODE_URL") or detected_url
+    if not opencode_url and args.no_managed:
+        # Plugin-spawned helpers must never start a shadow OpenCode server;
+        # exiting here surfaces as VOICE OFFLINE in the sidepod instead of a
+        # silently leaked `opencode serve` bound to the wrong sessions.
+        print(
+            "mortic-helper: no OpenCode server URL provided or detected and --no-managed is set.",
+            file=sys.stderr,
+        )
+        return 2
     if not opencode_url:
         opencode_dir = args.opencode_dir or (detect_opencode_directory(detected_url) if detected_url else None)
         opencode_url, opencode_process = start_managed_opencode(
@@ -81,6 +90,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Mortic local helper for OpenCode voice sessions.")
     parser.add_argument("--opencode-url", help="Existing OpenCode server URL. Auto-detected when omitted.")
     parser.add_argument("--managed-opencode", action="store_true", help="Start a clean managed OpenCode server.")
+    parser.add_argument(
+        "--no-managed",
+        action="store_true",
+        help="Exit instead of starting a managed OpenCode server when none is provided or detected.",
+    )
     parser.add_argument("--opencode-dir", help="Working directory for a managed OpenCode server.")
     parser.add_argument("--host", default="127.0.0.1", help="Voice bridge host.")
     parser.add_argument("--port", type=int, default=8765, help="Voice bridge port.")

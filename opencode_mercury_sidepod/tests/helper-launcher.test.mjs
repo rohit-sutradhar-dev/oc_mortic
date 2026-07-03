@@ -4,11 +4,14 @@ import { test } from "node:test";
 
 import {
   buildHelperEnv,
+  helperCwd,
   helperUrl,
   helperWsUrl,
   isReadyPayload,
-  resolveHelperCommand
+  resolveHelperCommand,
+  tokenizeCommand
 } from "../src/helper-launcher.mjs";
+import { opencodeServerUrl } from "../src/host-context.mjs";
 
 test("readiness is ready:true and nothing else gates it", () => {
   // MOR-167 contract: externally started helpers are first-class, so the
@@ -19,6 +22,24 @@ test("readiness is ready:true and nothing else gates it", () => {
   assert.equal(isReadyPayload({ ready: false }), false);
   assert.equal(isReadyPayload({ ok: true }), false);
   assert.equal(isReadyPayload(undefined), false);
+});
+
+test("command override survives paths with spaces", () => {
+  // Found live: this repo's path contains spaces, and a naive whitespace
+  // split turned the override into a nonexistent command (silent ENOENT).
+  assert.deepEqual(
+    tokenizeCommand('"/Users/dev/My Repo/.venv/bin/mortic-helper" --flag'),
+    ["/Users/dev/My Repo/.venv/bin/mortic-helper", "--flag"]
+  );
+  assert.deepEqual(tokenizeCommand("uv run mortic-helper"), ["uv", "run", "mortic-helper"]);
+  assert.deepEqual(tokenizeCommand("'/tmp/spaced dir/bin' -x"), ["/tmp/spaced dir/bin", "-x"]);
+
+  const override = resolveHelperCommand({
+    env: { MORTIC_HELPER_CMD: '"/Users/dev/My Repo/.venv/bin/mortic-helper"' },
+    repoRoot: "/repo",
+    exists: () => false
+  });
+  assert.equal(override.command, "/Users/dev/My Repo/.venv/bin/mortic-helper");
 });
 
 test("launch resolution honors override, dev install, repo checkout, then uvx", () => {
@@ -62,6 +83,32 @@ test("the spawned helper is pinned to the focused thread's OpenCode server", () 
 
   const bare = buildHelperEnv({ env: { PATH: "/usr/bin" } });
   assert.equal("OPENCODE_VOICE_OPENCODE_URL" in bare, false);
+});
+
+test("repo-checkout launches run from the repo root so BYOK .env loads", () => {
+  assert.equal(helperCwd("venv", "/repo"), "/repo");
+  assert.equal(helperCwd("uv-project", "/repo"), "/repo");
+  assert.equal(helperCwd("uvx", "/repo"), undefined);
+  assert.equal(helperCwd("env", "/repo"), undefined);
+});
+
+test("the recorded server url bridges entries via process env", () => {
+  // The hook and TUI entries load as separate module graphs (verified live),
+  // so module-level state cannot carry serverUrl between them; process env
+  // can, and it also flows to the spawned helper automatically. An explicit
+  // user override always wins.
+  assert.equal(
+    opencodeServerUrl({ MORTIC_OPENCODE_SERVER_URL: "http://127.0.0.1:5000" }),
+    "http://127.0.0.1:5000"
+  );
+  assert.equal(
+    opencodeServerUrl({
+      OPENCODE_VOICE_OPENCODE_URL: "http://user-override:1",
+      MORTIC_OPENCODE_SERVER_URL: "http://127.0.0.1:5000"
+    }),
+    "http://user-override:1"
+  );
+  assert.equal(opencodeServerUrl({}), undefined);
 });
 
 test("helper URLs derive from one base with env overrides", () => {

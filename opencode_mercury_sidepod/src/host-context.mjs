@@ -1,16 +1,17 @@
-// Shared state between the plugin's hook entry (src/index.js, which receives
-// PluginInput including serverUrl) and the TUI entry (src/tui.js, which does
-// not). Both entries load in the same process, so a module-level slot is the
-// simplest bridge. Stays undefined when the host never calls the hook entry
-// with input; callers fall back to env or helper self-discovery.
-const context = { serverUrl: undefined };
+// Bridges the plugin's hook entry (src/index.js, which receives PluginInput
+// including serverUrl) to the TUI entry (src/tui.js, which does not). The two
+// entries can be loaded as separate module graphs (verified live: module
+// state did NOT cross), so the value is carried on process env — process
+// state is global to the plugin host and inherited by the spawned helper.
+// A user-set OPENCODE_VOICE_OPENCODE_URL always wins as an explicit override.
+const RECORDED_ENV = "MORTIC_OPENCODE_SERVER_URL";
 
 export function recordServerUrl(url) {
-  if (url) {
-    context.serverUrl = String(url).replace(/\/$/, "");
+  if (url && globalThis.process?.env) {
+    globalThis.process.env[RECORDED_ENV] = String(url).replace(/\/$/, "");
   }
 }
 
-export function opencodeServerUrl() {
-  return context.serverUrl;
+export function opencodeServerUrl(env = globalThis.process?.env ?? {}) {
+  return env.OPENCODE_VOICE_OPENCODE_URL ?? env[RECORDED_ENV];
 }

@@ -790,7 +790,7 @@ export async function tui(api) {
         sourceSessionId: String(sessionId),
         keepFork: false
       };
-      const opencodeUrl = opencodeServerUrl() ?? globalThis.process?.env?.OPENCODE_VOICE_OPENCODE_URL;
+      const opencodeUrl = opencodeServerUrl();
       if (opencodeUrl) {
         start.opencodeUrl = String(opencodeUrl);
       }

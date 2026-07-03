@@ -39,13 +39,19 @@ export function isReadyPayload(payload) {
   return Boolean(payload && payload.ready === true);
 }
 
+/** Quote-aware split so commands with spaces in their paths survive. */
+export function tokenizeCommand(value) {
+  const tokens = String(value).match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  return tokens.map((token) => token.replace(/^(["'])(.*)\1$/, "$2"));
+}
+
 export function resolveHelperCommand({
   env = globalThis.process?.env ?? {},
   repoRoot = REPO_ROOT,
   exists = existsSync,
 } = {}) {
   if (env.MORTIC_HELPER_CMD) {
-    const [command, ...args] = env.MORTIC_HELPER_CMD.split(/\s+/).filter(Boolean);
+    const [command, ...args] = tokenizeCommand(env.MORTIC_HELPER_CMD);
     return { command, args, source: "env" };
   }
   const venvBinary = join(repoRoot, ".venv", "bin", "mortic-helper");
@@ -65,6 +71,16 @@ export function buildHelperEnv({ env = globalThis.process?.env ?? {}, opencodeUr
     child.OPENCODE_VOICE_OPENCODE_URL = String(opencodeUrl);
   }
   return child;
+}
+
+/**
+ * Working directory for the spawned helper. Repo-checkout launches run from
+ * the repo root so BYOK `.env` loading and `runs/` land where the dev
+ * workflow expects them (found live: spawning with the TUI's cwd left the
+ * helper with no credentials and ready:false).
+ */
+export function helperCwd(source, repoRoot = REPO_ROOT) {
+  return source === "venv" || source === "uv-project" ? repoRoot : undefined;
 }
 
 async function healthy(url, fetchImpl = globalThis.fetch) {
@@ -103,8 +119,13 @@ export async function ensureHelper({ opencodeUrl, log = () => {} } = {}) {
       const sink = openSync(logPath, "a");
       spawnedProcess = spawn(
         resolved.command,
-        [...resolved.args, "--host", "127.0.0.1", "--port", port],
+        // --no-managed: a plugin-spawned helper must never start a shadow
+        // OpenCode server; with no reachable server it exits and the lane
+        // reports VOICE OFFLINE instead (found live: a detection miss
+        // silently spawned and leaked a managed `opencode serve`).
+        [...resolved.args, "--host", "127.0.0.1", "--port", port, "--no-managed"],
         {
+          cwd: helperCwd(resolved.source),
           env: buildHelperEnv({ opencodeUrl }),
           stdio: ["ignore", sink, sink],
           detached: false,
