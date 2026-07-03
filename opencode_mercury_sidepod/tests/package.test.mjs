@@ -91,7 +91,7 @@ test("popups are centered host dialogs and Esc is never destructive", () => {
   assert.match(src, /key:\s*"escape",\s*cmd:\s*"mortic\.escape"/);
   assert.match(src, /recordSmoke\("exit\.confirm\.open"/);
   assert.match(src, /recordSmoke\("exit\.confirmed"\)/);
-  assert.match(src, /recordSmoke\("popup\.copy"/);
+  assert.match(src, /recordSmoke\("modal\.copy"/);
   assert.match(src, /recordSmoke\("modal\.open"/);
   assert.match(src, /recordSmoke\("modal\.close"/);
 });

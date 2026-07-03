@@ -1,6 +1,6 @@
 import { appendFileSync } from "node:fs";
 import { createElement, insert, setProp } from "@opentui/solid";
-import { createSignal } from "solid-js";
+import { createMemo, createSignal } from "solid-js";
 
 const WIDTH = 36;
 const INNER = WIDTH - 2;
@@ -56,11 +56,6 @@ function center(value, width = INNER) {
   }
   const left = Math.floor((width - clean.length) / 2);
   return `${" ".repeat(left)}${clean}${" ".repeat(width - clean.length - left)}`;
-}
-
-function row(left, right, width = INNER) {
-  const gap = Math.max(1, width - left.length - right.length);
-  return `${left}${" ".repeat(gap)}${right}`.slice(0, width);
 }
 
 function wrap(value, width = INNER) {
@@ -172,8 +167,8 @@ function radiates(x, y, phase, dist, radius, cx, cy) {
   return ring || ray;
 }
 
-function commandRow(key, label, state, color, onMouseDown) {
-  return clickable(`║ ${fit(key, 6)} ${fit(label, 15)} ${fit(state, 9)} ║`, color, onMouseDown);
+function commandRow(key, label, status, color, onMouseDown) {
+  return clickable(`║ ${fit(key, 6)} ${fit(label, 15)} ${fit(status, 9)} ║`, color, onMouseDown);
 }
 
 // One state bit is the entire voice control surface: mic muted or mic live.
@@ -255,16 +250,16 @@ function renderConversation(state, theme) {
   ];
 }
 
-function transcriptText(state) {
-  return state.transcript.map((item) => `${item.role}: ${item.text}`).join("\n");
+function transcriptText(transcript) {
+  return transcript.map((item) => `${item.role}: ${item.text}`).join("\n");
 }
 
-function handoffText(state) {
+function handoffText(userText, assistantText) {
   return [
     "Mortic handoff draft",
     "",
-    `User intent: ${state.userText}`,
-    `Assistant result: ${state.assistantText}`,
+    `User intent: ${userText}`,
+    `Assistant result: ${assistantText}`,
     "",
     "Keep code, commands, paths, diffs, and JSON screen-only."
   ].join("\n");
@@ -329,7 +324,7 @@ function createProtocolSender(recordSmoke) {
       socket.send(serialized);
       return;
     }
-    // Never replay a long backlog of stale PTT events when the helper
+    // Never replay a long backlog of stale queued events when the helper
     // reconnects: keep only a short queue and drop the oldest beyond it.
     queue.push(serialized);
     if (queue.length > 16) {
@@ -380,7 +375,6 @@ export async function tui(api) {
     const [getModal, setModal] = createSignal(null);
     const [getModalScroll, setModalScroll] = createSignal(0);
     const [getPhase, setPhase] = createSignal(0);
-    const [getEvent, setEvent] = createSignal("ready");
     const [getUserText, setUserText] = createSignal("Press M to unmute. Spoken asks will appear here.");
     const [getAssistantText, setAssistantText] = createSignal("Mortic replies with short speakable text. Details stay screen-only.");
     const [getTranscript, setTranscript] = createSignal([
@@ -450,7 +444,6 @@ export async function tui(api) {
         }
         setFocused(true);
         recordSmoke("focus");
-        setEvent("focus mode");
       });
     };
     const recordSmoke = (event, details = {}) => {
@@ -477,7 +470,7 @@ export async function tui(api) {
         return all.slice(top, top + MODAL_PAGE);
       }
       if (kind === "handoff") {
-        return handoffText({ userText: getUserText(), assistantText: getAssistantText() })
+        return handoffText(getUserText(), getAssistantText())
           .split("\n")
           .flatMap((item) => (item ? wrap(item, MODAL_INNER) : [""]));
       }
@@ -518,10 +511,8 @@ export async function tui(api) {
         setModalScroll(0);
         if (kind === "exit") {
           recordSmoke("exit.confirm.open");
-          setEvent("confirm exit");
         } else {
           recordSmoke("modal.open", { modal: kind });
-          setEvent(kind);
         }
         api.ui.dialog.replace(renderModalContent, onHostClose);
       });
@@ -546,10 +537,10 @@ export async function tui(api) {
       });
     const modalCopyText = () => {
       if (getModal() === "transcript") {
-        return transcriptText({ transcript: getTranscript() });
+        return transcriptText(getTranscript());
       }
       if (getModal() === "handoff") {
-        return handoffText({ userText: getUserText(), assistantText: getAssistantText() });
+        return handoffText(getUserText(), getAssistantText());
       }
       return "";
     };
@@ -559,11 +550,10 @@ export async function tui(api) {
         if (!value) {
           return;
         }
-        recordSmoke("popup.copy", { popup: getModal() });
+        recordSmoke("modal.copy", { modal: getModal() });
         // OSC 52 works in any terminal, including over SSH.
         const ok = api.renderer.copyToClipboardOSC52?.(value);
         api.ui.toast({ variant: ok ? "success" : "error", message: ok ? "Copied" : "Copy unavailable" });
-        setEvent(ok ? "copied" : "copy unavailable");
       });
     const endSession = () =>
       mutate(() => {
@@ -571,7 +561,6 @@ export async function tui(api) {
         setModal(null);
         api.ui.dialog.clear();
         setMicLive(false);
-        setEvent("session ended");
         setUserText("Mortic session ended.");
         setAssistantText("Start Mortic again for a fresh voice lane.");
         setTranscript([]);
@@ -599,7 +588,6 @@ export async function tui(api) {
       }
       mutate(() => {
         setMicLive(false);
-        setEvent("cleared");
         setUserText("Voice lane cleared.");
         setAssistantText("Ready for the next spoken turn.");
         setTranscript([{ role: "system", text: "Voice lane cleared." }]);
@@ -638,7 +626,6 @@ export async function tui(api) {
         const next = !getMicLive();
         setMicLive(next);
         sendProtocol({ ...protocolBase("live.set"), value: next, reason: "user.toggle" });
-        setEvent(next ? "mic live" : "mic muted");
         setUserText(next ? "Mic is live. Speak normally." : "Mic is muted. Tap M to talk.");
         appendTranscript("user", next ? "Mic unmuted." : "Mic muted.");
         recordSmoke("mic.state", { live: next, via: next ? "m-unmute" : "m-mute" });
@@ -748,22 +735,30 @@ export async function tui(api) {
     });
     api.lifecycle.onDispose(() => exitMorticMode?.());
 
-    const buildState = () => ({
-      micLive: getMicLive(),
-      focused: getFocused(),
-      phase: getPhase(),
-      event: getEvent(),
-      userText: getUserText(),
-      assistantText: getAssistantText(),
-      transcript: getTranscript(),
-      handoffReady: getTranscript().length > 1
+    // Memoized so sidebar_content and session_prompt_right (both re-rendered
+    // by the host on every requestRender) share one computed state instead of
+    // rebuilding it twice. The annex gets its own narrower memo so an
+    // animation-only tick (phase) doesn't invalidate it — its output only
+    // ever depends on focus/mic state.
+    const getSidebarState = createMemo(() => {
+      const transcript = getTranscript();
+      return {
+        micLive: getMicLive(),
+        focused: getFocused(),
+        phase: getPhase(),
+        userText: getUserText(),
+        assistantText: getAssistantText(),
+        transcript,
+        handoffReady: transcript.length > 1
+      };
     });
+    const getAnnexState = createMemo(() => ({ focused: getFocused(), micLive: getMicLive() }));
 
     api.slots.register({
       order: 760,
       slots: {
-        sidebar_content: () => renderPod(buildState(), actions, api.theme.current),
-        session_prompt_right: () => renderPromptAnnex(buildState(), api.theme.current)
+        sidebar_content: () => renderPod(getSidebarState(), actions, api.theme.current),
+        session_prompt_right: () => renderPromptAnnex(getAnnexState(), api.theme.current)
       }
     });
 }
