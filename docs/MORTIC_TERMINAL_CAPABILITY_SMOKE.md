@@ -58,17 +58,21 @@ Two consequences fixed in the PTT handler:
 1. **Repeat-as-press hazard**: the earlier "second press stops PTT" escape hatch would treat each key-repeat press as a deliberate stop, toggling PTT rapidly during a hold. 
 2. **Timing skew**: input processing can lag the keyboard under render load (observed >1.3s between arm and first repeat in a loaded session), so a narrow timing debounce is unreliable.
 
-Final adaptive model (`sawKeyRelease` in `src/tui.js`):
+An adaptive hold-with-tap-fallback model was built and machine-verified, then **rolled back by product decision (2026-07-03)**: terminal key-release reporting is too inconsistent to build the primary interaction on, and the Kitty flag escalation added more moving parts than hold-to-talk was worth for v1.
 
-- Once a session observes **any** real key-release event, the terminal is proven to honor event types → true hold semantics: presses while armed are always repeat; release stops.
-- Until then → tap semantics: press arms, press after the repeat window (1500 ms) stops, presses inside the window are repeat.
+**Final v1 model: tap-to-talk / tap-to-stop, uniformly, in every terminal.**
 
-Machine-verified state sequences (PTY, `MORTIC_SMOKE_LOG` sink):
+- `M` press arms PTT; the next deliberate `M` press stops it.
+- Key releases are ignored entirely (some terminals send them, most don't; the toggle behaves the same either way).
+- Key repeat is absorbed by a timing window (1500 ms — wide because input processing can lag the keyboard by >1.3 s under render load), so holding `M` down arms once and stays armed without flicker.
+- No Kitty keyboard flag changes; the host's negotiated terminal state is left untouched.
 
-- Kitty-style terminal: `press-arm → repeat-ignored×5 → release-stop → press-arm → release-stop`
-- iTerm2-style terminal (no releases ever): `press-arm → repeat-ignored×8 → press-stop → press-arm`
+Machine-verified state sequences (PTY, `MORTIC_SMOKE_LOG` sink), identical semantics in both terminal classes:
 
-**PTT interaction decision for MOR-92/93/94**: adaptive hold-with-tap-fallback, auto-detected per session from the first observed key release. UI copy must work for both: `Push-to-talk active. Release M or tap M again to stop.`
+- Plain-press terminal (iTerm2-style): `press-arm → repeat-ignored×8 → press-stop → press-arm`
+- Kitty-class terminal: `press-arm → press-stop → press-arm → repeat-ignored×4` (releases ignored; holding arms once)
+
+**PTT interaction decision for MOR-92/93/94**: tap-toggle is the primary and only PTT interaction in v1. UI copy: `Push-to-talk on. Tap M again to stop.` Hold-to-talk is a possible future enhancement, deferred; the investigation evidence above documents what it would take.
 
 ## Local Evidence
 
@@ -103,15 +107,16 @@ Machine-verified state sequences (PTY, `MORTIC_SMOKE_LOG` sink):
 
 | Terminal | Expected Mode | Expected `useKittyKeyboard` | Human Result | Notes |
 | --- | --- | --- | --- | --- |
-| PTY probe (emulated Kitty, machine) | Hold-`M` | `true` | Hold — pass 2026-07-03 | `press-arm → repeat-ignored → release-stop`, twice, no flicker. Verified against the adaptive model. |
-| PTY probe (no releases, machine) | Tap | `true` | Tap — pass 2026-07-03 | `press-arm → repeat-ignored×8 → press-stop → press-arm`. Repeat storm absorbed. |
-| iTerm2 3.5+ | Tap | `true` | Tap — confirmed 2026-07-03 | Live diagnostic: accepts `ESC[>7u` push but never sends release events for plain keys; key repeat arrives as plain presses. Terminal limitation, not a Mortic bug. |
-| macOS Terminal.app | Tap | `false` | Tap | Confirmed pre-fix; no Kitty support at all. |
-| Alacritty 0.13+ | Hold-`M` | `true` | Pending | Installed on this machine; documented event-types support — best local candidate for a real hold-to-talk confirmation. |
-| Ghostty | Hold-`M` | `true` | Not installed here | Full protocol support expected; test when available. |
-| Kitty | Hold-`M` | `true` | Not installed here | Reference implementation; test when available. |
-| WezTerm | Hold-`M` | `true` | Not installed here | May require `enable_kitty_keyboard=true` in WezTerm config; test when available. |
+PTT is tap-toggle by design in v1, so the matrix no longer gates the interaction — it records the evidence that led to the decision.
+
+| Terminal | v1 Behavior | Evidence |
+| --- | --- | --- |
+| PTY probe, plain presses (machine) | Tap | `press-arm → repeat-ignored×8 → press-stop → press-arm`, 2026-07-03. |
+| PTY probe, Kitty events (machine) | Tap | `press-arm → press-stop → press-arm → repeat-ignored×4`; releases ignored, holding arms once, 2026-07-03. |
+| iTerm2 3.5+ | Tap | Live diagnostic 2026-07-03: never sends release events for plain keys even when `ESC[>7u` is pushed; key repeat arrives as plain presses. |
+| macOS Terminal.app | Tap | Confirmed live; no Kitty protocol support at all. |
+| Alacritty / Ghostty / Kitty / WezTerm | Tap | Same tap semantics by design; their release-event support is unused in v1 and only relevant to a future hold-to-talk enhancement. |
 
 ## Completion Rule
 
-The three product-critical capabilities are confirmed: `/mortic` slash entry (machine-verified), typing lock (machine-verified), and PTT with adaptive hold/tap semantics (machine-verified for both terminal classes; iTerm2 and Terminal.app confirmed live as Tap). MOR-165 can close on this evidence. Optional follow-up, not blocking: one Alacritty run to confirm a real local terminal lands on Hold.
+The three product-critical capabilities are confirmed: `/mortic` slash entry (machine-verified), typing lock (machine-verified), and tap-toggle PTT (machine-verified in both terminal classes; iTerm2 and Terminal.app also confirmed live by a human). MOR-165 can close on this evidence.

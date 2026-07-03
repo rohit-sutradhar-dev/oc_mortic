@@ -325,42 +325,11 @@ function copyToClipboard(value) {
   return false;
 }
 
-// Kitty progressive-enhancement flags (https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
-// OpenCode's own `renderer.useKittyKeyboard = true` only requests
-// DISAMBIGUATE(1) | ALTERNATE_KEYS(4) — it never asks for EVENT_TYPES(2),
-// so terminals never report a release for a plain unmodified key like `m`.
-// Mortic focus mode escalates to request event types too, then restores the
-// host default on blur so unrelated OpenCode keymaps are unaffected.
-const KITTY_FLAG_DISAMBIGUATE = 1;
-const KITTY_FLAG_EVENT_TYPES = 2;
-const KITTY_FLAG_ALTERNATE_KEYS = 4;
-const MORTIC_KITTY_FLAGS = KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_EVENT_TYPES | KITTY_FLAG_ALTERNATE_KEYS;
-
-function requestPttReleaseReporting(api) {
-  if (!api.renderer.useKittyKeyboard || typeof api.renderer.enableKittyKeyboard !== "function") {
-    return;
-  }
-  try {
-    api.renderer.enableKittyKeyboard(MORTIC_KITTY_FLAGS);
-  } catch {
-    // best-effort: fall back to whatever flags the host already negotiated
-  }
-}
-
-function restoreHostKittyFlags(api) {
-  if (typeof api.renderer.enableKittyKeyboard !== "function") {
-    return;
-  }
-  try {
-    api.renderer.useKittyKeyboard = true;
-  } catch {
-    // best-effort restore
-  }
-}
-
-function keyboardMode(api) {
-  return api.renderer.useKittyKeyboard ? "hold" : "tap";
-}
+// PTT is tap-to-talk / tap-to-stop everywhere by product decision
+// (2026-07-03). Terminal key-release reporting is too inconsistent to build
+// on: iTerm2 and Terminal.app never send releases for plain keys, and the
+// Kitty flag escalation needed for the rest added more complexity than the
+// hold interaction was worth for v1.
 
 function keyEventType(input, fallback) {
   if (input && typeof input === "object") {
@@ -470,9 +439,8 @@ export async function tui(api) {
           previousFocus = api.renderer.currentFocusedRenderable ?? undefined;
           previousFocus?.blur?.();
         }
-        requestPttReleaseReporting(api);
         setFocused(true);
-        recordSmoke("focus", { source, pttMode: keyboardMode(api), typingLockProbe: "type printable keys after focus" });
+        recordSmoke("focus", { source, pttMode: "tap", typingLockProbe: "type printable keys after focus" });
         setEvent(source === "slash" ? "slash focus" : "focus mode");
       });
     const blurMortic = () =>
@@ -483,7 +451,6 @@ export async function tui(api) {
         }
         previousFocus?.focus?.();
         previousFocus = undefined;
-        restoreHostKittyFlags(api);
         setFocused(false);
         setEvent("prompt mode");
       });
@@ -537,41 +504,29 @@ export async function tui(api) {
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
     };
-    // Key repeat arrives as plain presses: terminals without Kitty event
-    // types (iTerm2, Terminal.app) can't mark repeats, and OpenTUI also
-    // normalizes Kitty repeat events to presses. Once a session has seen any
-    // real key release, presses while armed are always repeat — the stop
-    // comes from the release. Until then, tap semantics apply and repeat is
-    // distinguished from a deliberate stop-press by timing. The window is
-    // wide because input processing can lag the keyboard under render load
-    // (observed >1.3s between arm and first repeat in a loaded session).
+    // Key repeat arrives as plain presses (terminals without Kitty event
+    // types can't mark repeats, and OpenTUI normalizes Kitty repeats to
+    // presses), so a deliberate stop-tap is distinguished from holding the
+    // key down by timing. The window is wide because input processing can
+    // lag the keyboard under render load (observed >1.3s in a loaded session).
     const PTT_REPEAT_WINDOW_MS = 1500;
     let lastPttPressAt = 0;
-    let sawKeyRelease = false;
     const handlePttKey = (fallbackEventType, input) =>
       mutate(() => {
         const eventType = keyEventType(input, fallbackEventType);
         const key = keyName(input, "m");
-        const pttMode = keyboardMode(api);
-        recordSmoke("ptt.key", { key, eventType, pttMode });
+        recordSmoke("ptt.key", { key, eventType, pttMode: "tap" });
 
         if (eventType === "release") {
-          lastPttPressAt = 0;
-          if (getArmed()) {
-            setArmed(false);
-            setLive(false);
-            setEvent("m released");
-            setUserText("Push-to-talk released.");
-            appendTranscript("user", "M released.");
-            recordSmoke("ptt.state", { armed: false, via: "release-stop" });
-          }
+          // Tap-to-talk ignores key releases entirely; some terminals send
+          // them, most don't, and the toggle must behave the same in both.
           return;
         }
 
         const sincePrevPress = Date.now() - lastPttPressAt;
         lastPttPressAt = Date.now();
-        if (eventType === "repeat" || (getArmed() && (sawKeyRelease || sincePrevPress < PTT_REPEAT_WINDOW_MS))) {
-          setEvent(`m repeat ${pttMode}`);
+        if (eventType === "repeat" || (getArmed() && sincePrevPress < PTT_REPEAT_WINDOW_MS)) {
+          setEvent("m repeat");
           recordSmoke("ptt.state", { armed: getArmed(), via: "repeat-ignored" });
           return;
         }
@@ -581,16 +536,16 @@ export async function tui(api) {
           setLive(false);
           setEvent("m stopped");
           setUserText("Push-to-talk stopped.");
-          appendTranscript("user", "M stopped.");
+          appendTranscript("user", "M PTT stopped.");
           recordSmoke("ptt.state", { armed: false, via: "press-stop" });
           return;
         }
 
         setArmed(true);
         setLive(false);
-        setEvent("m held");
-        setUserText("Push-to-talk active. Release M or tap M again to stop.");
-        appendTranscript("user", "M PTT active.");
+        setEvent("m armed");
+        setUserText("Push-to-talk on. Tap M again to stop.");
+        appendTranscript("user", "M PTT on.");
         recordSmoke("ptt.state", { armed: true, via: "press-arm" });
       });
 
@@ -608,28 +563,14 @@ export async function tui(api) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
     };
-    // Hold-M release: keymap bindings only dispatch on key press; release
-    // arrives on the renderer key input stream when the terminal reports
-    // Kitty event types. Tap fallback stays press-driven via handlePttKey.
-    const releaseGuard = (event) => {
-      // Any real release event proves the terminal honors Kitty event types,
-      // which switches PTT from tap semantics to true hold semantics.
-      sawKeyRelease = true;
-      if (!getFocused()) return;
-      const name = typeof event?.name === "string" ? event.name.toLowerCase() : "";
-      if (name !== "m") return;
-      handlePttKey("release", event);
-    };
     const keyInput = api.renderer.keyInput;
     if (keyInput?.prependListener) {
       keyInput.prependListener("keypress", swallowGuard);
     } else {
       keyInput?.on?.("keypress", swallowGuard);
     }
-    keyInput?.on?.("keyrelease", releaseGuard);
     api.lifecycle.onDispose(() => {
       keyInput?.off?.("keypress", swallowGuard);
-      keyInput?.off?.("keyrelease", releaseGuard);
     });
 
     const actions = {
@@ -673,8 +614,7 @@ export async function tui(api) {
       commands: [
         { name: "mortic.blur", title: "Mortic: Return to prompt", category: "Mortic", run: blurMortic },
         { name: "mortic.ptt", title: "Mortic: Push to Talk", category: "Mortic", run: toggleArmed },
-        { name: "mortic.ptt.press", title: "Mortic: Hold M press", category: "Mortic", run: (input) => handlePttKey("press", input) },
-        { name: "mortic.ptt.release", title: "Mortic: Hold M release", category: "Mortic", run: (input) => handlePttKey("release", input) },
+        { name: "mortic.ptt.press", title: "Mortic: M push-to-talk toggle", category: "Mortic", run: (input) => handlePttKey("press", input) },
         { name: "mortic.live", title: "Mortic: Toggle Live", category: "Mortic", run: toggleLive },
         { name: "mortic.clear", title: "Mortic: Clear lane", category: "Mortic", run: clearLane },
         { name: "mortic.transcript", title: "Mortic: Transcript popup", category: "Mortic", run: openTranscript },
@@ -682,7 +622,7 @@ export async function tui(api) {
       ],
       bindings: [
         { key: "escape", cmd: "mortic.blur", desc: "Return to prompt" },
-        { key: "m", cmd: "mortic.ptt.press", desc: "Hold M PTT" },
+        { key: "m", cmd: "mortic.ptt.press", desc: "Tap M PTT" },
         { key: "p", cmd: "mortic.ptt", desc: "Push to Talk" },
         { key: "l", cmd: "mortic.live", desc: "Toggle Live" },
         { key: "c", cmd: "mortic.clear", desc: "Clear lane" },

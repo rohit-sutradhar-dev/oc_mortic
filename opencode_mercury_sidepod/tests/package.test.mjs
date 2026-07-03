@@ -53,42 +53,27 @@ test("source exposes MOR-165 slash and terminal smoke hooks", async () => {
   assert.match(src, /name:\s*"mortic\.ptt\.press"/);
 });
 
-test("focus mode locks typing and hears M release via key input stream", async () => {
+test("focus mode locks typing and PTT is a debounced tap toggle", async () => {
   const src = await readText("src/tui.js");
   const dist = await readText("dist/tui.js");
 
   for (const body of [src, dist]) {
-    // Keymap bindings never dispatch on key release, so release must come
-    // from the renderer key input stream; a keymap eventType filter is dead code.
+    // Keymap bindings never dispatch on key release, so a keymap eventType
+    // filter is dead code. PTT is tap-to-talk/tap-to-stop by product
+    // decision (2026-07-03): no keyrelease listener, no Kitty flag changes.
     assert.equal(/eventType:\s*"release",\s*cmd:/.test(body), false);
-    assert.match(body, /keyrelease/);
-    assert.match(body, /keyInput/);
+    assert.equal(body.includes("keyrelease"), false);
+    assert.equal(body.includes("enableKittyKeyboard"), false);
     // Typing lock swallows unbound keys before the prompt renderable sees them.
+    assert.match(body, /keyInput/);
     assert.match(body, /preventDefault/);
     assert.match(body, /stopPropagation/);
     // Prompt renderable focus is parked while Mortic focus mode is active.
     assert.match(body, /currentFocusedRenderable/);
-    // Key repeat arrives as plain presses (iTerm2/Terminal.app cannot mark
-    // repeats; OpenTUI normalizes Kitty repeats to presses), so a deliberate
-    // stop-press must be distinguished from repeat by a timing window.
+    // Key repeat arrives as plain presses (terminals without event types
+    // cannot mark repeats; OpenTUI normalizes Kitty repeats to presses), so
+    // a deliberate stop-tap is distinguished from repeat by a timing window.
     assert.match(body, /PTT_REPEAT_WINDOW_MS/);
-  }
-});
-
-test("focus mode escalates Kitty flags to request real M release events", async () => {
-  const src = await readText("src/tui.js");
-  const dist = await readText("dist/tui.js");
-
-  for (const body of [src, dist]) {
-    // OpenCode's own `useKittyKeyboard = true` only requests
-    // DISAMBIGUATE(1) | ALTERNATE_KEYS(4) = 5, which never includes
-    // EVENT_TYPES(2), so terminals never report a release for a plain
-    // unmodified key. Mortic focus mode must ask for EVENT_TYPES itself.
-    assert.match(body, /KITTY_FLAG_EVENT_TYPES\s*=\s*2/);
-    assert.match(body, /enableKittyKeyboard/);
-    // Escalation and restoration both live on the focus/blur transitions.
-    assert.match(body, /requestPttReleaseReporting\(api\)/);
-    assert.match(body, /restoreHostKittyFlags\(api\)/);
   }
 });
 
