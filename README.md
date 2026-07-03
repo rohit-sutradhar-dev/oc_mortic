@@ -53,7 +53,16 @@ python -m venv /tmp/mortic-helper-venv
 /tmp/mortic-helper-venv/bin/mortic-helper --help
 ```
 
-Platform should launch or discover the helper on `127.0.0.1:8765` unless overridden. Readiness is `GET /api/health`; a ready helper returns `ready: true`, otherwise it reports `Voice Bridge Issue` details. The sidepod v0 control/event transport is `ws://127.0.0.1:8765/ws/sidepod` and starts with a `start` command carrying `protocolVersion: "mortic.sidepod.v0"`. The helper responds with `ready` carrying the same protocol version before the sidepod treats the lane as connected.
+Platform should launch or discover the helper on `127.0.0.1:8765` unless overridden (`MORTIC_HELPER_URL`). Readiness is `GET /api/health`; a ready helper returns `ready: true`, otherwise it reports `Voice Bridge Issue` details. Nothing else in the health payload gates readiness — externally started helpers are first-class. The sidepod v0 control/event transport is `ws://127.0.0.1:8765/ws/sidepod` and starts with a `start` command carrying `protocolVersion: "mortic.sidepod.v0"`. The helper responds with `ready` carrying the same protocol version before the sidepod treats the lane as connected.
+
+The shipped plugin launcher (2026-07-04) resolves the helper in this order:
+
+1. `MORTIC_HELPER_CMD` — explicit command override (quote paths containing spaces).
+2. `<repo>/.venv/bin/mortic-helper` — repo-checkout dev install (spawned from the repo root so `.env` BYOK loading and `runs/` behave).
+3. `uv run --project <repo> mortic-helper` — repo checkout without a `.venv`.
+4. `uvx mortic-helper` — the published package.
+
+Plugin-spawned helpers receive `--no-managed` and the focused thread's OpenCode server URL via `OPENCODE_VOICE_OPENCODE_URL` (recorded from the plugin host's `serverUrl` as `MORTIC_OPENCODE_SERVER_URL`; an explicit user `OPENCODE_VOICE_OPENCODE_URL` wins). `start` additionally carries `opencodeUrl` so the engine forks on the server that owns the thread. With `--no-managed` and no reachable server the helper exits instead of starting a shadow OpenCode server. `MORTIC_HELPER_LOG` captures spawned-helper output; `MORTIC_HELPER_EVENT_LOG` mirrors the engine's redacted event log for diagnostics.
 
 No PyInstaller or app bundle is part of v1; the terminal process that launches `mortic-helper` keeps macOS mic permission attribution clear. Local keys stay in environment variables or `.env`; packages must not contain secrets.
 

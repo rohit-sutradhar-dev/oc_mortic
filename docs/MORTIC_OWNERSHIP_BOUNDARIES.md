@@ -68,6 +68,7 @@ Shared ownership is intentionally narrow.
 
 Shared modules and artifacts:
 
+- `protocol/` — the normative TypeScript contract source (`schema.ts`), its generator, and the canonical JSON Schema (added 2026-07-04; the generated runtime copies live inside each track's package and are regenerated together via `npm run gen` in `protocol/`)
 - `docs/MORTIC_PROTOCOL_V0.md`
 - `docs/MORTIC_CURRENT_CODE_INVENTORY.md`
 - Protocol fixtures and contract examples
@@ -91,7 +92,7 @@ Shared does not own:
 - Platform sends only v0 commands to Engine; Engine must not require Platform to handle raw audio, provider keys, provider payloads, or model/runtime details.
 - Engine sends only v0 events to Platform; Platform must translate those events into product states and must not display protocol names directly unless in developer-only logs.
 - Unknown fields are tolerated by both tracks; unknown message types are logged and ignored.
-- Protocol changes require both-owner approval and an update to `docs/MORTIC_PROTOCOL_V0.md`.
+- Protocol changes require both-owner approval and an update to `docs/MORTIC_PROTOCOL_V0.md`. Since 2026-07-04 they also require editing `protocol/schema.ts` and regenerating the artifacts — both test suites fail on a schema edit without regeneration, and both runtimes validate at the WebSocket boundary (the Engine lane fails closed).
 - Browser-backed UI under `opencode_voice/static/` is reference-only for WP-1 and must not become the packaged product surface.
 - Source OpenCode threads remain untouched; voice work belongs to ephemeral forks owned by Engine and rendered by Platform.
 

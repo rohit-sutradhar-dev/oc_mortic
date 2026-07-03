@@ -161,10 +161,10 @@ Shared-owned next work:
 
 ## Gaps And Risks To Track
 
-- Protocol mismatch: current bridge protocol is not PRD v0 and cannot be consumed directly by the future sidepod client without an adapter or refactor.
-- Packaged UI mismatch: current browser UI exposes thread selection, typed fallback, model/provider details, and visible browser/iframe surface, all non-goals for packaged v1.
-- Helper mismatch: current bridge is a FastAPI browser app, not yet an invisible helper/runtime artifact.
-- Native mic gap: current mic capture is browser-based; Engine still needs OS-native capture or an approved helper plan.
+- Protocol mismatch: **resolved 2026-07-04** — `SidepodConnection` translates all legacy engine vocabulary to v0 at a single `send_json` seam, validated against the generated schema (fail closed). The browser lane keeps its legacy names by design.
+- Packaged UI mismatch: current browser UI exposes thread selection, typed fallback, model/provider details, and visible browser/iframe surface, all non-goals for packaged v1. Browser surface stays reference-only.
+- Helper mismatch: **resolved for the sidepod lane 2026-07-04** — the plugin launcher discovers or spawns `mortic-helper` (`--no-managed`, pinned to the focused thread's OpenCode server) and the lane runs end to end over `/ws/sidepod`.
+- Native mic gap: **resolved 2026-07-04** — `NativeMicSession`/`NativeSpeakerSession` (sounddevice, cherry-picked from feature-voice) drive capture/playback; a capture watchdog turns silent capture into `mic_permission_needed`. Live spoken-turn verification remains an owner test.
 - Sidepod source gap: MOR-166 added `opencode_mercury_sidepod/src/`; the package now ships `src/` directly (no build step, no `dist/`).
 - Sidepod test gap: MOR-166 adds package fixture tests; deeper TUI snapshot tests are still needed before larger visual changes.
 - Source-thread safety gap: fork cleanup exists, but tests do not yet prove source OpenCode thread remains untouched after a voice turn.
