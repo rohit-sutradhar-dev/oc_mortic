@@ -51,15 +51,20 @@ test("focus mode locks typing and the mic is a plain M toggle", () => {
   assert.match(src, /currentFocusedRenderable/);
 });
 
-test("typing lock and focus state are announced, not silent", () => {
-  // Owner correction 2026-07-03: a collapsed sidebar panel means the pod is
-  // invisible, so indication has to reach the user via toast, not just UI.
-  assert.match(src, /const focusMortic = \(\) => \{[\s\S]*?api\.ui\.toast\(/);
-  assert.match(src, /noteSwallowedKey/);
-  assert.match(src, /const noteSwallowedKey = \([\s\S]*?api\.ui\.toast\(/);
-  // The swallow notice fires once per focus session, reset on focus/blur.
-  assert.match(src, /swallowNoticeShown = false/);
-  assert.match(src, /if \(swallowNoticeShown\) {\s*return;\s*}/);
+test("focus and typing-lock state render persistently beside the prompt", () => {
+  // Owner correction 2026-07-03: a collapsed sidebar panel means the pod can
+  // be invisible, so indication has to reach the user outside it. A toast
+  // was tried first; session_prompt_right (verified live via PTY: content
+  // renders directly beside the OpenCode prompt row) replaced it because a
+  // reactive slot is simpler than a toast + one-shot-notice flag — it's
+  // immutable while focused and clears itself the instant focus ends, with
+  // no timer or manual flush.
+  assert.match(src, /function renderPromptAnnex\(state, theme\)/);
+  assert.match(src, /session_prompt_right:\s*\(\)\s*=>\s*renderPromptAnnex/);
+  assert.match(src, /if \(!state\.focused\) {\s*return text\({}, \[""\]\);\s*}/);
+  // No toast/one-shot-notice machinery left over from the earlier design.
+  assert.equal(src.includes("noteSwallowedKey"), false);
+  assert.equal(src.includes("swallowNoticeShown"), false);
   // The hero caption reflects focus/mic state instead of a static label.
   assert.match(src, /function heroCaption\(state\)/);
   assert.match(src, /MIC LIVE/);

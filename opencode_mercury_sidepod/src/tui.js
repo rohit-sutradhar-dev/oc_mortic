@@ -340,6 +340,20 @@ function createProtocolSender(recordSmoke) {
   };
 }
 
+// Sits beside the OpenCode prompt row (session_prompt_right slot) so focus
+// state and the typing lock are visible right where the user is about to
+// type — persistent while focused, and reactively cleared the instant focus
+// state flips false. No timer, no manual clear: the slot re-renders off the
+// same signals sidebar_content uses.
+function renderPromptAnnex(state, theme) {
+  if (!state.focused) {
+    return text({}, [""]);
+  }
+  const label = state.micLive ? "MIC LIVE" : "MIC MUTED";
+  const color = state.micLive ? theme.success : theme.textMuted;
+  return text({ fg: color }, [`MORTIC · ${label} — Esc exit`]);
+}
+
 function renderPod(state, actions, theme) {
   return box(
     {
@@ -401,10 +415,6 @@ export async function tui(api) {
     let exitMorticMode;
     let previousFocus;
     let clientEventSeq = 0;
-    // The typing-lock notice fires once per focus session, at the moment a
-    // key actually gets swallowed — that's when the confusion would happen,
-    // and it reaches the user even if the sidebar panel is collapsed.
-    let swallowNoticeShown = false;
 
     const restorePromptFocus = () => {
       if (exitMorticMode) {
@@ -414,7 +424,6 @@ export async function tui(api) {
       previousFocus?.focus?.();
       previousFocus = undefined;
       setFocused(false);
-      swallowNoticeShown = false;
     };
 
     const focusMortic = () => {
@@ -440,30 +449,12 @@ export async function tui(api) {
           previousFocus?.blur?.();
         }
         setFocused(true);
-        swallowNoticeShown = false;
         recordSmoke("focus");
         setEvent("focus mode");
-        // The sidepod may be visually collapsed, so the confirmation that
-        // focus actually engaged has to reach the user outside the panel too.
-        api.ui.toast({
-          variant: "info",
-          message: "Mortic focused — M mic · T transcript · H handoff · Esc exit"
-        });
       });
     };
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
-    };
-    const noteSwallowedKey = (key, modal) => {
-      recordSmoke("typing.swallow", modal ? { key: key || "unknown", modal } : { key: key || "unknown" });
-      if (swallowNoticeShown) {
-        return;
-      }
-      swallowNoticeShown = true;
-      api.ui.toast({
-        variant: "info",
-        message: "Keys go to Mortic while it's focused. Esc returns to the prompt."
-      });
     };
 
     // Modals render as centered host dialogs over the whole TUI (never inside
@@ -693,12 +684,12 @@ export async function tui(api) {
         } else if (modal === "transcript" && (name === "k" || name === "up")) {
           scrollModal(-1);
         } else {
-          noteSwallowedKey(name, modal);
+          recordSmoke("typing.swallow", { key: name || "unknown", modal });
         }
         return;
       }
       if (morticModeKeys.has(name)) return;
-      noteSwallowedKey(name);
+      recordSmoke("typing.swallow", { key: name || "unknown" });
       event?.preventDefault?.();
       event?.stopPropagation?.();
     };
@@ -757,24 +748,22 @@ export async function tui(api) {
     });
     api.lifecycle.onDispose(() => exitMorticMode?.());
 
+    const buildState = () => ({
+      micLive: getMicLive(),
+      focused: getFocused(),
+      phase: getPhase(),
+      event: getEvent(),
+      userText: getUserText(),
+      assistantText: getAssistantText(),
+      transcript: getTranscript(),
+      handoffReady: getTranscript().length > 1
+    });
+
     api.slots.register({
       order: 760,
       slots: {
-        sidebar_content: () =>
-          renderPod(
-            {
-              micLive: getMicLive(),
-              focused: getFocused(),
-              phase: getPhase(),
-              event: getEvent(),
-              userText: getUserText(),
-              assistantText: getAssistantText(),
-              transcript: getTranscript(),
-              handoffReady: getTranscript().length > 1
-            },
-            actions,
-            api.theme.current
-          )
+        sidebar_content: () => renderPod(buildState(), actions, api.theme.current),
+        session_prompt_right: () => renderPromptAnnex(buildState(), api.theme.current)
       }
     });
 }

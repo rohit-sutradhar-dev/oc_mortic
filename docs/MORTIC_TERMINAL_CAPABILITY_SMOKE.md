@@ -55,12 +55,12 @@ Live testing found `/mortic` silently locking the keyboard when triggered before
 
 ## Typing-Lock Visibility (2026-07-03)
 
-A second live-testing finding: even inside a session, the typing lock gave no indication it was active — worse if the sidebar panel is collapsed, since the plugin has no API to detect or force panel visibility (`TuiApp` exposes only `{version}`; there is no host-prompt handle to pre-fill either). Indication had to live in host-level toasts, which reach the user regardless of panel visibility:
+A second live-testing finding: even inside a session, the typing lock gave no indication it was active — worse if the sidebar panel is collapsed, since the plugin has no API to detect or force panel visibility (`TuiApp` exposes only `{version}`). First fix was a pair of `api.ui.toast` calls (one on focus, one on the first swallowed keystroke per session). Owner asked whether the indication could instead live in the prompt row itself, persistent while focused and cleared on exit. Verified live via PTY that OpenCode's `session_prompt_right` host slot renders plugin content directly beside the prompt row (next to the model/agent status text) — so the sidepod now registers a `session_prompt_right` slot (`renderPromptAnnex`) built from the same state used by `sidebar_content`:
 
-- On successful focus, an info toast names the key surface: `Mortic focused — M mic · T transcript · H handoff · Esc exit`.
-- The first time a keystroke is actually swallowed in a focus session, a one-time info toast explains it: `Keys go to Mortic while it's focused. Esc returns to the prompt.` The flag resets on focus and on blur, so it fires again next time.
-- The hero caption is state-true instead of a static label: unfocused shows `/MORTIC TO FOCUS`; focused shows `MIC MUTED · M TO TALK` or `MIC LIVE · M TO MUTE`.
-- Nothing needs explicit clearing — toasts auto-expire and the caption/border already track `focused` state.
+- Focused: `MORTIC · MIC MUTED — Esc exit` or `MORTIC · MIC LIVE — Esc exit`, colored by mic state.
+- Unfocused: empty.
+
+This replaced both toasts — a reactive slot is simpler than a toast plus a one-shot-notice flag, and it satisfies "immutable until exit, then flushed" for free: the slot re-renders off the same `focused`/`micLive` signals, with no timer and no manual clear code. The hero caption also stays state-true instead of a static label: unfocused shows `/MORTIC TO FOCUS`; focused shows `MIC MUTED · M TO TALK` or `MIC LIVE · M TO MUTE`.
 
 ## Local Evidence
 
@@ -70,7 +70,7 @@ A second live-testing finding: even inside a session, the typing lock gave no in
   - Typing lock: printable probe text does not reach the prompt in focus mode; typing works again after `Esc`.
   - `/mortic` with no session open: focus refused, `focus.blocked` smoke event recorded, probe text still reaches the prompt (no lock engaged).
   - `M` toggles cleanly: unmute → mute → unmute → mute, one state flip per press, no repeat flicker in the toggle logic itself; each press emits a `live.set` protocol send.
-  - Focus toast text and the typing-lock swallow notice are drawn on screen.
+  - The prompt-row annex is absent before focus, reads `MORTIC · MIC MUTED — Esc exit` right after focus, flips to `MIC LIVE` on unmute and back on mute, and disappears the instant the session ends.
 - Live human diagnostic in iTerm2 (`MORTIC_SMOKE_LOG` sink) confirmed `useKittyKeyboard: true`, zero release events for plain keys, and key repeat arriving as plain presses — the evidence behind rolling back every release-dependent model above.
 - `npm run check` (12 tests) locks the slash reachability rules, the typing-lock guards, the mic-toggle protocol contract, and the absence of release/Kitty-flag/debounce/PTT machinery in `src/` (the package ships `src/` directly; there is no build step or `dist/`).
 - `uv run pytest` (37 tests) remains the repo-wide gate after the sidepod package check.
