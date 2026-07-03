@@ -11,7 +11,8 @@
         "sentAt": "2026-07-02T04:00:00.000Z",
         "sourceSessionId": "ses_source_123",
         "keepFork": false,
-        "workspacePath": "/Users/aeroknight/Documents/Fusion Self Benchmarking"
+        "workspacePath": "/Users/aeroknight/Documents/Fusion Self Benchmarking",
+        "opencodeUrl": "http://127.0.0.1:4096"
       }
     },
     {
@@ -81,6 +82,16 @@
         "promptId": "prompt_refresh_0001",
         "actionId": "refresh",
         "confirmed": true,
+        "voiceLaneId": "lane_123"
+      }
+    },
+    {
+      "name": "stop",
+      "message": {
+        "type": "stop",
+        "clientEventId": "evt_sidepod_0008",
+        "sentAt": "2026-07-02T04:02:00.000Z",
+        "reason": "user.end_session",
         "voiceLaneId": "lane_123"
       }
     }
@@ -196,6 +207,16 @@
         "retryable": true,
         "voiceLaneId": "lane_123",
         "debugRef": "run_20260702T040000Z"
+      }
+    },
+    {
+      "name": "stopped",
+      "message": {
+        "type": "stopped",
+        "sentAt": "2026-07-02T04:02:00.400Z",
+        "reason": "user.end_session",
+        "forkDeleted": true,
+        "voiceLaneId": "lane_123"
       }
     }
   ],
@@ -325,6 +346,14 @@
     {
       "direction": "engine_to_sidepod",
       "fixture": "voice_bridge_issue"
+    },
+    {
+      "direction": "sidepod_to_engine",
+      "fixture": "stop"
+    },
+    {
+      "direction": "engine_to_sidepod",
+      "fixture": "stopped"
     }
   ]
 }

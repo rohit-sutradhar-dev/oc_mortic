@@ -1,8 +1,20 @@
 # Mortic Sidepod Engine Protocol v0
 
-Status: frozen v0 contract for MOR-135
+Status: frozen v0 contract for MOR-135 (amended 2026-07-04, see Amendments)
 Date: 2026-07-02
 Source: `docs/MORTIC_PROJECT_EXECUTION_PLAN.md` section 2
+
+## Amendments
+
+### 2026-07-04 — schema as code, explicit stop, server pinning
+
+Approved by both owners (product owner + CTO) under the change-control rules below.
+
+1. **The TypeScript schema is now normative.** `protocol/schema.ts` is the single source of truth for message shapes. This document and the fixtures follow it. `protocol/generate.ts` regenerates the checked-in artifacts both runtimes validate against at the WebSocket boundary: `protocol/mortic.sidepod.v0.schema.json` (canonical), `opencode_mercury_sidepod/src/protocol.gen.mjs` (sidepod runtime copy), and `opencode_voice/protocol_schema.json` (engine runtime copy). Each artifact embeds a hash of `schema.ts`; both test suites fail if the schema changes without regeneration.
+2. **New command `stop` and new event `stopped`** for acknowledged lane teardown (End Session, thread switch, client shutdown). Defined in full below. A WebSocket disconnect without `stop` still tears the lane down completely (capture stopped, ephemeral fork deleted) — `stop` adds an acknowledged path, not a required one.
+3. **New optional `start` field `opencodeUrl`**: the sidepod tells the engine which local OpenCode server owns the source thread, replacing process-scan discovery when present. This is a local address, not a provider/model/runtime detail.
+
+The protocol version tag remains `mortic.sidepod.v0`.
 
 ## Scope
 
@@ -64,6 +76,7 @@ Required fields:
 Optional fields:
 
 - `workspacePath`: current workspace path when OpenCode exposes it.
+- `opencodeUrl`: base URL of the local OpenCode server that owns `sourceSessionId` (amendment 2026-07-04). When present the Engine must use it instead of discovering a server itself.
 
 Contract field:
 
@@ -261,6 +274,33 @@ Example:
   "promptId": "prompt_refresh_0001",
   "actionId": "refresh",
   "confirmed": true,
+  "voiceLaneId": "lane_123"
+}
+```
+
+### `stop`
+
+Added by the 2026-07-04 amendment. Sent when the sidepod ends the voice lane on purpose: End Session, switching to another source thread, or plugin shutdown. The Engine must stop audio capture, abort any active fork turn, delete the ephemeral fork unless `keepFork` was set on `start`, and reply with `stopped`. Disconnecting the WebSocket without `stop` triggers the same teardown without the acknowledgement.
+
+Required fields:
+
+- `type`: `stop`
+- `clientEventId`: unique sidepod event id.
+- `sentAt`: client timestamp.
+- `reason`: teardown reason. Canonical values: `user.end_session`, `thread.switch`, `client.shutdown`.
+
+Optional fields:
+
+- `voiceLaneId`: current voice lane id, if known.
+
+Example:
+
+```json
+{
+  "type": "stop",
+  "clientEventId": "evt_sidepod_0008",
+  "sentAt": "2026-07-02T04:02:00.000Z",
+  "reason": "user.end_session",
   "voiceLaneId": "lane_123"
 }
 ```
@@ -548,5 +588,32 @@ Example:
   "retryable": true,
   "voiceLaneId": "lane_123",
   "debugRef": "run_20260702T040000Z"
+}
+```
+
+### `stopped`
+
+Added by the 2026-07-04 amendment. Acknowledges a `stop` command (or an engine-initiated lane teardown) after capture is stopped and fork cleanup has run.
+
+Required fields:
+
+- `type`: `stopped`
+- `sentAt`: helper timestamp.
+- `reason`: teardown reason, echoing the `stop` reason when one was received.
+- `forkDeleted`: whether the ephemeral voice fork was deleted during teardown.
+
+Optional fields:
+
+- `voiceLaneId`: voice lane id that was torn down, if one existed.
+
+Example:
+
+```json
+{
+  "type": "stopped",
+  "sentAt": "2026-07-02T04:02:00.400Z",
+  "reason": "user.end_session",
+  "forkDeleted": true,
+  "voiceLaneId": "lane_123"
 }
 ```

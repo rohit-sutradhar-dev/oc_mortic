@@ -1,0 +1,695 @@
+{
+  "title": "Mortic Sidepod <-> Engine protocol v0",
+  "protocolVersion": "mortic.sidepod.v0",
+  "x-source-hash": "f97e8be86040dd47b13f0dba35a24b03dd740f6921c99540abfb1beab659e35a",
+  "x-generated-by": "protocol/generate.ts",
+  "commands": {
+    "start": {
+      "additionalProperties": {},
+      "properties": {
+        "clientEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "keepFork": {
+          "type": "boolean"
+        },
+        "opencodeUrl": {
+          "type": "string"
+        },
+        "protocolVersion": {
+          "const": "mortic.sidepod.v0",
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sourceSessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "start",
+          "type": "string"
+        },
+        "workspacePath": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "clientEventId",
+        "type",
+        "sourceSessionId",
+        "keepFork"
+      ],
+      "type": "object"
+    },
+    "ptt.start": {
+      "additionalProperties": {},
+      "properties": {
+        "clientEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "eventType": {
+          "type": "string"
+        },
+        "inputMode": {
+          "const": "ptt",
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminalSupportsKeyRelease": {
+          "type": "boolean"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "ptt.start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "clientEventId",
+        "type",
+        "turnId",
+        "inputMode"
+      ],
+      "type": "object"
+    },
+    "ptt.stop": {
+      "additionalProperties": {},
+      "properties": {
+        "clientEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "eventType": {
+          "type": "string"
+        },
+        "matchingStartEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "ptt.stop",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "clientEventId",
+        "type",
+        "turnId",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "live.set": {
+      "additionalProperties": {},
+      "properties": {
+        "clientEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "live.set",
+          "type": "string"
+        },
+        "value": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sentAt",
+        "clientEventId",
+        "type",
+        "value"
+      ],
+      "type": "object"
+    },
+    "refresh": {
+      "additionalProperties": {},
+      "properties": {
+        "clientEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "confirmedByPromptId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sourceSessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "refresh",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "clientEventId",
+        "type",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "barge_in": {
+      "additionalProperties": {},
+      "properties": {
+        "clientEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "barge_in",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "clientEventId",
+        "type",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "confirm.response": {
+      "additionalProperties": {},
+      "properties": {
+        "actionId": {
+          "enum": [
+            "refresh",
+            "exit"
+          ],
+          "type": "string"
+        },
+        "clientEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "confirmed": {
+          "type": "boolean"
+        },
+        "promptId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "confirm.response",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "clientEventId",
+        "type",
+        "promptId",
+        "actionId",
+        "confirmed"
+      ],
+      "type": "object"
+    },
+    "stop": {
+      "additionalProperties": {},
+      "properties": {
+        "clientEventId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "stop",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "clientEventId",
+        "type",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "events": {
+    "ready": {
+      "additionalProperties": {},
+      "properties": {
+        "forkSessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "protocolVersion": {
+          "const": "mortic.sidepod.v0",
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sourceSessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "type": {
+          "const": "ready",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "voiceLaneId",
+        "state"
+      ],
+      "type": "object"
+    },
+    "listening": {
+      "additionalProperties": {},
+      "properties": {
+        "mode": {
+          "enum": [
+            "ptt",
+            "live"
+          ],
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "listening",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "voiceLaneId",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "transcript": {
+      "additionalProperties": {},
+      "properties": {
+        "confidence": {
+          "type": "number"
+        },
+        "final": {
+          "type": "boolean"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sequence": {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "timing": {
+          "additionalProperties": {},
+          "properties": {},
+          "type": "object"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "transcript",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "turnId",
+        "sequence",
+        "text",
+        "final"
+      ],
+      "type": "object"
+    },
+    "thinking": {
+      "additionalProperties": {},
+      "properties": {
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sourceMode": {
+          "enum": [
+            "ptt",
+            "live"
+          ],
+          "type": "string"
+        },
+        "submittedTextChars": {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "thinking",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "turnId",
+        "sourceMode"
+      ],
+      "type": "object"
+    },
+    "assistant.delta": {
+      "additionalProperties": {},
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "screenOnly": {
+          "type": "boolean"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sequence": {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "assistant.delta",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "turnId",
+        "sequence",
+        "delta"
+      ],
+      "type": "object"
+    },
+    "speaking": {
+      "additionalProperties": {},
+      "properties": {
+        "firstAudioLatencyMs": {
+          "type": "number"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "speaking",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "complete": {
+      "additionalProperties": {},
+      "properties": {
+        "fullSpokenText": {
+          "type": "string"
+        },
+        "latency": {
+          "additionalProperties": {},
+          "properties": {
+            "firstAssistantTextMs": {
+              "type": "number"
+            },
+            "firstAudioMs": {
+              "type": "number"
+            },
+            "firstTranscriptMs": {
+              "type": "number"
+            },
+            "totalMs": {
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "streamSource": {
+          "enum": [
+            "event",
+            "poll",
+            "poll_after_event"
+          ],
+          "type": "string"
+        },
+        "tokenSummary": {
+          "additionalProperties": {},
+          "properties": {},
+          "type": "object"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "complete",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "turnId",
+        "latency"
+      ],
+      "type": "object"
+    },
+    "interrupted": {
+      "additionalProperties": {},
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "interrupted",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "voice_bridge_issue": {
+      "additionalProperties": {},
+      "properties": {
+        "debugRef": {
+          "type": "string"
+        },
+        "diagnosticCode": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "safeDetail": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "voice_bridge_issue",
+          "type": "string"
+        },
+        "userMessage": {
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "userMessage",
+        "diagnosticCode",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "stopped": {
+      "additionalProperties": {},
+      "properties": {
+        "forkDeleted": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sentAt": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "stopped",
+          "type": "string"
+        },
+        "voiceLaneId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sentAt",
+        "type",
+        "reason",
+        "forkDeleted"
+      ],
+      "type": "object"
+    }
+  }
+}

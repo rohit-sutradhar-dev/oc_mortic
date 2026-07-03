@@ -1,0 +1,16 @@
+{
+  "name": "mortic-protocol",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Normative TypeScript source for the Mortic Sidepod <-> Engine protocol v0. Dev-only: neither shipped package depends on this at runtime; `npm run gen` regenerates the checked-in JSON Schema artifacts consumed by the sidepod plugin and the Python helper.",
+  "scripts": {
+    "gen": "node generate.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "zod": "4.0.14"
+  }
+}
