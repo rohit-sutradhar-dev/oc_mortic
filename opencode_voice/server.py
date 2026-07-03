@@ -13,7 +13,13 @@ import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from opencode_voice.config import VoiceConfig, load_voice_credentials, redact_secrets, voice_bridge_issue_payload
+from opencode_voice.config import (
+    VoiceConfig,
+    iso_utc_now,
+    load_voice_credentials,
+    redact_secrets,
+    voice_bridge_issue_payload,
+)
 from opencode_voice.deepgram import (
     FlushLimiter,
     SpeechTextFilter,
@@ -38,6 +44,7 @@ from opencode_voice.state import (
 STATIC_DIR = Path(__file__).with_name("static")
 EPHEMERAL_PREFIX = "[voice tmp]"
 AUDIO_DEPENDENCY_MODULE = "sounddevice"
+SIDEPOD_PROTOCOL_VERSION = "mortic.sidepod.v0"
 CONTEXT_OVERFLOW_MARKERS = (
     "maximum context length",
     "context length",
@@ -94,7 +101,11 @@ class OpenCodeEventFallback(Exception):
         self.prompt_sent = prompt_sent
 
 
-def create_app(config: VoiceConfig) -> FastAPI:
+def create_app(
+    config: VoiceConfig,
+    *,
+    client_factory: Callable[[str, float], OpenCodeClient] = OpenCodeClient,
+) -> FastAPI:
     app = FastAPI(title="OpenCode Mercury Voice Bridge")
     load_voice_credentials()
     logger = RunLogger(config.run_root)
@@ -136,7 +147,7 @@ def create_app(config: VoiceConfig) -> FastAPI:
     async def health() -> JSONResponse:
         credentials = load_voice_credentials()
         readiness_issues = helper_readiness_issues(transport_ready=True, debug_ref=str(logger.run_dir))
-        client = OpenCodeClient(config.opencode_url, timeout_sec=10)
+        client = client_factory(config.opencode_url, 10)
         try:
             opencode_health = await client.health()
         finally:
@@ -165,7 +176,7 @@ def create_app(config: VoiceConfig) -> FastAPI:
 
     @app.get("/api/sessions")
     async def sessions() -> JSONResponse:
-        client = OpenCodeClient(config.opencode_url, timeout_sec=20)
+        client = client_factory(config.opencode_url, 20)
         try:
             rows = await client.list_sessions()
         finally:
@@ -192,8 +203,19 @@ def create_app(config: VoiceConfig) -> FastAPI:
     @app.websocket("/ws/voice")
     async def voice_socket(websocket: WebSocket) -> None:
         await websocket.accept()
-        client = OpenCodeClient(config.opencode_url, timeout_sec=60)
+        client = client_factory(config.opencode_url, 60)
         connection = VoiceConnection(config=config, client=client, logger=logger, websocket=websocket)
+        try:
+            await connection.run()
+        finally:
+            await connection.close()
+            await client.close()
+
+    @app.websocket("/ws/sidepod")
+    async def sidepod_socket(websocket: WebSocket) -> None:
+        await websocket.accept()
+        client = client_factory(config.opencode_url, 60)
+        connection = SidepodConnection(config=config, client=client, logger=logger, websocket=websocket)
         try:
             await connection.run()
         finally:
@@ -224,6 +246,9 @@ class VoiceConnection:
         self.turn_task: asyncio.Task[None] | None = None
         self.turn_seq = 0
         self.active_turn_id: int | None = None
+        self.voice_lane_id: str | None = None
+        self.protocol_turn_id = ""
+        self.sidepod_readiness_issues: tuple[dict[str, Any], ...] = ()
         self.flux: DeepgramFluxSession | None = None
         self.speaker: DeepgramSpeakSession | None = None
         self.final_transcript = ""
@@ -316,7 +341,7 @@ class VoiceConnection:
             self.keep_fork = bool(payload.get("value"))
             await self.send_json({"type": "fork.keep", "keep_fork": self.keep_fork})
 
-    async def start(self, session_id: str, keep_fork: bool) -> None:
+    async def create_voice_fork(self, session_id: str, keep_fork: bool) -> dict[str, Any]:
         self.keep_fork = keep_fork
         self.source_session_id = session_id
         fork_started = time.perf_counter()
@@ -347,6 +372,7 @@ class VoiceConnection:
         except httpx.HTTPStatusError:
             await self.client.update_session(fork_id, {"title": title})
         self.fork_session_id = fork_id
+        self.voice_lane_id = self.voice_lane_id or f"lane_{int(time.time() * 1000)}"
         session = await self.client.get_session(fork_id)
         messages = await self.client.messages(fork_id)
         estimate = active_context_estimate(messages)
@@ -361,18 +387,19 @@ class VoiceConnection:
             usage_tokens=usage_tokens,
             keep_fork=keep_fork,
         )
-        await self.send_json(
-            {
-                "type": "fork.ready",
-                "source_session_id": session_id,
-                "fork_session_id": fork_id,
-                "title": title,
-                "context_tokens": estimate.tokens,
-                "context_source": estimate.source,
-                "usage_tokens": usage_tokens,
-                "keep_fork": keep_fork,
-            }
-        )
+        return {
+            "source_session_id": session_id,
+            "fork_session_id": fork_id,
+            "title": title,
+            "context_tokens": estimate.tokens,
+            "context_source": estimate.source,
+            "usage_tokens": usage_tokens,
+            "keep_fork": keep_fork,
+        }
+
+    async def start(self, session_id: str, keep_fork: bool) -> None:
+        fork = await self.create_voice_fork(session_id, keep_fork)
+        await self.send_json({"type": "fork.ready", **fork})
         await self.maybe_start_compaction(reason="session_start", run_in_background=True)
 
     async def stop(self) -> None:
@@ -381,6 +408,7 @@ class VoiceConnection:
             await self.client.delete_session(fork_id)
             self.logger.write("fork.delete", session_id=fork_id)
         self.fork_session_id = None
+        self.voice_lane_id = None
         await self.send_json({"type": "stopped"})
 
     async def start_audio(self) -> None:
@@ -886,6 +914,214 @@ class VoiceConnection:
                 await self.websocket.send_text(json.dumps(redact_secrets(payload), ensure_ascii=False))
             except WebSocketDisconnect:
                 self.closed = True
+
+
+class SidepodConnection(VoiceConnection):
+    async def run(self) -> None:
+        readiness_issues = helper_readiness_issues(
+            transport_ready=True,
+            debug_ref=str(self.logger.run_dir),
+        )
+        self.sidepod_readiness_issues = readiness_issues
+        if readiness_issues:
+            self.logger.state_transition(
+                "sidepod.connected",
+                "voice_bridge_issue",
+                diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
+            )
+            for issue in readiness_issues:
+                await self.send_json(issue)
+        else:
+            self.logger.state_transition("sidepod.connected", "waiting_for_start")
+
+        while True:
+            message = await self.websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            text = message.get("text")
+            if text is None:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                await self.send_protocol_issue(
+                    diagnostic_code="protocol_invalid_message",
+                    safe_detail="Invalid sidepod message",
+                )
+                continue
+            if not isinstance(payload, dict):
+                await self.send_protocol_issue(
+                    diagnostic_code="protocol_invalid_message",
+                    safe_detail="Invalid sidepod message",
+                )
+                continue
+            await self.handle_control(payload)
+
+    async def handle_control(self, payload: dict[str, Any]) -> None:
+        kind = str(payload.get("type") or "")
+        if kind == "start":
+            await self.handle_start(payload)
+        elif kind == "stop":
+            await self.stop()
+        elif kind == "refresh":
+            await self.handle_refresh(payload)
+        elif kind == "ptt.start":
+            await self.handle_ptt_start(payload)
+        elif kind == "ptt.stop":
+            await self.handle_ptt_stop(payload)
+        elif kind == "live.set":
+            await self.send_protocol_issue(
+                diagnostic_code="native_audio_capture_unavailable",
+                safe_detail="Audio capture unavailable",
+            )
+        elif kind == "barge_in":
+            await self.barge_in(reason=str(payload.get("reason") or "sidepod"))
+        elif kind == "confirm.response":
+            self.logger.write(
+                "sidepod.confirm.response",
+                prompt_id=payload.get("promptId"),
+                action_id=payload.get("actionId"),
+                confirmed=bool(payload.get("confirmed")),
+                voice_lane_id=self.voice_lane_id,
+            )
+        else:
+            await self.send_protocol_issue(
+                diagnostic_code="protocol_invalid_message",
+                safe_detail="Unsupported sidepod command",
+            )
+
+    async def handle_start(self, payload: dict[str, Any]) -> None:
+        requested_version = str(payload.get("protocolVersion") or SIDEPOD_PROTOCOL_VERSION)
+        if requested_version != SIDEPOD_PROTOCOL_VERSION:
+            await self.send_protocol_issue(
+                diagnostic_code="protocol_version_unsupported",
+                safe_detail="Sidepod protocol unsupported",
+                retryable=False,
+            )
+            return
+
+        source_session_id = str(payload.get("sourceSessionId") or payload.get("session_id") or "")
+        if not source_session_id:
+            await self.send_protocol_issue(
+                diagnostic_code="protocol_invalid_message",
+                safe_detail="Source session unavailable",
+            )
+            return
+        if self.sidepod_readiness_issues:
+            for issue in self.sidepod_readiness_issues:
+                await self.send_json(issue)
+            return
+
+        if self.fork_session_id:
+            await self.stop()
+        self.voice_lane_id = self.voice_lane_id or f"lane_{int(time.time() * 1000)}"
+        try:
+            fork = await self.create_voice_fork(source_session_id, keep_fork=bool(payload.get("keepFork")))
+        except Exception as exc:  # noqa: BLE001 - keep sidepod transport alive.
+            self.logger.write("sidepod.start.error", source_session_id=source_session_id, error=repr(exc))
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_start_failed",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+
+        self.logger.state_transition("waiting_for_start", "ready", voice_lane_id=self.voice_lane_id)
+        await self.send_json(
+            {
+                "type": "ready",
+                "sentAt": iso_utc_now(),
+                "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
+                "voiceLaneId": self.voice_lane_id,
+                "state": "ready",
+                "sourceSessionId": fork["source_session_id"],
+                "forkSessionId": fork["fork_session_id"],
+            }
+        )
+
+    async def handle_refresh(self, payload: dict[str, Any]) -> None:
+        source_session_id = str(payload.get("sourceSessionId") or self.source_session_id or "")
+        if not source_session_id:
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_not_started",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+        await self.stop()
+        await self.handle_start(
+            {
+                "type": "start",
+                "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
+                "sourceSessionId": source_session_id,
+                "keepFork": self.keep_fork,
+            }
+        )
+
+    async def handle_ptt_start(self, payload: dict[str, Any]) -> None:
+        if not self.fork_session_id or not self.voice_lane_id:
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_not_started",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+        self.active_turn_id = None
+        self.protocol_turn_id = str(payload.get("turnId") or "")
+        await self.send_protocol_issue(
+            diagnostic_code="native_audio_capture_unavailable",
+            safe_detail="Audio capture unavailable",
+        )
+
+    async def handle_ptt_stop(self, payload: dict[str, Any]) -> None:
+        turn_id = str(payload.get("turnId") or "")
+        if turn_id and getattr(self, "protocol_turn_id", None) == turn_id:
+            await self.barge_in(reason=str(payload.get("reason") or "ptt.stop"))
+            self.protocol_turn_id = ""
+
+    async def stop(self) -> None:
+        if self.fork_session_id and not self.keep_fork:
+            fork_id = self.fork_session_id
+            await self.client.delete_session(fork_id)
+            self.logger.write("fork.delete", session_id=fork_id)
+        self.fork_session_id = None
+        self.voice_lane_id = None
+        self.protocol_turn_id = ""
+
+    async def barge_in(self, reason: str) -> None:
+        turn_id = getattr(self, "protocol_turn_id", "") or None
+        if self.active_turn_id is not None:
+            self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
+        self.active_turn_id = None
+        if self.speaker:
+            await self.speaker.close()
+            self.speaker = None
+        if self.fork_session_id:
+            try:
+                await self.client.abort(self.fork_session_id)
+            except Exception as exc:  # noqa: BLE001 - abort is best-effort during barge-in.
+                self.logger.write("turn.abort.error", session_id=self.fork_session_id, error=repr(exc))
+        payload: dict[str, Any] = {"type": "interrupted", "sentAt": iso_utc_now(), "reason": reason}
+        if self.voice_lane_id:
+            payload["voiceLaneId"] = self.voice_lane_id
+        if turn_id:
+            payload["turnId"] = turn_id
+        await self.send_json(payload)
+
+    async def send_protocol_issue(
+        self,
+        *,
+        diagnostic_code: str,
+        safe_detail: str,
+        retryable: bool = True,
+    ) -> None:
+        await self.send_json(
+            voice_bridge_issue_payload(
+                capability="sidepod_transport",
+                diagnostic_code=diagnostic_code,
+                safe_detail=safe_detail,
+                retryable=retryable,
+                debug_ref=str(self.logger.run_dir),
+                voice_lane_id=self.voice_lane_id,
+            )
+        )
 
 
 class DeepgramFluxSession:

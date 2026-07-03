@@ -7,18 +7,22 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
 from opencode_voice.config import (
     REDACTED,
     ModelRef,
+    VoiceConfig,
     load_local_dotenv,
     load_voice_credentials,
     redact_secrets,
     render_opencode_config,
+    voice_bridge_issue_payload,
 )
 from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import SSEParser
-from opencode_voice.server import helper_readiness_issues
+from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, create_app, helper_readiness_issues
 from opencode_voice.state import (
     AssistantTextTracker,
     OpenCodeEventTurnTracker,
@@ -26,6 +30,50 @@ from opencode_voice.state import (
     session_context_tokens,
     session_usage_tokens,
 )
+
+
+class FakeOpenCodeClient:
+    def __init__(self) -> None:
+        self.fork_count = 0
+        self.deleted: list[str] = []
+        self.aborted: list[str] = []
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def health(self) -> dict[str, bool]:
+        return {"ok": True}
+
+    async def list_sessions(self) -> list[dict[str, object]]:
+        return []
+
+    async def fork_session(self, session_id: str) -> dict[str, str]:
+        self.fork_count += 1
+        return {"id": f"fork_{self.fork_count}"}
+
+    async def get_session(self, session_id: str) -> dict[str, object]:
+        return {"id": session_id, "title": "Source Thread", "tokens": {}}
+
+    async def switch_model(self, session_id: str, model: ModelRef) -> dict[str, bool]:
+        return {"ok": True}
+
+    async def switch_agent(self, session_id: str, agent: str) -> dict[str, bool]:
+        return {"ok": True}
+
+    async def update_session(self, session_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return payload
+
+    async def messages(self, session_id: str) -> list[dict[str, object]]:
+        return []
+
+    async def delete_session(self, session_id: str) -> bool:
+        self.deleted.append(session_id)
+        return True
+
+    async def abort(self, session_id: str) -> bool:
+        self.aborted.append(session_id)
+        return True
 
 
 class MercuryConfigTests(unittest.TestCase):
@@ -165,6 +213,118 @@ class HelperReadinessTests(unittest.TestCase):
         self.assertEqual(record["text"]["kind"], "text")
         self.assertEqual(record["text"]["chars"], len("do not persist this prompt"))
         self.assertEqual(record["raw"]["kind"], "dict")
+
+
+class SidepodTransportTests(unittest.TestCase):
+    def test_sidepod_start_ready_and_refresh_clean_up_forks(self) -> None:
+        fake = FakeOpenCodeClient()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "opencode_voice.server.helper_readiness_issues",
+            return_value=(),
+        ):
+            app = create_app(
+                VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
+                client_factory=lambda _url, _timeout: fake,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/sidepod") as websocket:
+                    websocket.send_json(
+                        {
+                            "type": "start",
+                            "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
+                            "clientEventId": "evt_test_1",
+                            "sentAt": "2026-07-03T00:00:00.000Z",
+                            "sourceSessionId": "source_1",
+                            "keepFork": False,
+                        }
+                    )
+                    ready = websocket.receive_json()
+                    self.assertEqual(ready["type"], "ready")
+                    self.assertEqual(ready["protocolVersion"], SIDEPOD_PROTOCOL_VERSION)
+                    self.assertEqual(ready["sourceSessionId"], "source_1")
+                    self.assertEqual(ready["forkSessionId"], "fork_1")
+
+                    websocket.send_json(
+                        {
+                            "type": "refresh",
+                            "clientEventId": "evt_test_2",
+                            "sentAt": "2026-07-03T00:00:01.000Z",
+                            "reason": "user.confirmed_refresh",
+                            "sourceSessionId": "source_1",
+                        }
+                    )
+                    refreshed = websocket.receive_json()
+                    self.assertEqual(refreshed["type"], "ready")
+                    self.assertEqual(refreshed["forkSessionId"], "fork_2")
+                    self.assertEqual(fake.deleted, ["fork_1"])
+
+                self.assertEqual(fake.deleted, ["fork_1", "fork_2"])
+
+    def test_sidepod_readiness_issues_are_protocol_events(self) -> None:
+        fake = FakeOpenCodeClient()
+        issue = voice_bridge_issue_payload(
+            capability="voice_audio",
+            diagnostic_code="audio_dependency_unavailable",
+            safe_detail="Audio capture unavailable",
+            sent_at="2026-07-03T00:00:00.000Z",
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "opencode_voice.server.helper_readiness_issues",
+            return_value=(issue,),
+        ):
+            app = create_app(
+                VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
+                client_factory=lambda _url, _timeout: fake,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/sidepod") as websocket:
+                    event = websocket.receive_json()
+                    websocket.send_json(
+                        {
+                            "type": "start",
+                            "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
+                            "clientEventId": "evt_blocked",
+                            "sentAt": "2026-07-03T00:00:00.000Z",
+                            "sourceSessionId": "source_1",
+                            "keepFork": False,
+                        }
+                    )
+                    blocked = websocket.receive_json()
+
+        self.assertEqual(event["type"], "voice_bridge_issue")
+        self.assertEqual(event["userMessage"], "Voice Bridge Issue")
+        self.assertEqual(event["diagnosticCode"], "audio_dependency_unavailable")
+        self.assertEqual(blocked["diagnosticCode"], "audio_dependency_unavailable")
+        self.assertEqual(fake.fork_count, 0)
+
+    def test_sidepod_rejects_unsupported_protocol_without_forking(self) -> None:
+        fake = FakeOpenCodeClient()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "opencode_voice.server.helper_readiness_issues",
+            return_value=(),
+        ):
+            app = create_app(
+                VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
+                client_factory=lambda _url, _timeout: fake,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/sidepod") as websocket:
+                    websocket.send_json(
+                        {
+                            "type": "start",
+                            "protocolVersion": "mortic.sidepod.v9",
+                            "clientEventId": "evt_test_bad",
+                            "sentAt": "2026-07-03T00:00:00.000Z",
+                            "sourceSessionId": "source_1",
+                            "keepFork": False,
+                        }
+                    )
+                    event = websocket.receive_json()
+
+        self.assertEqual(event["type"], "voice_bridge_issue")
+        self.assertEqual(event["diagnosticCode"], "protocol_version_unsupported")
+        self.assertFalse(event["retryable"])
+        self.assertEqual(fake.fork_count, 0)
 
 
 class TokenTests(unittest.TestCase):
