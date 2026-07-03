@@ -331,35 +331,6 @@ function copyToClipboard(value) {
 // Kitty flag escalation needed for the rest added more complexity than the
 // hold interaction was worth for v1.
 
-function keyEventType(input, fallback) {
-  if (input && typeof input === "object") {
-    if (typeof input.eventType === "string") {
-      return input.eventType;
-    }
-    if (typeof input.type === "string") {
-      return input.type;
-    }
-    if (input.key && typeof input.key === "object" && typeof input.key.eventType === "string") {
-      return input.key.eventType;
-    }
-  }
-  return fallback;
-}
-
-function keyName(input, fallback) {
-  if (input && typeof input === "object") {
-    if (typeof input.name === "string") {
-      return input.name;
-    }
-    if (typeof input.key === "string") {
-      return input.key;
-    }
-    if (input.key && typeof input.key === "object" && typeof input.key.name === "string") {
-      return input.key.name;
-    }
-  }
-  return fallback;
-}
 
 function logSmoke(api, event, details = {}) {
   const payload = {
@@ -504,49 +475,25 @@ export async function tui(api) {
     const recordSmoke = (event, details = {}) => {
       logSmoke(api, event, details);
     };
-    // Key repeat arrives as plain presses (terminals without Kitty event
-    // types can't mark repeats, and OpenTUI normalizes Kitty repeats to
-    // presses), so a deliberate stop-tap is distinguished from holding the
-    // key down by timing. The window is wide because input processing can
-    // lag the keyboard under render load (observed >1.3s in a loaded session).
-    const PTT_REPEAT_WINDOW_MS = 1500;
-    let lastPttPressAt = 0;
-    const handlePttKey = (fallbackEventType, input) =>
+    // Plain M toggle by product decision (2026-07-03): every M press flips
+    // armed/stopped. No repeat debounce, no event-type handling, no timing.
+    const handlePttKey = () =>
       mutate(() => {
-        const eventType = keyEventType(input, fallbackEventType);
-        const key = keyName(input, "m");
-        recordSmoke("ptt.key", { key, eventType, pttMode: "tap" });
-
-        if (eventType === "release") {
-          // Tap-to-talk ignores key releases entirely; some terminals send
-          // them, most don't, and the toggle must behave the same in both.
-          return;
-        }
-
-        const sincePrevPress = Date.now() - lastPttPressAt;
-        lastPttPressAt = Date.now();
-        if (eventType === "repeat" || (getArmed() && sincePrevPress < PTT_REPEAT_WINDOW_MS)) {
-          setEvent("m repeat");
-          recordSmoke("ptt.state", { armed: getArmed(), via: "repeat-ignored" });
-          return;
-        }
-
         if (getArmed()) {
           setArmed(false);
           setLive(false);
           setEvent("m stopped");
           setUserText("Push-to-talk stopped.");
           appendTranscript("user", "M PTT stopped.");
-          recordSmoke("ptt.state", { armed: false, via: "press-stop" });
+          recordSmoke("ptt.state", { armed: false, via: "m-stop" });
           return;
         }
-
         setArmed(true);
         setLive(false);
         setEvent("m armed");
         setUserText("Push-to-talk on. Tap M again to stop.");
         appendTranscript("user", "M PTT on.");
-        recordSmoke("ptt.state", { armed: true, via: "press-arm" });
+        recordSmoke("ptt.state", { armed: true, via: "m-arm" });
       });
 
     // Typing lock: global key handlers run before renderable handlers and the
@@ -614,7 +561,7 @@ export async function tui(api) {
       commands: [
         { name: "mortic.blur", title: "Mortic: Return to prompt", category: "Mortic", run: blurMortic },
         { name: "mortic.ptt", title: "Mortic: Push to Talk", category: "Mortic", run: toggleArmed },
-        { name: "mortic.ptt.press", title: "Mortic: M push-to-talk toggle", category: "Mortic", run: (input) => handlePttKey("press", input) },
+        { name: "mortic.ptt.press", title: "Mortic: M push-to-talk toggle", category: "Mortic", run: () => handlePttKey() },
         { name: "mortic.live", title: "Mortic: Toggle Live", category: "Mortic", run: toggleLive },
         { name: "mortic.clear", title: "Mortic: Clear lane", category: "Mortic", run: clearLane },
         { name: "mortic.transcript", title: "Mortic: Transcript popup", category: "Mortic", run: openTranscript },

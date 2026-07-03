@@ -53,27 +53,24 @@ test("source exposes MOR-165 slash and terminal smoke hooks", async () => {
   assert.match(src, /name:\s*"mortic\.ptt\.press"/);
 });
 
-test("focus mode locks typing and PTT is a debounced tap toggle", async () => {
+test("focus mode locks typing and PTT is a plain M toggle", async () => {
   const src = await readText("src/tui.js");
   const dist = await readText("dist/tui.js");
 
   for (const body of [src, dist]) {
-    // Keymap bindings never dispatch on key release, so a keymap eventType
-    // filter is dead code. PTT is tap-to-talk/tap-to-stop by product
-    // decision (2026-07-03): no keyrelease listener, no Kitty flag changes.
+    // PTT is a plain M toggle by product decision (2026-07-03): every press
+    // flips armed/stopped. No keyrelease listener, no Kitty flag changes,
+    // no repeat debounce, no event-type handling.
     assert.equal(/eventType:\s*"release",\s*cmd:/.test(body), false);
     assert.equal(body.includes("keyrelease"), false);
     assert.equal(body.includes("enableKittyKeyboard"), false);
+    assert.equal(body.includes("PTT_REPEAT_WINDOW_MS"), false);
     // Typing lock swallows unbound keys before the prompt renderable sees them.
     assert.match(body, /keyInput/);
     assert.match(body, /preventDefault/);
     assert.match(body, /stopPropagation/);
     // Prompt renderable focus is parked while Mortic focus mode is active.
     assert.match(body, /currentFocusedRenderable/);
-    // Key repeat arrives as plain presses (terminals without event types
-    // cannot mark repeats; OpenTUI normalizes Kitty repeats to presses), so
-    // a deliberate stop-tap is distinguished from repeat by a timing window.
-    assert.match(body, /PTT_REPEAT_WINDOW_MS/);
   }
 });
 
