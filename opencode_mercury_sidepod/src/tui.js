@@ -1,4 +1,3 @@
-import { appendFileSync } from "node:fs";
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal } from "solid-js";
 
@@ -6,7 +5,7 @@ import { ensureHelper, helperWsUrl, stopHelper } from "./helper-launcher.mjs";
 import { createLaneState, reduceLaneEvent } from "./lane-reducer.mjs";
 import { checkMessage } from "./protocol-validate.mjs";
 import { PROTOCOL_VERSION } from "./protocol.gen.mjs";
-import { opencodeServerUrl } from "./host-context.mjs";
+import { appendSmoke, opencodeServerUrl } from "./host-context.mjs";
 
 const WIDTH = 36;
 const INNER = WIDTH - 2;
@@ -293,11 +292,7 @@ function logSmoke(api, event, details = {}) {
     ...details
   };
   console.info("[mortic smoke]", JSON.stringify(payload));
-  try {
-    appendFileSync(SMOKE_SINK, JSON.stringify(payload) + "\n");
-  } catch {
-    // the smoke sink must never break the TUI
-  }
+  appendSmoke(payload);
 }
 
 // Voice-lane protocol client. Socket lifetime = lane lifetime: opened on

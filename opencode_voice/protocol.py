@@ -16,13 +16,15 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-PROTOCOL_VERSION = "mortic.sidepod.v0"
-
 
 @functools.lru_cache(maxsize=1)
 def schema_document() -> dict[str, Any]:
     text = resources.files("opencode_voice").joinpath("protocol_schema.json").read_text()
     return json.loads(text)
+
+
+# The generated artifact is the single source of the version string.
+PROTOCOL_VERSION = str(schema_document()["protocolVersion"])
 
 
 @functools.lru_cache(maxsize=64)

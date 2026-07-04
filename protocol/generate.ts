@@ -56,6 +56,46 @@ const document = {
   events: mapAll(EVENTS),
 };
 
+// The plugin validates with a dependency-free interpreter that understands
+// only this keyword subset (opencode_mercury_sidepod/src/protocol-validate.mjs).
+// A schema.ts change that emits anything richer would be enforced by the
+// helper's full jsonschema but silently accepted by the plugin — two
+// contracts. Fail generation instead.
+const PLUGIN_VALIDATOR_KEYWORDS = new Set([
+  "type",
+  "const",
+  "enum",
+  "minLength",
+  "minimum",
+  "maximum",
+  "required",
+  "properties",
+  "additionalProperties",
+]);
+
+function assertPluginValidatable(node: unknown, path: string): void {
+  if (!node || typeof node !== "object" || Array.isArray(node)) return;
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (!PLUGIN_VALIDATOR_KEYWORDS.has(key)) {
+      throw new Error(
+        `${path}.${key}: JSON Schema keyword not supported by protocol-validate.mjs — ` +
+          "extend the plugin validator (and this whitelist) before using it in schema.ts",
+      );
+    }
+    if (key === "properties" && value && typeof value === "object") {
+      for (const [prop, propSchema] of Object.entries(value as Record<string, unknown>)) {
+        assertPluginValidatable(propSchema, `${path}.properties.${prop}`);
+      }
+    }
+  }
+}
+
+for (const [table, entries] of Object.entries({ commands: document.commands, events: document.events })) {
+  for (const [name, schema] of Object.entries(entries)) {
+    assertPluginValidatable(schema, `${table}.${name}`);
+  }
+}
+
 const json = JSON.stringify(document, null, 2) + "\n";
 
 writeFileSync(join(here, "mortic.sidepod.v0.schema.json"), json);

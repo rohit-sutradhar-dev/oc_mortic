@@ -20,6 +20,7 @@ from opencode_voice.config import VoiceConfig
 from opencode_voice.logging import RunLogger
 from opencode_voice.protocol import check_event
 from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, SidepodConnection
+from tests.fakes import FakeOpenCodeClient
 
 ENV_WITH_KEYS = {"DEEPGRAM_API_KEY": "audio-key", "INCEPTION_API_KEY": "turn-key"}
 
@@ -35,54 +36,29 @@ class FakeWebSocket:
         self.sent.append(json.loads(text))
 
 
-class LaneFakeClient:
+class LaneFakeClient(FakeOpenCodeClient):
+    """FakeOpenCodeClient plus the turn surface: fork directories, a staged
+    1.17-shaped event stream, and prompt_async."""
+
     def __init__(self, base_url: str = "http://opencode.test") -> None:
-        self.base_url = base_url
-        self.fork_count = 0
-        self.deleted: list[str] = []
-        self.aborted: list[str] = []
+        super().__init__(base_url)
         self.prompts: list[tuple[str, str]] = []
-        self.closed = False
         self._assistant_messages: list[dict[str, Any]] = []
         self._staged_events: list[dict[str, Any]] = []
         self._events_staged = asyncio.Event()
         self.event_directories: list[str | None] = []
 
-    async def close(self) -> None:
-        self.closed = True
-
     async def fork_session(self, session_id: str) -> dict[str, str]:
-        self.fork_count += 1
+        fork = await super().fork_session(session_id)
         # Real forks inherit the source thread's directory (not the server's).
-        return {"id": f"fork_{self.fork_count}", "directory": "/project/source-thread"}
+        return {**fork, "directory": "/project/source-thread"}
 
     async def get_session(self, session_id: str) -> dict[str, Any]:
-        return {
-            "id": session_id,
-            "title": "Source Thread",
-            "tokens": {},
-            "directory": "/project/source-thread",
-        }
-
-    async def switch_model(self, session_id: str, model: Any) -> dict[str, bool]:
-        return {"ok": True}
-
-    async def switch_agent(self, session_id: str, agent: str) -> dict[str, bool]:
-        return {"ok": True}
-
-    async def update_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return payload
+        session = await super().get_session(session_id)
+        return {**session, "directory": "/project/source-thread"}
 
     async def messages(self, session_id: str) -> list[dict[str, Any]]:
         return list(self._assistant_messages)
-
-    async def delete_session(self, session_id: str) -> bool:
-        self.deleted.append(session_id)
-        return True
-
-    async def abort(self, session_id: str) -> bool:
-        self.aborted.append(session_id)
-        return True
 
     def events(self, on_open: Any = None, directory: str | None = None) -> Any:
         self.event_directories.append(directory)
@@ -197,9 +173,6 @@ class FakeNativeSpeaker:
 
     async def close(self) -> None:
         self.audible = False
-
-    async def close(self) -> None:
-        return None
 
 
 class FakeNativeMic:
@@ -601,7 +574,6 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
             await connection.handle_native_audio(b"\x22" * 640)
 
             self.assertEqual(connection.flux.audio, [b"\x00" * 640, b"\x22" * 640])
-            self.assertEqual(connection.mic_gated_frames, 1)
 
     async def test_full_duplex_passes_raw_frames_even_while_speaking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(

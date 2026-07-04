@@ -1,6 +1,4 @@
-import { appendFileSync } from "node:fs";
-
-import { recordServerUrl } from "./host-context.mjs";
+import { appendSmoke, recordServerUrl } from "./host-context.mjs";
 
 const plugin = {
   id: "mortic-sidepod",
@@ -9,17 +7,7 @@ const plugin = {
   // pin the helper to the OpenCode server that owns the focused thread.
   server: async (input) => {
     recordServerUrl(input?.serverUrl);
-    const sink = globalThis.process?.env?.MORTIC_SMOKE_LOG;
-    if (sink) {
-      try {
-        appendFileSync(
-          sink,
-          JSON.stringify({ event: "hook.server-url", present: Boolean(input?.serverUrl) }) + "\n"
-        );
-      } catch {
-        // the smoke sink must never break plugin load
-      }
-    }
+    appendSmoke({ event: "hook.server-url", present: Boolean(input?.serverUrl) });
     return {};
   }
 };

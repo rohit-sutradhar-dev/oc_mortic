@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -30,6 +31,7 @@ from opencode_voice.deepgram import (
 )
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import OpenCodeClient
+from opencode_voice.protocol import PROTOCOL_VERSION as SIDEPOD_PROTOCOL_VERSION
 from opencode_voice.protocol import check_command as check_sidepod_command
 from opencode_voice.protocol import check_event as check_sidepod_event
 from opencode_voice.protocol import schema_document as sidepod_schema_document
@@ -48,7 +50,6 @@ from opencode_voice.state import (
 STATIC_DIR = Path(__file__).with_name("static")
 EPHEMERAL_PREFIX = "[voice tmp]"
 AUDIO_DEPENDENCY_MODULE = "sounddevice"
-SIDEPOD_PROTOCOL_VERSION = "mortic.sidepod.v0"
 # Live capture that produces zero frames within this window is treated as a
 # silently denied mic (macOS TCC denies without any error on some terminals).
 MIC_WATCHDOG_SEC = 4.0
@@ -147,13 +148,17 @@ class NativeMicSession:
         blocksize = max(1, int(self.config.deepgram_sample_rate * 0.08))
 
         def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
-            if self.closed:
+            # PortAudio realtime thread: no blocking calls here — logging does
+            # file I/O and status flags fire exactly when the device is
+            # already stressed, so defer everything to the loop.
+            if self.closed or not self.loop:
                 return
             if status:
-                self.logger.write("native_audio.status", status=str(status))
-            data = bytes(indata)
-            if self.loop:
-                self.loop.call_soon_threadsafe(self.enqueue_audio, data)
+                self.loop.call_soon_threadsafe(log_status, str(status))
+            self.loop.call_soon_threadsafe(self.enqueue_audio, bytes(indata))
+
+        def log_status(status: str) -> None:
+            self.logger.write("native_audio.status", status=status)
 
         try:
             self.stream = sd.RawInputStream(
@@ -315,12 +320,6 @@ class NativeSpeakerSession:
             return
         while not self.closed:
             data = await self.queue.get()
-            if self.on_render:
-                try:
-                    self.on_render(data)
-                except Exception as exc:  # noqa: BLE001 - reference feed must not stop playback.
-                    self.logger.write("native_tts.render_ref.error", error=repr(exc))
-                    self.on_render = None
             try:
                 await asyncio.to_thread(self.write_output, data)
             except Exception as exc:  # noqa: BLE001 - surface playback failures but keep transport alive.
@@ -349,6 +348,15 @@ class NativeSpeakerSession:
                 )
 
     def write_output(self, data: bytes) -> None:
+        # Runs on a worker thread, so the echo-canceller reference feed (~one
+        # FFI round-trip per 10ms frame) stays off the event loop that is
+        # simultaneously servicing mic frames and lane sends.
+        if self.on_render:
+            try:
+                self.on_render(data)
+            except Exception as exc:  # noqa: BLE001 - reference feed must not stop playback.
+                self.logger.write("native_tts.render_ref.error", error=repr(exc))
+                self.on_render = None
         if self.stream:
             self.stream.write(data)
 
@@ -538,7 +546,6 @@ class VoiceConnection:
         self.native_speaker: NativeSpeakerSession | None = None
         self.native_speaker_unavailable = False
         self.echo_canceller: EchoCanceller | None = None
-        self.mic_gated_frames = 0
         self.speak_generation = 0
         self.stale_tts_chunks = 0
         self.tts_unavailable_chunks = 0
@@ -717,7 +724,7 @@ class VoiceConnection:
         self.voice_lane_id = None
         await self.send_json({"type": "stopped"})
 
-    async def start_audio(self, notify_ready: bool = True) -> None:
+    async def start_audio(self) -> None:
         issue = self.config.credential_issue_for("voice_audio")
         if issue:
             await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
@@ -727,11 +734,11 @@ class VoiceConnection:
         self.reset_audio_input_counters()
         self.flux = DeepgramFluxSession(self.config, on_event=self.handle_flux_event)
         await self.flux.start()
-        if notify_ready:
-            await self.send_json({"type": "audio.ready"})
+        # Legacy browser clients render this; the sidepod seam drops it.
+        await self.send_json({"type": "audio.ready"})
 
     async def start_native_audio(self) -> bool:
-        await self.start_audio(notify_ready=False)
+        await self.start_audio()
         if self.closed or self.flux is None or self.native_mic:
             return bool(self.native_mic)
         self.ensure_echo_canceller()
@@ -781,7 +788,6 @@ class VoiceConnection:
                 self.logger.write("audio.aec.error", error=repr(exc))
                 self.echo_canceller = None
         if mode != "full" and self.native_speaker and self.native_speaker.is_audible():
-            self.mic_gated_frames += 1
             return b"\x00" * len(data)
         return data
 
@@ -1266,19 +1272,34 @@ class VoiceConnection:
         async with self.send_lock:
             await self.websocket.send_bytes(data)
 
-    async def barge_in(self, reason: str) -> None:
+    async def interrupt_playback(self, reason: str) -> bool:
+        """Stop the active turn and any speakers; the single owner of the
+        speak-generation bump that keeps stale TTS audio off the wire.
+        Returns True when something was actually cut off."""
         self.speak_generation += 1
+        interrupted = self.active_turn_id is not None or bool(self.speaker or self.native_speaker)
         if self.active_turn_id is not None:
             self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
         self.active_turn_id = None
         if self.speaker:
             await self.speaker.close()
             self.speaker = None
+        if self.native_speaker:
+            await self.native_speaker.close()
+            self.native_speaker = None
+            self.native_speaker_unavailable = False
+        return interrupted
+
+    async def abort_fork_turn(self) -> None:
         if self.fork_session_id:
             try:
                 await self.client.abort(self.fork_session_id)
             except Exception as exc:  # noqa: BLE001 - abort is best-effort during barge-in.
                 self.logger.write("turn.abort.error", session_id=self.fork_session_id, error=repr(exc))
+
+    async def barge_in(self, reason: str) -> None:
+        await self.interrupt_playback(reason)
+        await self.abort_fork_turn()
         await self.send_json({"type": "barge_in", "reason": reason})
 
     async def maybe_wait_for_compaction(self, turn_id: int) -> None:
@@ -1386,6 +1407,17 @@ class VoiceConnection:
                 self.closed = True
 
 
+@dataclass
+class TurnSeam:
+    """Per-turn bookkeeping for translating one legacy engine turn to v0."""
+
+    lane_id: str
+    started_at: float
+    latency: dict[str, Any] = field(default_factory=dict)
+    stream_source: str = "event"
+    assistant_seq: int = 0
+
+
 class SidepodConnection(VoiceConnection):
     """Protocol v0 lane. Every outbound message funnels through the send_json
     override: legacy engine vocabulary is translated to v0, schema-validated,
@@ -1408,11 +1440,9 @@ class SidepodConnection(VoiceConnection):
         self.transcript_seq = 0
         self.speech_started_at: float | None = None
         self.pending_latency: dict[str, Any] = {}
-        self.legacy_turn_ids: dict[int, str] = {}
-        self.turn_started_at: dict[int, float] = {}
-        self.turn_latency: dict[int, dict[str, Any]] = {}
-        self.turn_stream_source: dict[int, str] = {}
-        self.assistant_seq: dict[int, int] = {}
+        # One turn runs at a time; the dict form only tolerates stragglers
+        # from an aborted turn arriving after the next one starts.
+        self.turn_seams: dict[int, TurnSeam] = {}
 
     async def run(self) -> None:
         readiness_issues = helper_readiness_issues(
@@ -1501,22 +1531,9 @@ class SidepodConnection(VoiceConnection):
             )
 
     async def handle_start(self, payload: dict[str, Any]) -> None:
-        requested_version = str(payload.get("protocolVersion") or SIDEPOD_PROTOCOL_VERSION)
-        if requested_version != SIDEPOD_PROTOCOL_VERSION:
-            await self.send_protocol_issue(
-                diagnostic_code="protocol_version_unsupported",
-                safe_detail="Sidepod protocol unsupported",
-                retryable=False,
-            )
-            return
-
-        source_session_id = str(payload.get("sourceSessionId") or payload.get("session_id") or "")
-        if not source_session_id:
-            await self.send_protocol_issue(
-                diagnostic_code="protocol_invalid_message",
-                safe_detail="Source session unavailable",
-            )
-            return
+        # Version and shape are already enforced by handle_control before any
+        # wire message reaches here; handle_refresh builds a conforming payload.
+        source_session_id = str(payload.get("sourceSessionId") or "")
         if self.sidepod_readiness_issues:
             for issue in self.sidepod_readiness_issues:
                 await self.send_json(issue)
@@ -1640,7 +1657,7 @@ class SidepodConnection(VoiceConnection):
 
     async def handle_ptt_stop(self, payload: dict[str, Any]) -> None:
         turn_id = str(payload.get("turnId") or "")
-        if turn_id and getattr(self, "protocol_turn_id", None) == turn_id:
+        if turn_id and self.protocol_turn_id == turn_id:
             await self.barge_in(reason=str(payload.get("reason") or "ptt.stop"))
             self.protocol_turn_id = ""
 
@@ -1661,24 +1678,13 @@ class SidepodConnection(VoiceConnection):
 
     async def stop(self) -> None:
         self.cancel_mic_watchdog()
-        self.speak_generation += 1
         await self.stop_audio(reason="sidepod_stop")
         if self.turn_task and not self.turn_task.done():
             self.turn_task.cancel()
-        self.active_turn_id = None
-        if self.speaker:
-            await self.speaker.close()
-            self.speaker = None
-        if self.native_speaker:
-            await self.native_speaker.close()
-            self.native_speaker = None
-            self.native_speaker_unavailable = False
-        if self.fork_session_id and not self.keep_fork:
-            fork_id = self.fork_session_id
-            await self.client.delete_session(fork_id)
-            self.logger.write("fork.delete", session_id=fork_id)
-        self.fork_session_id = None
-        self.voice_lane_id = None
+        await self.interrupt_playback("sidepod_stop")
+        # The parent's legacy `stopped` message dies at the translation seam;
+        # the v0 ack is handle_stop's job.
+        await super().stop()
         self.protocol_turn_id = ""
         self.pending_turn_id = None
 
@@ -1733,28 +1739,12 @@ class SidepodConnection(VoiceConnection):
             self.logger.write("audio.aec.delay.error", error=repr(exc))
 
     async def barge_in(self, reason: str) -> None:
-        self.speak_generation += 1
-        turn_id = getattr(self, "protocol_turn_id", "") or None
+        turn_id = self.protocol_turn_id or None
         # `interrupted` means something was actually cut off; a speech.start
         # with no active turn or speech is just the user starting to talk.
-        interrupted_something = self.active_turn_id is not None or bool(self.speaker or self.native_speaker)
-        if self.active_turn_id is not None:
-            self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
-        self.active_turn_id = None
-        if self.speaker:
-            await self.speaker.close()
-            self.speaker = None
-        if self.native_speaker:
-            await self.native_speaker.close()
-            self.native_speaker = None
-            self.native_speaker_unavailable = False
-        if not interrupted_something:
+        if not await self.interrupt_playback(reason):
             return
-        if self.fork_session_id:
-            try:
-                await self.client.abort(self.fork_session_id)
-            except Exception as exc:  # noqa: BLE001 - abort is best-effort during barge-in.
-                self.logger.write("turn.abort.error", session_id=self.fork_session_id, error=repr(exc))
+        await self.abort_fork_turn()
         payload: dict[str, Any] = {"type": "interrupted", "sentAt": iso_utc_now(), "reason": reason}
         if self.voice_lane_id:
             payload["voiceLaneId"] = self.voice_lane_id
@@ -1821,6 +1811,9 @@ class SidepodConnection(VoiceConnection):
 
     def translate_to_v0(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         message_type = str(payload.get("type") or "")
+        # v0-native payloads (lane handlers and base-class issue plumbing both
+        # emit them) pass through; the discriminator against same-named legacy
+        # messages is `sentAt`, which no legacy message may ever carry.
         if message_type in self.lane_event_types and "sentAt" in payload:
             return payload
         if message_type == "turn.start":
@@ -1828,10 +1821,10 @@ class SidepodConnection(VoiceConnection):
         if message_type == "assistant.delta":
             return self.translate_assistant_delta(payload)
         if message_type == "assistant.first_text":
-            legacy_id = int(payload.get("turn_id") or 0)
+            seam = self.turn_seams.get(int(payload.get("turn_id") or 0))
             latency_ms = payload.get("latency_ms")
-            if isinstance(latency_ms, (int, float)):
-                self.turn_latency.setdefault(legacy_id, {})["firstAssistantTextMs"] = latency_ms
+            if seam and isinstance(latency_ms, (int, float)):
+                seam.latency["firstAssistantTextMs"] = latency_ms
             return None
         if message_type == "tts.first_audio":
             return self.translate_tts_first_audio(payload)
@@ -1840,8 +1833,9 @@ class SidepodConnection(VoiceConnection):
         if message_type in ("turn.error", "turn.timeout"):
             return self.translate_turn_failure(payload)
         if message_type == "opencode.stream.fallback":
-            legacy_id = int(payload.get("turn_id") or 0)
-            self.turn_stream_source[legacy_id] = "poll_after_event" if payload.get("prompt_sent") else "poll"
+            seam = self.turn_seams.get(int(payload.get("turn_id") or 0))
+            if seam:
+                seam.stream_source = "poll_after_event" if payload.get("prompt_sent") else "poll"
             return None
         if message_type == "error":
             return voice_bridge_issue_payload(
@@ -1854,19 +1848,20 @@ class SidepodConnection(VoiceConnection):
         return None
 
     def lane_turn_id(self, legacy_id: int) -> str:
-        return self.legacy_turn_ids.get(legacy_id) or f"turn_legacy_{legacy_id}"
+        seam = self.turn_seams.get(legacy_id)
+        return seam.lane_id if seam else f"turn_legacy_{legacy_id}"
 
     def translate_turn_start(self, payload: dict[str, Any]) -> dict[str, Any]:
         legacy_id = int(payload.get("turn_id") or 0)
         lane_id = self.ensure_pending_turn()
-        self.legacy_turn_ids[legacy_id] = lane_id
         self.pending_turn_id = None
         self.protocol_turn_id = lane_id
-        self.turn_started_at[legacy_id] = time.perf_counter()
-        self.turn_latency[legacy_id] = dict(self.pending_latency)
+        self.turn_seams[legacy_id] = TurnSeam(
+            lane_id=lane_id,
+            started_at=time.perf_counter(),
+            latency=dict(self.pending_latency),
+        )
         self.pending_latency = {}
-        self.assistant_seq[legacy_id] = 0
-        self.turn_stream_source[legacy_id] = "event"
         out: dict[str, Any] = {
             "type": "thinking",
             "sentAt": iso_utc_now(),
@@ -1880,18 +1875,20 @@ class SidepodConnection(VoiceConnection):
 
     def translate_assistant_delta(self, payload: dict[str, Any]) -> dict[str, Any]:
         legacy_id = int(payload.get("turn_id") or 0)
-        self.assistant_seq[legacy_id] = self.assistant_seq.get(legacy_id, 0) + 1
+        seam = self.turn_seams.get(legacy_id)
+        if seam:
+            seam.assistant_seq += 1
         return {
             "type": "assistant.delta",
             "sentAt": iso_utc_now(),
             "turnId": self.lane_turn_id(legacy_id),
-            "sequence": self.assistant_seq[legacy_id],
+            "sequence": seam.assistant_seq if seam else 1,
             "delta": str(payload.get("delta") or ""),
         }
 
     def translate_tts_first_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
         legacy_id = int(payload.get("turn_id") or 0)
-        started = self.turn_started_at.get(legacy_id)
+        seam = self.turn_seams.get(legacy_id)
         out: dict[str, Any] = {
             "type": "speaking",
             "sentAt": iso_utc_now(),
@@ -1899,25 +1896,25 @@ class SidepodConnection(VoiceConnection):
         }
         if self.voice_lane_id:
             out["voiceLaneId"] = self.voice_lane_id
-        if started is not None:
-            first_audio_ms = elapsed_ms(started)
-            self.turn_latency.setdefault(legacy_id, {})["firstAudioMs"] = first_audio_ms
+        if seam:
+            first_audio_ms = elapsed_ms(seam.started_at)
+            seam.latency["firstAudioMs"] = first_audio_ms
             out["firstAudioLatencyMs"] = first_audio_ms
         return out
 
     def translate_turn_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         legacy_id = int(payload.get("turn_id") or 0)
-        lane_id = self.lane_turn_id(legacy_id)
+        seam = self.turn_seams.pop(legacy_id, None)
+        lane_id = seam.lane_id if seam else f"turn_legacy_{legacy_id}"
         latency = {
             key: value
-            for key, value in self.turn_latency.get(legacy_id, {}).items()
+            for key, value in (seam.latency if seam else {}).items()
             if isinstance(value, (int, float))
         }
         total_ms = payload.get("latency_ms")
         if isinstance(total_ms, (int, float)):
             latency["totalMs"] = total_ms
-        stream_source = self.turn_stream_source.get(legacy_id, "event")
-        self.cleanup_turn_state(legacy_id)
+        stream_source = seam.stream_source if seam else "event"
         self.logger.write("sidepod.turn.latency", turn_id=lane_id, stream_source=stream_source, **latency)
         return {
             "type": "complete",
@@ -1928,11 +1925,10 @@ class SidepodConnection(VoiceConnection):
         }
 
     def translate_turn_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
-        legacy_id = int(payload.get("turn_id") or 0)
         timed_out = payload.get("type") == "turn.timeout"
         if timed_out:
             # A timed-out turn gets no turn.complete, so drop its seam state here.
-            self.cleanup_turn_state(legacy_id)
+            self.turn_seams.pop(int(payload.get("turn_id") or 0), None)
         return voice_bridge_issue_payload(
             capability="voice_turns",
             diagnostic_code="turn_timeout" if timed_out else "turn_failed",
@@ -1940,13 +1936,6 @@ class SidepodConnection(VoiceConnection):
             debug_ref=str(self.logger.run_dir),
             voice_lane_id=self.voice_lane_id,
         )
-
-    def cleanup_turn_state(self, legacy_id: int) -> None:
-        self.turn_started_at.pop(legacy_id, None)
-        self.turn_latency.pop(legacy_id, None)
-        self.turn_stream_source.pop(legacy_id, None)
-        self.assistant_seq.pop(legacy_id, None)
-        self.legacy_turn_ids.pop(legacy_id, None)
 
     async def send_protocol_issue(
         self,

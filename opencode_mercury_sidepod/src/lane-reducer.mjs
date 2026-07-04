@@ -7,8 +7,6 @@
 
 export function createLaneState() {
   return {
-    laneId: null,
-    forkSessionId: null,
     activeTurnId: null,
     transcriptSeq: 0,
     deltaSeq: 0,
@@ -16,12 +14,10 @@ export function createLaneState() {
   };
 }
 
-const AUDIO_ISSUE_HINTS = ["mic", "audio"];
-
+// The engine tags every issue payload with the capability it degrades
+// (voice_bridge_issue_payload in the helper); audio problems mute the mic.
 function isAudioIssue(event) {
-  const code = String(event.diagnosticCode ?? "");
-  const capability = String(event.capability ?? "");
-  return AUDIO_ISSUE_HINTS.some((hint) => code.includes(hint) || capability.includes(hint));
+  return event.capability === "voice_audio";
 }
 
 /**
@@ -33,7 +29,7 @@ export function reduceLaneEvent(state, event) {
   const type = event?.type;
   if (type === "ready") {
     return {
-      state: { ...createLaneState(), laneId: event.voiceLaneId, forkSessionId: event.forkSessionId ?? null },
+      state: createLaneState(),
       ui: {
         status: "ready",
         assistantText: "Voice lane ready. Tap M to talk.",

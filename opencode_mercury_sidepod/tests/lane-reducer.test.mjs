@@ -92,6 +92,7 @@ test("audio-capability issues flip the mic back to muted, others do not", () => 
     userMessage: "Voice Bridge Issue",
     safeDetail: "Mic permission needed",
     diagnosticCode: "mic_permission_needed",
+    capability: "voice_audio",
     retryable: true
   });
   assert.equal(audio.ui.micLive, false);
@@ -103,6 +104,7 @@ test("audio-capability issues flip the mic back to muted, others do not", () => 
     sentAt: at,
     userMessage: "Voice Bridge Issue",
     diagnosticCode: "turn_failed",
+    capability: "voice_turns",
     retryable: true
   });
   assert.equal("micLive" in turn.ui, false);
@@ -110,10 +112,10 @@ test("audio-capability issues flip the mic back to muted, others do not", () => 
 
 test("stopped resets the lane and unknown events are ignored", () => {
   const stopped = reduceLaneEvent(
-    { ...createLaneState(), laneId: "lane_1", activeTurnId: "turn_0001" },
+    { ...createLaneState(), activeTurnId: "turn_0001" },
     { type: "stopped", sentAt: at, reason: "user.end_session", forkDeleted: true }
   );
-  assert.equal(stopped.state.laneId, null);
+  assert.equal(stopped.state.activeTurnId, null);
   assert.equal(stopped.ui.micLive, false);
   assert.equal(stopped.ui.status, "ended");
 

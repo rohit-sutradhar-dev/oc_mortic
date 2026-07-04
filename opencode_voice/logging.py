@@ -51,6 +51,17 @@ class RunLogger:
         self.run_dir = Path(root) / utc_timestamp()
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.run_dir / "events.jsonl"
+        # Line-buffered handles held open for the logger's lifetime: write()
+        # runs per event on the voice hot path, so no per-record open/close,
+        # and the mirror env cannot change mid-process.
+        self._handle = self.path.open("a", encoding="utf-8", buffering=1)
+        self._mirror = None
+        mirror_path = helper_event_log_path()
+        if mirror_path:
+            try:
+                self._mirror = Path(mirror_path).open("a", encoding="utf-8", buffering=1)
+            except OSError:
+                self._mirror = None
 
     def write(self, event: str, **fields: Any) -> None:
         record = {
@@ -59,15 +70,12 @@ class RunLogger:
             **fields,
         }
         line = json.dumps(redact_secrets(safe_log_fields(record)), ensure_ascii=False, default=str) + "\n"
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-        mirror_path = helper_event_log_path()
-        if mirror_path:
+        self._handle.write(line)
+        if self._mirror is not None:
             try:
-                with Path(mirror_path).open("a", encoding="utf-8") as handle:
-                    handle.write(line)
+                self._mirror.write(line)
             except OSError:
-                pass
+                self._mirror = None
 
     def state_transition(self, from_state: str, to_state: str, **fields: Any) -> None:
         self.write("state.transition", from_state=from_state, to_state=to_state, **fields)

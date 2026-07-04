@@ -31,50 +31,7 @@ from opencode_voice.state import (
     session_context_tokens,
     session_usage_tokens,
 )
-
-
-class FakeOpenCodeClient:
-    def __init__(self) -> None:
-        self.fork_count = 0
-        self.deleted: list[str] = []
-        self.aborted: list[str] = []
-        self.closed = False
-
-    async def close(self) -> None:
-        self.closed = True
-
-    async def health(self) -> dict[str, bool]:
-        return {"ok": True}
-
-    async def list_sessions(self) -> list[dict[str, object]]:
-        return []
-
-    async def fork_session(self, session_id: str) -> dict[str, str]:
-        self.fork_count += 1
-        return {"id": f"fork_{self.fork_count}"}
-
-    async def get_session(self, session_id: str) -> dict[str, object]:
-        return {"id": session_id, "title": "Source Thread", "tokens": {}}
-
-    async def switch_model(self, session_id: str, model: ModelRef) -> dict[str, bool]:
-        return {"ok": True}
-
-    async def switch_agent(self, session_id: str, agent: str) -> dict[str, bool]:
-        return {"ok": True}
-
-    async def update_session(self, session_id: str, payload: dict[str, object]) -> dict[str, object]:
-        return payload
-
-    async def messages(self, session_id: str) -> list[dict[str, object]]:
-        return []
-
-    async def delete_session(self, session_id: str) -> bool:
-        self.deleted.append(session_id)
-        return True
-
-    async def abort(self, session_id: str) -> bool:
-        self.aborted.append(session_id)
-        return True
+from tests.fakes import FakeOpenCodeClient
 
 
 class MercuryConfigTests(unittest.TestCase):

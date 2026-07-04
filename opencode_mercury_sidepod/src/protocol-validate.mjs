@@ -40,6 +40,16 @@ function validateNode(schema, value, path, errors) {
     errors.push(`${path}: shorter than ${schema.minLength}`);
     return;
   }
+  if (typeof value === "number") {
+    if (schema.minimum !== undefined && value < schema.minimum) {
+      errors.push(`${path}: below minimum ${schema.minimum}`);
+      return;
+    }
+    if (schema.maximum !== undefined && value > schema.maximum) {
+      errors.push(`${path}: above maximum ${schema.maximum}`);
+      return;
+    }
+  }
   if (schema.type === "object") {
     for (const field of schema.required ?? []) {
       if (!(field in value)) errors.push(`${path}.${field}: missing required field`);
