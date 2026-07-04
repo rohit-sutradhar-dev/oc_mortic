@@ -829,6 +829,53 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(connection.active_turn_id)
             self.assertEqual(started, ["no wait, look at the tests instead"])
 
+    async def test_dismissed_transcripts_final_copy_never_becomes_a_turn(self) -> None:
+        # The regression from run 20260704T093645Z: the eager copy of an echo
+        # was correctly dismissed, then its confirming final speech.end
+        # arrived 30ms later on the ordinary path and became a ghost turn.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = "Sure, I can walk you through the config file changes now."
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "walk you through", "eager": True}
+            )
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "walk you through", "eager": False}
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, [])
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertFalse(speaker.paused)
+
+    async def test_short_reply_in_silence_is_admitted(self) -> None:
+        # The tiny/echo floors only apply while the assistant is audible;
+        # "Yes." in silence is a legitimate turn.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            connection.spoken_text_recent = "Should I apply the change? Yes or no."
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "Yes.", "eager": False})
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, ["Yes."])
+
     async def test_confirm_deadline_expiry_resumes_playback(self) -> None:
         import dataclasses
 

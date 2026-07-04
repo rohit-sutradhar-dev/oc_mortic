@@ -621,6 +621,8 @@ class VoiceConnection:
         self.final_transcript = ""
         self.eager_turn_text: str | None = None
         self.spoken_text_recent = ""
+        self.dismissed_transcript: str | None = None
+        self.dismissed_at = 0.0
         self.barge_pending = False
         self.pending_barge_task: asyncio.Task[None] | None = None
         self.aec_delay_error_logged = False
@@ -986,23 +988,72 @@ class VoiceConnection:
             self.final_transcript = ""
             eager = bool(event.get("eager"))
             self.logger.write("speech.end", transcript_chars=len(transcript), eager=eager)
+            await self.handle_transcript(transcript, eager=eager)
+
+    async def handle_transcript(self, transcript: str, eager: bool) -> None:
+        """The single admission path for every voice transcript. The verdict
+        both decides whether a turn starts and resolves any paused playback,
+        so eager/final duplicates and echo cannot slip in through one code
+        path while another filters them."""
+        verdict, detail = self.transcript_verdict(transcript, eager)
+        if verdict == "admit":
             if self.barge_pending:
-                confirmed = await self.resolve_pending_barge_in(transcript, reason="speech_end")
-                if not confirmed:
-                    return
-            if not transcript:
-                return
-            if not eager and self.eager_turn_text == transcript:
-                # The final EOT that confirms an in-flight eager turn: same
-                # words, turn already running — restarting only adds latency.
-                self.logger.write(
-                    "speech.end.confirmed",
-                    turn_id=self.active_turn_id,
-                    transcript_chars=len(transcript),
-                )
-                self.eager_turn_text = None
-                return
+                self.clear_pending_barge_in()
+                self.logger.write("barge_in.confirmed", transcript_chars=len(transcript))
+                await self.barge_in(reason="speech_confirmed")
+                await self.maybe_start_compaction(reason="speech_confirmed", run_in_background=True)
+            elif self.native_speaker and self.native_speaker.is_audible():
+                # No pause in flight but stale audio is still playing (e.g. a
+                # timeout resumed it): the new turn supersedes that playback.
+                await self.interrupt_playback("new_turn")
             await self.enqueue_text_turn(transcript, source="voice", eager=eager)
+            return
+        self.logger.write("transcript.rejected", verdict=verdict, transcript_chars=len(transcript), **detail)
+        if verdict in ("tiny", "echo"):
+            # The confirming final speech.end repeats the same words moments
+            # later; remember the dismissal so it cannot re-enter as a turn.
+            self.dismissed_transcript = transcript
+            self.dismissed_at = time.perf_counter()
+        if verdict == "confirmed_eager":
+            self.eager_turn_text = None
+        if self.barge_pending:
+            self.dismiss_pending_barge_in(verdict)
+
+    def transcript_verdict(self, transcript: str, eager: bool) -> tuple[str, dict[str, Any]]:
+        """Classify a transcript: "admit" starts a turn, anything else drops it.
+
+        empty            nothing was said
+        duplicate        repeats a transcript rejected moments ago (Flux sends
+                         eager + final copies of the same utterance)
+        confirmed_eager  the final EOT matching the in-flight eager turn —
+                         the turn is already running, restarting adds latency
+        tiny             below the length floor while the assistant is audible
+        echo             mostly the assistant's own recent words while audible
+                         (a length gate cannot tell echo from a user: live run
+                         had 9-13 char echo fragments confirm 5 interrupts)
+
+        The tiny/echo rules apply only while playback is audible: in silence
+        a short "Yes." is a legitimate reply and overlap with the previous
+        answer is meaningless.
+        """
+        if not transcript:
+            return "empty", {}
+        if (
+            self.dismissed_transcript == transcript
+            and time.perf_counter() - self.dismissed_at < 3.0
+        ):
+            return "duplicate", {}
+        if not eager and self.eager_turn_text == transcript:
+            return "confirmed_eager", {"turn_id": self.active_turn_id}
+        if self.native_speaker and self.native_speaker.is_audible():
+            if len(transcript) < self.config.barge_in_min_chars:
+                return "tiny", {}
+            words = transcript_words(transcript)
+            spoken = set(transcript_words(self.spoken_text_recent))
+            overlap = sum(word in spoken for word in words) / len(words) if words else 0.0
+            if len(words) >= 2 and overlap >= 0.75:
+                return "echo", {"overlap": round(overlap, 2)}
+        return "admit", {}
 
     def begin_pending_barge_in(self) -> None:
         self.barge_pending = True
@@ -1019,7 +1070,8 @@ class VoiceConnection:
 
     async def expire_pending_barge_in(self) -> None:
         await asyncio.sleep(self.config.barge_in_confirm_sec)
-        await self.resolve_pending_barge_in(transcript=None, reason="timeout")
+        if self.barge_pending:
+            self.dismiss_pending_barge_in("timeout")
 
     def clear_pending_barge_in(self) -> None:
         self.barge_pending = False
@@ -1028,38 +1080,11 @@ class VoiceConnection:
             task.cancel()
         self.pending_barge_task = None
 
-    async def resolve_pending_barge_in(self, transcript: str | None, reason: str) -> bool:
-        """Decide a paused-playback interruption: True means it was real and
-        the turn was torn down; False resumed playback (false alarm)."""
-        if not self.barge_pending:
-            return True
+    def dismiss_pending_barge_in(self, verdict: str) -> None:
         self.clear_pending_barge_in()
-        if transcript and len(transcript) >= self.config.barge_in_min_chars:
-            # A transcript whose words are mostly the assistant's own recent
-            # speech is echo the canceller missed, not the user — a length
-            # gate can't tell them apart (live run: 9-13 char echo fragments
-            # "confirmed" five interrupts in a row and chained into turns).
-            words = transcript_words(transcript)
-            spoken = set(transcript_words(self.spoken_text_recent))
-            overlap = sum(word in spoken for word in words) / len(words) if words else 0.0
-            if len(words) >= 2 and overlap >= 0.75:
-                self.logger.write(
-                    "barge_in.echo",
-                    reason=reason,
-                    transcript_chars=len(transcript),
-                    overlap=round(overlap, 2),
-                )
-                if self.native_speaker:
-                    self.native_speaker.resume()
-                return False
-            self.logger.write("barge_in.confirmed", reason=reason, transcript_chars=len(transcript))
-            await self.barge_in(reason="speech_confirmed")
-            await self.maybe_start_compaction(reason="speech_confirmed", run_in_background=True)
-            return True
-        self.logger.write("barge_in.false_alarm", reason=reason, transcript_chars=len(transcript or ""))
+        self.logger.write("barge_in.false_alarm", verdict=verdict)
         if self.native_speaker:
             self.native_speaker.resume()
-        return False
 
     async def enqueue_text_turn(self, text: str, source: str, eager: bool = False) -> None:
         issue = self.config.credential_issue_for("voice_turns")
