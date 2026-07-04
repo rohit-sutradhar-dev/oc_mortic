@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -582,9 +584,37 @@ class OpenCodeEventTurnTrackerTests(unittest.TestCase):
         self.assertEqual(update.deltas, [])
         self.assertEqual(update.full_text, "")
 
-    def test_completes_on_session_idle(self) -> None:
+    def test_completes_on_session_idle_after_assistant_message(self) -> None:
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
+        tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
+            }
+        )
+
+        update = tracker.update({"type": "session.idle", "properties": {"sessionID": "ses_1"}})
+
+        self.assertTrue(update.completed)
+        self.assertEqual(tracker.stale_idles, 0)
+
+    def test_idle_before_any_assistant_message_is_stale_not_completion(self) -> None:
+        # A session.idle left over from the previous (aborted) turn can arrive
+        # on the new turn's subscription before our prompt produces anything;
+        # honoring it used to force the poll fallback with an empty turn.
         tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
 
+        stale = tracker.update({"type": "session.idle", "properties": {"sessionID": "ses_1"}})
+
+        self.assertFalse(stale.completed)
+        self.assertEqual(tracker.stale_idles, 1)
+
+        tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
+            }
+        )
         update = tracker.update({"type": "session.idle", "properties": {"sessionID": "ses_1"}})
 
         self.assertTrue(update.completed)
@@ -723,6 +753,73 @@ class TTSTests(unittest.TestCase):
 
         self.assertEqual(spoken, "Done.")
         self.assertEqual(filter_.flush(), "I am still forming the next sentence")
+
+
+class NativeSpeakerPlaybackTests(unittest.IsolatedAsyncioTestCase):
+    """Playback buffering: TTS delivers faster than realtime, so play() must
+    apply backpressure instead of dropping audio (one live turn lost 3.8s of
+    speech to queue overflow), and pause/resume must hold chunks intact."""
+
+    def make_speaker(self, tmp: str, maxsize: int) -> Any:
+        from opencode_voice.server import NativeSpeakerSession
+
+        speaker = NativeSpeakerSession(
+            config=VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
+            logger=RunLogger(root=tmp),
+            on_issue=self._no_issue,
+        )
+        # Wired by hand: no sounddevice stream (write_output becomes a no-op),
+        # which exercises the queue/pump machinery exactly as production does.
+        speaker.queue = asyncio.Queue(maxsize=maxsize)
+        speaker.pump_task = asyncio.create_task(speaker.pump())
+        return speaker
+
+    @staticmethod
+    async def _no_issue(payload: dict[str, object]) -> None:
+        return None
+
+    async def test_fast_producer_loses_no_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            speaker = self.make_speaker(tmp, maxsize=2)
+            for index in range(20):
+                self.assertTrue(await speaker.play(bytes([index]) * 320, turn_id=1))
+            while speaker.played_chunks < 20:
+                await asyncio.sleep(0.001)
+            await speaker.close()
+
+            self.assertEqual(speaker.played_chunks, 20)
+            self.assertEqual(speaker.dropped_chunks, 0)
+
+    async def test_close_unblocks_a_pending_put_and_counts_teardown_discard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # maxsize=1: the paused pump holds the first chunk, the second
+            # fills the queue, so the third put genuinely blocks.
+            speaker = self.make_speaker(tmp, maxsize=1)
+            speaker.pause()
+            await speaker.play(b"\x01" * 320, turn_id=1)
+            await speaker.play(b"\x02" * 320, turn_id=1)
+            blocked = asyncio.create_task(speaker.play(b"\x03" * 320, turn_id=1))
+            await asyncio.sleep(0.01)
+            self.assertFalse(blocked.done())
+
+            await speaker.close()
+
+            self.assertFalse(await blocked)  # woke up and reported closed
+            self.assertGreaterEqual(speaker.dropped_chunks, 1)  # teardown discard only
+
+    async def test_pause_holds_playback_and_resume_releases_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            speaker = self.make_speaker(tmp, maxsize=8)
+            speaker.pause()
+            await speaker.play(b"\x01" * 320, turn_id=1)
+            await asyncio.sleep(0.02)
+            self.assertEqual(speaker.played_chunks, 0)
+
+            speaker.resume()
+            while speaker.played_chunks < 1:
+                await asyncio.sleep(0.001)
+            self.assertEqual(speaker.played_chunks, 1)
+            await speaker.close()
 
 
 if __name__ == "__main__":

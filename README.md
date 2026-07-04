@@ -41,6 +41,8 @@ mortic-helper --managed-opencode --opencode-dir "/path/to/project"
 mortic-helper --context-threshold 70000 --model-variant low
 mortic-helper --eager-eot-threshold 0.7   # default 0.6; pass 0 to disable
 mortic-helper --voice-duplex full          # headphones: skip echo protection
+mortic-helper --barge-in-confirm-sec 2.0  # pause window while a mid-playback voice confirms
+mortic-helper --barge-in-min-chars 4      # shorter transcripts resume playback instead
 ```
 
 ## Echo Protection
@@ -53,6 +55,14 @@ hears itself and voice barge-in stays usable on open speakers.
 canceller and degrades to a half-duplex silence gate if the native module is
 unavailable, `full` passes raw mic audio (headphone users), `half` forces the
 gate (mute key interrupts while the assistant speaks).
+
+Two behaviors keep the loop stable on open speakers. A voice detected while
+the assistant is audible **pauses** playback rather than killing the turn;
+a real transcript within `--barge-in-confirm-sec` commits the interruption,
+anything shorter than `--barge-in-min-chars` (echo residue, stray noise)
+resumes playback where it left off. And when Flux fires an eager end-of-turn
+followed by the confirming final one for the same words, the final confirms
+the already-running turn instead of restarting it.
 
 Turns stream from OpenCode's `/event` feed scoped to the fork's directory
 (forks inherit the source thread's directory; an unscoped subscription never

@@ -128,6 +128,11 @@ class VoiceConfig:
     # gate the mic while TTS is audible. "full": raw passthrough (headphones).
     # "half": force the gate.
     voice_duplex: str = "auto"
+    # speech.start while TTS is audible pauses playback and waits this long
+    # for a transcript before deciding interrupt vs false alarm; transcripts
+    # shorter than barge_in_min_chars resume playback instead of interrupting.
+    barge_in_confirm_sec: float = 2.0
+    barge_in_min_chars: int = 4
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False

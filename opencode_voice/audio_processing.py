@@ -55,11 +55,25 @@ class EchoCanceller:
         )
         self.capture_slicer = FrameSlicer(sample_rate)
         self.render_slicer = FrameSlicer(sample_rate)
+        self.stream_delay_ms: int | None = None
+        self.delay_error: str | None = None
+
+    def set_stream_delay_ms(self, delay_ms: int) -> None:
+        # WebRTC accepts 0-500ms and wants the value re-asserted alongside
+        # every process_stream call, so we only store it here and apply it
+        # per frame in process_capture (livekit's media_devices does the same).
+        self.stream_delay_ms = min(500, max(0, int(delay_ms)))
 
     def process_capture(self, data: bytes) -> bytes:
         out = bytearray()
         for frame_bytes in self.capture_slicer.push(data):
             frame = self._rtc.AudioFrame(frame_bytes, self.sample_rate, 1, self.samples_per_frame)
+            if self.stream_delay_ms is not None:
+                try:
+                    self.apm.set_stream_delay_ms(self.stream_delay_ms)
+                except Exception as exc:  # noqa: BLE001 - delay hint is an optimization only.
+                    if self.delay_error is None:
+                        self.delay_error = repr(exc)
             self.apm.process_stream(frame)
             out.extend(frame_bytes)
         return bytes(out)
@@ -68,6 +82,3 @@ class EchoCanceller:
         for frame_bytes in self.render_slicer.push(data):
             frame = self._rtc.AudioFrame(frame_bytes, self.sample_rate, 1, self.samples_per_frame)
             self.apm.process_reverse_stream(frame)
-
-    def set_stream_delay_ms(self, delay_ms: int) -> None:
-        self.apm.set_stream_delay_ms(max(0, int(delay_ms)))

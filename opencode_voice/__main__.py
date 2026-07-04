@@ -60,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         deepgram_sample_rate=args.sample_rate,
         flux_eager_eot_threshold=args.eager_eot_threshold or None,
         voice_duplex=args.voice_duplex,
+        barge_in_confirm_sec=args.barge_in_confirm_sec,
+        barge_in_min_chars=args.barge_in_min_chars,
         opencode_agent=args.agent,
         voice_agent_prompt_path=args.voice_agent_prompt,
         keep_fork_default=args.keep_fork,
@@ -126,6 +128,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "available and gate otherwise, full = raw passthrough (headphones), "
             "half = always gate."
         ),
+    )
+    parser.add_argument(
+        "--barge-in-confirm-sec",
+        type=float,
+        default=2.0,
+        help="How long a speech.start during playback pauses audio while waiting for a transcript.",
+    )
+    parser.add_argument(
+        "--barge-in-min-chars",
+        type=int,
+        default=4,
+        help="Transcripts shorter than this during playback resume audio instead of interrupting.",
     )
     parser.add_argument("--keep-fork", action="store_true", help="Keep ephemeral forks by default.")
     parser.add_argument("--print-config", action="store_true", help="Print the generated OpenCode config overlay.")

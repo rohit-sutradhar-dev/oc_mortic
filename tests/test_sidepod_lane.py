@@ -158,6 +158,7 @@ class FakeNativeSpeaker:
         self.played: list[bytes] = []
         self.on_render = on_render
         self.audible = False
+        self.paused = False
 
     async def start(self) -> bool:
         return True
@@ -171,12 +172,19 @@ class FakeNativeSpeaker:
     def is_audible(self, tail_sec: float = 0.3) -> bool:
         return self.audible
 
+    def pause(self) -> None:
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
+
     async def close(self) -> None:
         self.audible = False
 
 
 class FakeNativeMic:
     ok = True
+    input_delay_sec = 0.0
 
     def __init__(self, config: Any, logger: Any, on_audio: Any, on_issue: Any) -> None:
         self.on_issue = on_issue
@@ -528,6 +536,8 @@ class FakeEchoCanceller:
         self.sample_rate = sample_rate
         self.captured: list[bytes] = []
         self.rendered: list[bytes] = []
+        self.delays: list[int] = []
+        self.delay_error: str | None = None
 
     def process_capture(self, data: bytes) -> bytes:
         self.captured.append(data)
@@ -537,7 +547,7 @@ class FakeEchoCanceller:
         self.rendered.append(data)
 
     def set_stream_delay_ms(self, delay_ms: int) -> None:
-        return None
+        self.delays.append(delay_ms)
 
 
 class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
@@ -622,6 +632,166 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
             await stale_speaker.on_audio(b"\x01\x02", 1)
             self.assertIsNone(connection.native_speaker)
             self.assertEqual(connection.stale_tts_chunks, 1)
+
+
+class EagerTurnConfirmTests(unittest.IsolatedAsyncioTestCase):
+    """Flux fires an eager end-of-turn and then a confirming final one for the
+    same utterance milliseconds later; the final must confirm the running
+    turn, not restart it (24 new_turn aborts per session before this)."""
+
+    def hold_turns(self, connection: SidepodConnection) -> tuple[list[str], asyncio.Event]:
+        started: list[str] = []
+        release = asyncio.Event()
+
+        async def fake_turn(text: str, source: str, eager: bool) -> None:
+            started.append(text)
+            await release.wait()
+
+        connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+        return started, release
+
+    async def test_final_speech_end_with_same_transcript_confirms_the_eager_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            started, release = self.hold_turns(connection)
+
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "what time is it", "eager": True})
+            await asyncio.sleep(0)
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "what time is it", "eager": False})
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, ["what time is it"])
+            self.assertEqual(client.aborted, [])
+            release.set()
+
+    async def test_final_speech_end_with_longer_transcript_restarts_the_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            started, release = self.hold_turns(connection)
+
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "what time", "eager": True})
+            await asyncio.sleep(0)
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "what time is it in tokyo", "eager": False}
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, ["what time", "what time is it in tokyo"])
+            release.set()
+
+    async def test_speech_resumed_still_cancels_the_eager_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            started, release = self.hold_turns(connection)
+
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "so what", "eager": True})
+            await asyncio.sleep(0)
+            connection.active_turn_id = 1
+            await connection.handle_flux_event({"type": "speech.resumed"})
+            # The eager prompt must not be treated as confirmable afterwards.
+            self.assertIsNone(connection.eager_turn_text)
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "so what", "eager": False})
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, ["so what", "so what"])
+            release.set()
+
+
+class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
+    """speech.start during audible playback pauses instead of killing the
+    turn; the transcript decides interrupt vs false alarm."""
+
+    def audible_speaker(self, connection: SidepodConnection) -> FakeNativeSpeaker:
+        # A canceller must be present or duplex "auto" resolves to the
+        # half-duplex gate, which swallows speech events while audible.
+        connection.echo_canceller = FakeEchoCanceller(16_000)  # type: ignore[assignment]
+        speaker = FakeNativeSpeaker(None, None, None)
+        speaker.audible = True
+        connection.native_speaker = speaker
+        return speaker
+
+    async def test_speech_start_during_playback_pauses_without_aborting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+
+            await connection.handle_flux_event({"type": "speech.start"})
+
+            self.assertTrue(speaker.paused)
+            self.assertTrue(connection.barge_pending)
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertEqual(client.aborted, [])
+            self.assertNotIn("interrupted", [message["type"] for message in websocket.sent])
+            connection.clear_pending_barge_in()
+
+    async def test_tiny_transcript_resumes_playback_and_never_becomes_a_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "uh", "eager": False})
+            await asyncio.sleep(0)
+
+            self.assertFalse(speaker.paused)
+            self.assertFalse(connection.barge_pending)
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertEqual(started, [])
+            self.assertEqual(client.aborted, [])
+
+    async def test_real_transcript_commits_the_interrupt_and_starts_the_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "wait, try the other file", "eager": False}
+            )
+            await asyncio.sleep(0)
+
+            self.assertIsNone(connection.active_turn_id)
+            self.assertEqual(len(client.aborted), 1)
+            self.assertEqual(started, ["wait, try the other file"])
+            self.assertFalse(connection.barge_pending)
+
+    async def test_confirm_deadline_expiry_resumes_playback(self) -> None:
+        import dataclasses
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            connection.config = dataclasses.replace(connection.config, barge_in_confirm_sec=0.02)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+
+            await connection.handle_flux_event({"type": "speech.start"})
+            self.assertTrue(speaker.paused)
+            await asyncio.sleep(0.08)
+
+            self.assertFalse(speaker.paused)
+            self.assertFalse(connection.barge_pending)
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertEqual(client.aborted, [])
 
 
 class SidepodCompactionWiringTests(unittest.IsolatedAsyncioTestCase):

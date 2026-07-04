@@ -127,6 +127,7 @@ class NativeMicSession:
         self.pump_task: asyncio.Task[None] | None = None
         self.closed = False
         self.dropped_chunks = 0
+        self.input_delay_sec = 0.0
 
     async def start(self) -> bool:
         try:
@@ -153,6 +154,15 @@ class NativeMicSession:
             # already stressed, so defer everything to the loop.
             if self.closed or not self.loop:
                 return
+            try:
+                # Capture-side delay for the echo canceller, from PortAudio
+                # timing the way livekit's media_devices measures it. Plain
+                # float attribute write: safe from this thread.
+                adc_delay = float(time_info.currentTime) - float(time_info.inputBufferAdcTime)
+                if adc_delay > 0:
+                    self.input_delay_sec = adc_delay
+            except Exception:  # noqa: BLE001, S110 - some hosts omit timing info.
+                pass
             if status:
                 self.loop.call_soon_threadsafe(log_status, str(status))
             self.loop.call_soon_threadsafe(self.enqueue_audio, bytes(indata))
@@ -248,6 +258,10 @@ class NativeSpeakerSession:
         self.started_at: float | None = None
         self.last_summary_log = 0.0
         self.speaking_until = 0.0
+        self.resume_event = asyncio.Event()
+        self.resume_event.set()
+        self.paused = False
+        self.paused_at = 0.0
 
     async def start(self) -> bool:
         try:
@@ -264,7 +278,9 @@ class NativeSpeakerSession:
             )
             return False
 
-        self.queue = asyncio.Queue(maxsize=128)
+        # Memory bound only; play() blocks when full so chunks are never
+        # dropped mid-turn (256 chunks ≈ 10s of 16kHz mono int16 audio).
+        self.queue = asyncio.Queue(maxsize=256)
         try:
             self.stream = sd.RawOutputStream(
                 samplerate=self.config.deepgram_sample_rate,
@@ -296,30 +312,50 @@ class NativeSpeakerSession:
     async def play(self, data: bytes, turn_id: int | None) -> bool:
         if not self.queue or self.closed:
             return False
-        try:
-            self.queue.put_nowait(data)
-            now = time.perf_counter()
-            chunk_sec = len(data) / (self.config.deepgram_sample_rate * 2)
-            self.speaking_until = max(now, self.speaking_until) + chunk_sec
-            if self.started_at is None:
-                self.started_at = now
-                self.last_summary_log = self.started_at
-                self.logger.write("native_tts.first_chunk", bytes=len(data), turn_id=turn_id)
-            return True
-        except asyncio.QueueFull:
-            self.dropped_chunks += 1
-            if self.dropped_chunks == 1 or self.dropped_chunks % 50 == 0:
-                self.logger.write("native_tts.drop", dropped_chunks=self.dropped_chunks, turn_id=turn_id)
+        # Backpressure instead of drops: TTS delivers faster than realtime,
+        # and put() blocking here stalls the Deepgram receive loop until the
+        # device catches up. close() drains the queue so this never deadlocks.
+        await self.queue.put(data)
+        if self.closed:
             return False
+        now = time.perf_counter()
+        chunk_sec = len(data) / (self.config.deepgram_sample_rate * 2)
+        self.speaking_until = max(now, self.speaking_until) + chunk_sec
+        if self.started_at is None:
+            self.started_at = now
+            self.last_summary_log = self.started_at
+            self.logger.write("native_tts.first_chunk", bytes=len(data), turn_id=turn_id)
+        return True
 
     def is_audible(self, tail_sec: float = 0.3) -> bool:
         return not self.closed and time.perf_counter() < self.speaking_until + tail_sec
+
+    def pause(self) -> None:
+        """Hold playback between chunks; the queue keeps its audio."""
+        if self.closed or self.paused:
+            return
+        self.paused = True
+        self.paused_at = time.perf_counter()
+        self.resume_event.clear()
+        self.logger.write("native_tts.pause")
+
+    def resume(self) -> None:
+        if self.closed or not self.paused:
+            return
+        # The playback clock stood still while paused.
+        self.speaking_until += time.perf_counter() - self.paused_at
+        self.paused = False
+        self.resume_event.set()
+        self.logger.write("native_tts.resume")
 
     async def pump(self) -> None:
         if not self.queue:
             return
         while not self.closed:
             data = await self.queue.get()
+            await self.resume_event.wait()
+            if self.closed:
+                break
             try:
                 await asyncio.to_thread(self.write_output, data)
             except Exception as exc:  # noqa: BLE001 - surface playback failures but keep transport alive.
@@ -363,12 +399,23 @@ class NativeSpeakerSession:
     async def close(self) -> None:
         self.closed = True
         self.speaking_until = 0.0
+        self.resume_event.set()
         if self.pump_task and not self.pump_task.done():
             self.pump_task.cancel()
             try:
                 await self.pump_task
             except asyncio.CancelledError:
                 pass
+        if self.queue is not None:
+            # Frees queue slots so a play() blocked on put() wakes up (and
+            # then sees closed); anything still buffered is teardown discard.
+            discarded = 0
+            while not self.queue.empty():
+                self.queue.get_nowait()
+                discarded += 1
+            if discarded:
+                self.dropped_chunks += discarded
+                self.logger.write("native_tts.drop", dropped_chunks=discarded, reason="teardown")
         if self.stream:
             try:
                 self.stream.stop()
@@ -551,6 +598,10 @@ class VoiceConnection:
         self.tts_unavailable_chunks = 0
         self.speaker_prewarm_task: asyncio.Task[None] | None = None
         self.final_transcript = ""
+        self.eager_turn_text: str | None = None
+        self.barge_pending = False
+        self.pending_barge_task: asyncio.Task[None] | None = None
+        self.aec_delay_error_logged = False
         self.tts_first_audio_seen = False
         self.audio_input_chunks = 0
         self.audio_input_bytes = 0
@@ -783,13 +834,31 @@ class VoiceConnection:
         mode = self.duplex_mode()
         if mode == "aec" and self.echo_canceller:
             try:
-                return self.echo_canceller.process_capture(data)
+                self.update_aec_delay()
+                processed = self.echo_canceller.process_capture(data)
+                if self.echo_canceller.delay_error and not self.aec_delay_error_logged:
+                    self.aec_delay_error_logged = True
+                    self.logger.write("audio.aec.delay.error", error=self.echo_canceller.delay_error)
+                return processed
             except Exception as exc:  # noqa: BLE001 - fall back to the gate for the rest of the lane.
                 self.logger.write("audio.aec.error", error=repr(exc))
                 self.echo_canceller = None
         if mode != "full" and self.native_speaker and self.native_speaker.is_audible():
             return b"\x00" * len(data)
         return data
+
+    def update_aec_delay(self) -> None:
+        # Called per mic chunk: the canceller applies the stored value right
+        # before each process_stream frame, which is the cadence WebRTC
+        # expects (a one-shot set at speaker start never landed — livekit's
+        # media_devices re-asserts it per capture frame).
+        if not self.echo_canceller:
+            return
+        delay_sec = self.native_mic.input_delay_sec if self.native_mic else 0.0
+        speaker_latency = getattr(getattr(self.native_speaker, "stream", None), "latency", None)
+        if isinstance(speaker_latency, (int, float)):
+            delay_sec += float(speaker_latency)
+        self.echo_canceller.set_stream_delay_ms(int(delay_sec * 1000))
 
     def mic_gate_active(self) -> bool:
         return (
@@ -867,12 +936,24 @@ class VoiceConnection:
                 # while TTS is audible can only be residue, never a user.
                 self.logger.write("speech.gated", event_type="speech.start")
                 return
+            if self.barge_pending:
+                return
+            if self.native_speaker and self.native_speaker.is_audible():
+                # Mid-playback speech could be the user or echo residue the
+                # canceller missed. Pause instead of killing the turn and let
+                # the transcript decide (resolve_pending_barge_in).
+                self.begin_pending_barge_in()
+                return
             await self.barge_in(reason="speech_start")
             await self.maybe_start_compaction(reason="speech_start", run_in_background=True)
         elif event["type"] == "speech.resumed":
             self.logger.write("speech.resumed")
             if self.mic_gate_active():
                 self.logger.write("speech.gated", event_type="speech.resumed")
+                return
+            if self.barge_pending:
+                # Speech is still going; give the transcript a fresh window.
+                self.arm_pending_barge_in_deadline()
                 return
             await self.barge_in(reason="speech_resumed")
         elif event["type"] == "speech.transcript" and event.get("is_final") and event.get("transcript"):
@@ -881,9 +962,65 @@ class VoiceConnection:
         elif event["type"] == "speech.end":
             transcript = str(event.get("transcript") or self.final_transcript).strip()
             self.final_transcript = ""
-            self.logger.write("speech.end", transcript_chars=len(transcript), eager=bool(event.get("eager")))
-            if transcript:
-                await self.enqueue_text_turn(transcript, source="voice", eager=bool(event.get("eager")))
+            eager = bool(event.get("eager"))
+            self.logger.write("speech.end", transcript_chars=len(transcript), eager=eager)
+            if self.barge_pending:
+                confirmed = await self.resolve_pending_barge_in(transcript, reason="speech_end")
+                if not confirmed:
+                    return
+            if not transcript:
+                return
+            if not eager and self.eager_turn_text == transcript:
+                # The final EOT that confirms an in-flight eager turn: same
+                # words, turn already running — restarting only adds latency.
+                self.logger.write(
+                    "speech.end.confirmed",
+                    turn_id=self.active_turn_id,
+                    transcript_chars=len(transcript),
+                )
+                self.eager_turn_text = None
+                return
+            await self.enqueue_text_turn(transcript, source="voice", eager=eager)
+
+    def begin_pending_barge_in(self) -> None:
+        self.barge_pending = True
+        if self.native_speaker:
+            self.native_speaker.pause()
+        self.logger.write("barge_in.pending")
+        self.arm_pending_barge_in_deadline()
+
+    def arm_pending_barge_in_deadline(self) -> None:
+        task = self.pending_barge_task
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        self.pending_barge_task = asyncio.create_task(self.expire_pending_barge_in())
+
+    async def expire_pending_barge_in(self) -> None:
+        await asyncio.sleep(self.config.barge_in_confirm_sec)
+        await self.resolve_pending_barge_in(transcript=None, reason="timeout")
+
+    def clear_pending_barge_in(self) -> None:
+        self.barge_pending = False
+        task = self.pending_barge_task
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        self.pending_barge_task = None
+
+    async def resolve_pending_barge_in(self, transcript: str | None, reason: str) -> bool:
+        """Decide a paused-playback interruption: True means it was real and
+        the turn was torn down; False resumed playback (false alarm)."""
+        if not self.barge_pending:
+            return True
+        self.clear_pending_barge_in()
+        if transcript and len(transcript) >= self.config.barge_in_min_chars:
+            self.logger.write("barge_in.confirmed", reason=reason, transcript_chars=len(transcript))
+            await self.barge_in(reason="speech_confirmed")
+            await self.maybe_start_compaction(reason="speech_confirmed", run_in_background=True)
+            return True
+        self.logger.write("barge_in.false_alarm", reason=reason, transcript_chars=len(transcript or ""))
+        if self.native_speaker:
+            self.native_speaker.resume()
+        return False
 
     async def enqueue_text_turn(self, text: str, source: str, eager: bool = False) -> None:
         issue = self.config.credential_issue_for("voice_turns")
@@ -895,6 +1032,9 @@ class VoiceConnection:
             return
         if self.turn_task and not self.turn_task.done():
             await self.barge_in(reason="new_turn")
+        # Remember the eager prompt so the confirming final speech.end can be
+        # recognized (and skipped) instead of restarting the turn.
+        self.eager_turn_text = text if eager else None
         self.turn_task = asyncio.create_task(self.run_text_turn(text=text, source=source, eager=eager))
 
     async def run_text_turn(self, text: str, source: str, eager: bool) -> None:
@@ -1070,6 +1210,7 @@ class VoiceConnection:
             speech_filter = SpeechTextFilter()
             first_text_ms: int | None = None
             full_text = ""
+            stale_idle_logged = False
             last_event_ms = elapsed_ms(started)
             while self.active_turn_id == turn_id and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
                 try:
@@ -1085,6 +1226,9 @@ class VoiceConnection:
                     raise OpenCodeEventFallback(str(event.get("reason") or "event_stream_error"), prompt_sent=prompt_sent)
                 last_event_ms = elapsed_ms(started)
                 update = tracker.update(event)
+                if tracker.stale_idles and not stale_idle_logged:
+                    stale_idle_logged = True
+                    self.logger.write("opencode.stream.stale_idle", turn_id=turn_id)
                 if update.deltas and first_text_ms is None:
                     first_text_ms = elapsed_ms(started)
                     await self.send_json({"type": "assistant.first_text", "turn_id": turn_id, "latency_ms": first_text_ms})
@@ -1277,6 +1421,8 @@ class VoiceConnection:
         speak-generation bump that keeps stale TTS audio off the wire.
         Returns True when something was actually cut off."""
         self.speak_generation += 1
+        self.eager_turn_text = None
+        self.clear_pending_barge_in()
         interrupted = self.active_turn_id is not None or bool(self.speaker or self.native_speaker)
         if self.active_turn_id is not None:
             self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
@@ -1416,6 +1562,9 @@ class TurnSeam:
     latency: dict[str, Any] = field(default_factory=dict)
     stream_source: str = "event"
     assistant_seq: int = 0
+    # Kept (not popped) after turn.complete so a first TTS chunk arriving
+    # after the text finished can still report firstAudioMs.
+    completed: bool = False
 
 
 class SidepodConnection(VoiceConnection):
@@ -1710,7 +1859,6 @@ class SidepodConnection(VoiceConnection):
                 self.native_speaker_unavailable = True
                 return
             self.native_speaker = speaker
-            self.update_aec_delay()
         if not await self.native_speaker.play(data, turn_id):
             self.tts_unavailable_chunks += 1
             if self.tts_unavailable_chunks == 1 or self.tts_unavailable_chunks % 50 == 0:
@@ -1724,19 +1872,6 @@ class SidepodConnection(VoiceConnection):
     def feed_render_reference(self, data: bytes) -> None:
         if self.echo_canceller:
             self.echo_canceller.process_render(data)
-
-    def update_aec_delay(self) -> None:
-        if not self.echo_canceller:
-            return
-        delay_sec = 0.0
-        for session in (self.native_mic, self.native_speaker):
-            latency = getattr(getattr(session, "stream", None), "latency", None)
-            if isinstance(latency, (int, float)):
-                delay_sec += float(latency)
-        try:
-            self.echo_canceller.set_stream_delay_ms(int(delay_sec * 1000))
-        except Exception as exc:  # noqa: BLE001 - delay hint is an optimization only.
-            self.logger.write("audio.aec.delay.error", error=repr(exc))
 
     async def barge_in(self, reason: str) -> None:
         turn_id = self.protocol_turn_id or None
@@ -1856,6 +1991,10 @@ class SidepodConnection(VoiceConnection):
         lane_id = self.ensure_pending_turn()
         self.pending_turn_id = None
         self.protocol_turn_id = lane_id
+        # Completed seams were only kept for late first-audio; a new turn
+        # supersedes them.
+        for old_id in [k for k, v in self.turn_seams.items() if v.completed]:
+            del self.turn_seams[old_id]
         self.turn_seams[legacy_id] = TurnSeam(
             lane_id=lane_id,
             started_at=time.perf_counter(),
@@ -1900,11 +2039,21 @@ class SidepodConnection(VoiceConnection):
             first_audio_ms = elapsed_ms(seam.started_at)
             seam.latency["firstAudioMs"] = first_audio_ms
             out["firstAudioLatencyMs"] = first_audio_ms
+            if seam.completed:
+                # The turn's latency record already went out at text-complete;
+                # streamed turns usually reach first audio only afterwards.
+                self.logger.write(
+                    "sidepod.turn.latency.audio",
+                    turn_id=seam.lane_id,
+                    firstAudioMs=first_audio_ms,
+                )
         return out
 
     def translate_turn_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         legacy_id = int(payload.get("turn_id") or 0)
-        seam = self.turn_seams.pop(legacy_id, None)
+        seam = self.turn_seams.get(legacy_id)
+        if seam:
+            seam.completed = True
         lane_id = seam.lane_id if seam else f"turn_legacy_{legacy_id}"
         latency = {
             key: value

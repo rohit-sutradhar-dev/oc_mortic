@@ -198,6 +198,7 @@ class OpenCodeEventTurnTracker:
         self.part_text: dict[str, str] = {}
         self.part_order: list[str] = []
         self.completed = False
+        self.stale_idles = 0
         self.error: Any | None = None
 
     @property
@@ -222,7 +223,14 @@ class OpenCodeEventTurnTracker:
             if delta:
                 deltas.append(delta)
         elif event_type == "session.idle":
-            self.completed = True
+            if self.active_message_id:
+                self.completed = True
+            else:
+                # An idle left over from the previous (usually aborted) turn
+                # can arrive on this turn's fresh subscription before our
+                # prompt produces anything; honoring it would report a
+                # completed-empty turn and force the poll fallback.
+                self.stale_idles += 1
         elif event_type == "session.status":
             status = properties.get("status") or {}
             if isinstance(status, dict) and status.get("type") == "idle" and self.active_message_id:

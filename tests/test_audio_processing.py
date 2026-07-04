@@ -101,6 +101,22 @@ class EchoCancellerTests(unittest.TestCase):
 
         self.assertEqual(len(canceller.process_capture(chunk)), len(chunk))
 
+    def test_stream_delay_is_clamped_and_applied_without_error(self) -> None:
+        # set_stream_delay_ms stores the hint; process_capture re-asserts it
+        # per frame, which is the cadence WebRTC accepts (a one-shot set at
+        # speaker start raised on every real run — MOR-111).
+        canceller = EchoCanceller(SAMPLE_RATE)
+
+        canceller.set_stream_delay_ms(9_999)
+        self.assertEqual(canceller.stream_delay_ms, 500)
+        canceller.set_stream_delay_ms(-25)
+        self.assertEqual(canceller.stream_delay_ms, 0)
+
+        canceller.set_stream_delay_ms(120)
+        canceller.process_render(b"\x00" * (FRAME_BYTES * 4))
+        canceller.process_capture(b"\x00" * (FRAME_BYTES * 4))
+        self.assertIsNone(canceller.delay_error)
+
 
 if __name__ == "__main__":
     unittest.main()
