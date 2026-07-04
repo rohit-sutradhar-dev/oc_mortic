@@ -60,6 +60,24 @@ test("a poll-fallback turn with no deltas renders via fullSpokenText", () => {
   assert.deepEqual(intents[3].appendTranscript, [{ role: "assistant", text: "Here is the summary." }]);
 });
 
+test("a straggler partial never steals the running turn", () => {
+  // The frozen-viewer bug from run 20260704T140244Z: a partial transcript
+  // with a fresh turnId arrived right after thinking; superseding on it made
+  // the running turn's deltas and complete fail the turnId guard.
+  const { intents } = play([
+    { type: "transcript", sentAt: at, turnId: "turn_0005", sequence: 1, text: "why change this", final: true },
+    { type: "thinking", sentAt: at, turnId: "turn_0005", sourceMode: "live" },
+    { type: "transcript", sentAt: at, turnId: "turn_0006", sequence: 1, text: "why change this file", final: false },
+    { type: "assistant.delta", sentAt: at, turnId: "turn_0005", sequence: 1, delta: "The roadmap holds. " },
+    { type: "complete", sentAt: at, turnId: "turn_0005", latency: { totalMs: 1600 } },
+  ]);
+
+  assert.equal(intents[2].userText, "why change this file…", "straggler still shows as a live caption");
+  assert.equal(intents[3].assistantText, "The roadmap holds. ");
+  assert.equal(intents[4].assistantText, "The roadmap holds. ");
+  assert.deepEqual(intents[4].appendTranscript, [{ role: "assistant", text: "The roadmap holds. " }]);
+});
+
 test("interrupt clears the transcript sequence like complete does", () => {
   const { state, intents } = play([
     { type: "transcript", sentAt: at, turnId: "turn_0001", sequence: 4, text: "long dropped question", final: true },
@@ -104,15 +122,23 @@ test("events for superseded turns do not replace the active display", () => {
   assert.equal(intents[4].assistantText, "live turn");
 });
 
-test("a transcript for a new turn supersedes the previous turn display", () => {
+test("only a final transcript supersedes a running turn", () => {
   const { state } = play([
     { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live" },
     { type: "assistant.delta", sentAt: at, turnId: "turn_0001", sequence: 1, delta: "old reply" },
     { type: "transcript", sentAt: at, turnId: "turn_0002", sequence: 1, text: "next ask", final: false }
   ]);
 
-  assert.equal(state.activeTurnId, "turn_0002");
-  assert.equal(state.assistantBuffer, "");
+  // The partial shows as a caption but must not steal the running turn.
+  assert.equal(state.activeTurnId, "turn_0001");
+  assert.equal(state.assistantBuffer, "old reply");
+
+  const { state: after } = play(
+    [{ type: "transcript", sentAt: at, turnId: "turn_0002", sequence: 2, text: "next ask", final: true }],
+    state
+  );
+  assert.equal(after.activeTurnId, "turn_0002");
+  assert.equal(after.assistantBuffer, "");
 });
 
 test("audio-capability issues flip the mic back to muted, others do not", () => {

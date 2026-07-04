@@ -52,6 +52,16 @@ export function reduceLaneEvent(state, event) {
       const next = { ...state, transcriptSeq: event.sequence };
       return applyTranscript(next, event);
     }
+    if (!event.final && state.activeTurnId) {
+      // Live captions never steal a RUNNING turn. A straggler partial
+      // arriving just after `thinking` carries a fresh turnId; letting it
+      // supersede made every later delta/complete for the running turn fail
+      // the turnId guard — viewer frozen at "…" while TTS spoke (convicted
+      // via the client smoke log, run 20260704T140244Z). Between turns
+      // (activeTurnId null) partials supersede as before, which keeps their
+      // sequence dedup.
+      return { state, ui: { userText: `${String(event.text ?? "")}…` } };
+    }
     // A transcript for a new turnId supersedes the active turn display.
     const next = {
       ...state,
