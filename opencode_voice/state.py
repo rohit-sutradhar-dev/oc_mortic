@@ -207,7 +207,7 @@ class OpenCodeEventTurnTracker:
     def update(self, event: dict[str, Any]) -> AssistantUpdate:
         event_type = str(event.get("type") or "")
         properties = event_properties(event)
-        if properties.get("sessionID") != self.session_id:
+        if event_session_id(event) != self.session_id:
             return self._empty()
 
         deltas: list[str] = []
@@ -277,6 +277,12 @@ class OpenCodeEventTurnTracker:
             return ""
         old = self.part_text.get(part_id, "")
         self._remember_part(part_id)
+        # 1.17 may stream delta-only updates (`properties.delta`) without the
+        # full part text; fall back to diffing full-text snapshots otherwise.
+        delta = properties.get("delta")
+        if not text and isinstance(delta, str) and delta:
+            self.part_text[part_id] = old + delta
+            return delta
         self.part_text[part_id] = text
         if text.startswith(old):
             return text[len(old):]
@@ -312,6 +318,27 @@ def event_properties(event: dict[str, Any]) -> dict[str, Any]:
     if isinstance(data, dict):
         return data
     return {}
+
+
+def event_session_id(event: dict[str, Any]) -> str:
+    """Resolve the session id an OpenCode SSE event belongs to.
+
+    OpenCode 1.17 nests it per event family: `message.updated` carries it in
+    `properties.info.sessionID`, `message.part.updated` in
+    `properties.part.sessionID`, and session-level events keep it at
+    `properties.sessionID`.
+    """
+    properties = event_properties(event)
+    direct = properties.get("sessionID")
+    if isinstance(direct, str) and direct:
+        return direct
+    for container_key in ("info", "part"):
+        container = properties.get(container_key)
+        if isinstance(container, dict):
+            nested = container.get("sessionID")
+            if isinstance(nested, str) and nested:
+                return nested
+    return ""
 
 
 def assistant_texts(messages: list[dict[str, Any]]) -> list[AssistantText]:

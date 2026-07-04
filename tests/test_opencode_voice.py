@@ -27,6 +27,7 @@ from opencode_voice.state import (
     AssistantTextTracker,
     OpenCodeEventTurnTracker,
     active_context_estimate,
+    event_session_id,
     session_context_tokens,
     session_usage_tokens,
 )
@@ -77,6 +78,12 @@ class FakeOpenCodeClient:
 
 
 class MercuryConfigTests(unittest.TestCase):
+    def test_latency_and_duplex_defaults(self) -> None:
+        config = VoiceConfig(opencode_url="http://127.0.0.1:1")
+
+        self.assertEqual(config.flux_eager_eot_threshold, 0.6)
+        self.assertEqual(config.voice_duplex, "auto")
+
     def test_mercury_is_used_for_all_opencode_slots(self) -> None:
         config = render_opencode_config(ModelRef(provider_id="inception", model_id="mercury-2"))
 
@@ -473,12 +480,15 @@ class SSEParserTests(unittest.TestCase):
 
 
 class OpenCodeEventTurnTrackerTests(unittest.TestCase):
+    # OpenCode 1.17 nests sessionID per event family (`properties.info` for
+    # message.updated, `properties.part` for message.part.updated); only
+    # session-level events keep it top-level. These tests use the real shapes.
     def test_ignores_user_text_part_updates(self) -> None:
         tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
         tracker.update(
             {
                 "type": "message.updated",
-                "properties": {"sessionID": "ses_1", "info": {"id": "msg_user", "role": "user"}},
+                "properties": {"info": {"id": "msg_user", "role": "user", "sessionID": "ses_1"}},
             }
         )
 
@@ -486,8 +496,13 @@ class OpenCodeEventTurnTrackerTests(unittest.TestCase):
             {
                 "type": "message.part.updated",
                 "properties": {
-                    "sessionID": "ses_1",
-                    "part": {"id": "prt_1", "messageID": "msg_user", "type": "text", "text": "hello"},
+                    "part": {
+                        "id": "prt_1",
+                        "sessionID": "ses_1",
+                        "messageID": "msg_user",
+                        "type": "text",
+                        "text": "hello",
+                    },
                 },
             }
         )
@@ -525,42 +540,90 @@ class OpenCodeEventTurnTrackerTests(unittest.TestCase):
         tracker.update(
             {
                 "type": "message.updated",
-                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
+                "properties": {"info": {"id": "msg_new", "role": "assistant", "sessionID": "ses_1"}},
             }
         )
 
-        first = tracker.update(
-            {
+        def part_updated(text: str) -> dict[str, object]:
+            return {
                 "type": "message.part.updated",
                 "properties": {
-                    "sessionID": "ses_1",
-                    "part": {"id": "prt_1", "messageID": "msg_new", "type": "text", "text": "hel"},
+                    "part": {
+                        "id": "prt_1",
+                        "sessionID": "ses_1",
+                        "messageID": "msg_new",
+                        "type": "text",
+                        "text": text,
+                    },
                 },
             }
-        )
-        second = tracker.update(
-            {
-                "type": "message.part.updated",
-                "properties": {
-                    "sessionID": "ses_1",
-                    "part": {"id": "prt_1", "messageID": "msg_new", "type": "text", "text": "hello"},
-                },
-            }
-        )
-        duplicate = tracker.update(
-            {
-                "type": "message.part.updated",
-                "properties": {
-                    "sessionID": "ses_1",
-                    "part": {"id": "prt_1", "messageID": "msg_new", "type": "text", "text": "hello"},
-                },
-            }
-        )
+
+        first = tracker.update(part_updated("hel"))
+        second = tracker.update(part_updated("hello"))
+        duplicate = tracker.update(part_updated("hello"))
 
         self.assertEqual(first.deltas, ["hel"])
         self.assertEqual(second.deltas, ["lo"])
         self.assertEqual(duplicate.deltas, [])
         self.assertEqual(duplicate.full_text, "hello")
+
+    def test_accepts_delta_only_part_updates(self) -> None:
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
+        tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"info": {"id": "msg_new", "role": "assistant", "sessionID": "ses_1"}},
+            }
+        )
+
+        def delta_update(delta: str) -> dict[str, object]:
+            return {
+                "type": "message.part.updated",
+                "properties": {
+                    "delta": delta,
+                    "part": {
+                        "id": "prt_1",
+                        "sessionID": "ses_1",
+                        "messageID": "msg_new",
+                        "type": "text",
+                        "text": "",
+                    },
+                },
+            }
+
+        first = tracker.update(delta_update("hel"))
+        second = tracker.update(delta_update("lo"))
+
+        self.assertEqual(first.deltas, ["hel"])
+        self.assertEqual(second.deltas, ["lo"])
+        self.assertEqual(second.full_text, "hello")
+
+    def test_ignores_nested_events_for_other_sessions(self) -> None:
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
+        tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"info": {"id": "msg_other", "role": "assistant", "sessionID": "ses_2"}},
+            }
+        )
+
+        update = tracker.update(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "part": {
+                        "id": "prt_1",
+                        "sessionID": "ses_2",
+                        "messageID": "msg_other",
+                        "type": "text",
+                        "text": "not ours",
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(update.deltas, [])
+        self.assertEqual(update.full_text, "")
 
     def test_completes_on_session_idle(self) -> None:
         tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
@@ -568,6 +631,32 @@ class OpenCodeEventTurnTrackerTests(unittest.TestCase):
         update = tracker.update({"type": "session.idle", "properties": {"sessionID": "ses_1"}})
 
         self.assertTrue(update.completed)
+
+
+class EventSessionIdTests(unittest.TestCase):
+    def test_resolves_top_level_session_id(self) -> None:
+        event = {"type": "session.idle", "properties": {"sessionID": "ses_1"}}
+
+        self.assertEqual(event_session_id(event), "ses_1")
+
+    def test_resolves_message_updated_info_session_id(self) -> None:
+        event = {
+            "type": "message.updated",
+            "properties": {"info": {"id": "msg_1", "role": "assistant", "sessionID": "ses_1"}},
+        }
+
+        self.assertEqual(event_session_id(event), "ses_1")
+
+    def test_resolves_part_updated_nested_session_id(self) -> None:
+        event = {
+            "type": "message.part.updated",
+            "properties": {"part": {"id": "prt_1", "sessionID": "ses_1", "type": "text"}},
+        }
+
+        self.assertEqual(event_session_id(event), "ses_1")
+
+    def test_returns_empty_when_absent(self) -> None:
+        self.assertEqual(event_session_id({"type": "server.connected", "properties": {}}), "")
 
 
 class DeepgramProtocolTests(unittest.TestCase):

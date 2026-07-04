@@ -116,11 +116,16 @@ class OpenCodeClient:
         }
         return await self._post(f"/session/{session_id}/prompt_async", payload)
 
-    async def events(self, on_open: Callable[[], None] | None = None) -> AsyncIterator[dict[str, Any]]:
+    async def events(
+        self,
+        on_open: Callable[[], None] | None = None,
+        directory: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         parser = SSEParser()
         async with self._client.stream(
             "GET",
             "/event",
+            params={"directory": directory} if directory else None,
             headers={"accept": "text/event-stream"},
             timeout=None,
         ) as response:

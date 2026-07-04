@@ -58,7 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         deepgram_stt_model=args.stt_model,
         deepgram_tts_model=args.tts_model,
         deepgram_sample_rate=args.sample_rate,
-        flux_eager_eot_threshold=args.eager_eot_threshold,
+        flux_eager_eot_threshold=args.eager_eot_threshold or None,
+        voice_duplex=args.voice_duplex,
         opencode_agent=args.agent,
         voice_agent_prompt_path=args.voice_agent_prompt,
         keep_fork_default=args.keep_fork,
@@ -110,7 +111,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stt-model", default="flux-general-en", help="Speech-to-text model id.")
     parser.add_argument("--tts-model", default="aura-2-thalia-en", help="Text-to-speech model id.")
     parser.add_argument("--sample-rate", type=int, default=16_000, help="PCM sample rate for STT and TTS.")
-    parser.add_argument("--eager-eot-threshold", type=float, help="Enable experimental Flux eager end-of-turn.")
+    parser.add_argument(
+        "--eager-eot-threshold",
+        type=float,
+        default=0.6,
+        help="Flux eager end-of-turn threshold (default 0.6; pass 0 to disable).",
+    )
+    parser.add_argument(
+        "--voice-duplex",
+        default="auto",
+        choices=["auto", "full", "half"],
+        help=(
+            "Mic behavior while the assistant speaks: auto = echo-cancel when "
+            "available and gate otherwise, full = raw passthrough (headphones), "
+            "half = always gate."
+        ),
+    )
     parser.add_argument("--keep-fork", action="store_true", help="Keep ephemeral forks by default.")
     parser.add_argument("--print-config", action="store_true", help="Print the generated OpenCode config overlay.")
     parser.add_argument("--log-level", default="info", choices=["critical", "error", "warning", "info", "debug"])

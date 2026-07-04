@@ -122,8 +122,12 @@ class VoiceConfig:
     deepgram_tts_model: str = "aura-2-thalia-en"
     deepgram_sample_rate: int = 16_000
     flux_eot_threshold: float = 0.7
-    flux_eager_eot_threshold: float | None = None
+    flux_eager_eot_threshold: float | None = 0.6
     flux_eot_timeout_ms: int = 5_000
+    # "auto": echo-cancel the mic when the canceller is available, otherwise
+    # gate the mic while TTS is audible. "full": raw passthrough (headphones).
+    # "half": force the gate.
+    voice_duplex: str = "auto"
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False

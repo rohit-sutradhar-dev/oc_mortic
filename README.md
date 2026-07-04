@@ -39,8 +39,24 @@ Useful options:
 mortic-helper --help
 mortic-helper --managed-opencode --opencode-dir "/path/to/project"
 mortic-helper --context-threshold 70000 --model-variant low
-mortic-helper --eager-eot-threshold 0.5
+mortic-helper --eager-eot-threshold 0.7   # default 0.6; pass 0 to disable
+mortic-helper --voice-duplex full          # headphones: skip echo protection
 ```
+
+## Echo Protection
+
+The native lane echo-cancels the microphone the way a browser does: WebRTC's
+audio processing module (prebuilt in the `livekit` wheel) runs on the capture
+path with TTS playback fed in as the render reference, so the assistant never
+hears itself and voice barge-in stays usable on open speakers.
+`--voice-duplex` controls the behavior: `auto` (default) uses the echo
+canceller and degrades to a half-duplex silence gate if the native module is
+unavailable, `full` passes raw mic audio (headphone users), `half` forces the
+gate (mute key interrupts while the assistant speaks).
+
+Turns stream from OpenCode's `/event` feed scoped to the fork's directory
+(forks inherit the source thread's directory; an unscoped subscription never
+sees their events and every turn would pay the poll-fallback timeout).
 
 ## Helper Distribution Contract
 

@@ -44,16 +44,25 @@ class LaneFakeClient:
         self.prompts: list[tuple[str, str]] = []
         self.closed = False
         self._assistant_messages: list[dict[str, Any]] = []
+        self._staged_events: list[dict[str, Any]] = []
+        self._events_staged = asyncio.Event()
+        self.event_directories: list[str | None] = []
 
     async def close(self) -> None:
         self.closed = True
 
     async def fork_session(self, session_id: str) -> dict[str, str]:
         self.fork_count += 1
-        return {"id": f"fork_{self.fork_count}"}
+        # Real forks inherit the source thread's directory (not the server's).
+        return {"id": f"fork_{self.fork_count}", "directory": "/project/source-thread"}
 
     async def get_session(self, session_id: str) -> dict[str, Any]:
-        return {"id": session_id, "title": "Source Thread", "tokens": {}}
+        return {
+            "id": session_id,
+            "title": "Source Thread",
+            "tokens": {},
+            "directory": "/project/source-thread",
+        }
 
     async def switch_model(self, session_id: str, model: Any) -> dict[str, bool]:
         return {"ok": True}
@@ -75,26 +84,78 @@ class LaneFakeClient:
         self.aborted.append(session_id)
         return True
 
-    def events(self, on_open: Any = None) -> Any:
-        raise RuntimeError("event stream disabled in tests")
+    def events(self, on_open: Any = None, directory: str | None = None) -> Any:
+        self.event_directories.append(directory)
+        return self._event_stream(on_open)
+
+    async def _event_stream(self, on_open: Any) -> Any:
+        if on_open:
+            on_open()
+        await self._events_staged.wait()
+        staged, self._staged_events = self._staged_events, []
+        self._events_staged.clear()
+        for event in staged:
+            yield event
+        # A real stream stays open after the turn; block until cancelled.
+        await asyncio.Event().wait()
 
     async def prompt_async(self, session_id: str, text: str, model: Any, agent: str) -> Any:
-        raise RuntimeError("prompt_async disabled in tests")
-
-    async def prompt_text(self, session_id: str, text: str, model: Any, agent: str) -> Any:
         self.prompts.append((session_id, text))
         reply_number = len(self.prompts)
+        message_id = f"msg_reply_{reply_number}"
+        part_id = f"prt_reply_{reply_number}"
+        reply = "On it. I will tighten the summary."
+        first, rest = reply[:6], reply[6:]
         self._assistant_messages = self._assistant_messages + [
             {
                 "info": {
-                    "id": f"msg_reply_{reply_number}",
+                    "id": message_id,
                     "role": "assistant",
                     "time": {"created": reply_number * 2 - 1, "completed": reply_number * 2},
                 },
-                "parts": [{"type": "text", "text": "On it. I will tighten the summary."}],
+                "parts": [{"type": "text", "text": reply}],
             }
         ]
+        # Real OpenCode 1.17 shapes: sessionID nested in info/part, delta on
+        # part.updated, session-level idle event carries it top-level.
+        self._staged_events = [
+            {
+                "type": "message.updated",
+                "properties": {"info": {"id": message_id, "role": "assistant", "sessionID": session_id}},
+            },
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "delta": first,
+                    "part": {
+                        "id": part_id,
+                        "sessionID": session_id,
+                        "messageID": message_id,
+                        "type": "text",
+                        "text": first,
+                    },
+                },
+            },
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "delta": rest,
+                    "part": {
+                        "id": part_id,
+                        "sessionID": session_id,
+                        "messageID": message_id,
+                        "type": "text",
+                        "text": reply,
+                    },
+                },
+            },
+            {"type": "session.idle", "properties": {"sessionID": session_id}},
+        ]
+        self._events_staged.set()
         return {"ok": True}
+
+    async def prompt_text(self, session_id: str, text: str, model: Any, agent: str) -> Any:
+        raise RuntimeError("poll path should not run when the event stream works")
 
 
 class FakeSpeakSession:
@@ -117,15 +178,25 @@ class FakeSpeakSession:
 
 
 class FakeNativeSpeaker:
-    def __init__(self, config: Any, logger: Any, on_issue: Any) -> None:
+    def __init__(self, config: Any, logger: Any, on_issue: Any, on_render: Any = None) -> None:
         self.played: list[bytes] = []
+        self.on_render = on_render
+        self.audible = False
 
     async def start(self) -> bool:
         return True
 
     async def play(self, data: bytes, turn_id: Any) -> bool:
         self.played.append(data)
+        if self.on_render:
+            self.on_render(data)
         return True
+
+    def is_audible(self, tail_sec: float = 0.3) -> bool:
+        return self.audible
+
+    async def close(self) -> None:
+        self.audible = False
 
     async def close(self) -> None:
         return None
@@ -147,12 +218,13 @@ class FakeNativeMic:
 class FakeFlux:
     def __init__(self, config: Any, on_event: Any) -> None:
         self.on_event = on_event
+        self.audio: list[bytes] = []
 
     async def start(self) -> None:
         return None
 
     async def send_audio(self, data: bytes) -> None:
-        return None
+        self.audio.append(data)
 
     async def close(self) -> None:
         return None
@@ -168,11 +240,16 @@ START_PAYLOAD = {
 }
 
 
-def lane_connection(tmp: str, client: LaneFakeClient | None = None, **kwargs: Any) -> tuple[SidepodConnection, FakeWebSocket, LaneFakeClient]:
+def lane_connection(
+    tmp: str,
+    client: LaneFakeClient | None = None,
+    voice_duplex: str = "auto",
+    **kwargs: Any,
+) -> tuple[SidepodConnection, FakeWebSocket, LaneFakeClient]:
     websocket = FakeWebSocket()
     fake_client = client or LaneFakeClient()
     connection = SidepodConnection(
-        config=VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
+        config=VoiceConfig(opencode_url="http://opencode.test", run_root=tmp, voice_duplex=voice_duplex),
         client=fake_client,  # type: ignore[arg-type]
         logger=RunLogger(root=tmp),
         websocket=websocket,  # type: ignore[arg-type]
@@ -209,7 +286,16 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
             types = [message["type"] for message in websocket.sent]
             self.assertEqual(
                 types,
-                ["ready", "transcript", "transcript", "thinking", "assistant.delta", "speaking", "complete"],
+                [
+                    "ready",
+                    "transcript",
+                    "transcript",
+                    "thinking",
+                    "assistant.delta",
+                    "speaking",
+                    "assistant.delta",
+                    "complete",
+                ],
             )
             assert_all_lane_messages_valid(self, websocket.sent)
 
@@ -225,12 +311,15 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
 
             complete = websocket.sent[-1]
             self.assertEqual(complete["turnId"], final["turnId"])
-            self.assertEqual(complete["streamSource"], "poll")
+            self.assertEqual(complete["streamSource"], "event")
             self.assertIn("totalMs", complete["latency"])
             self.assertIn("firstTranscriptMs", complete["latency"])
             self.assertIn("firstAssistantTextMs", complete["latency"])
             self.assertIn("firstAudioMs", complete["latency"])
             self.assertEqual(client.prompts, [("fork_1", "Make the test output easier to scan.")])
+            # /event is directory-scoped; the turn must subscribe with the
+            # fork's inherited directory or the stream stays silent.
+            self.assertEqual(client.event_directories, ["/project/source-thread"])
 
     async def test_second_turn_gets_a_fresh_turn_id_and_sequences_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
@@ -459,6 +548,108 @@ class SidepodLaneEnforcementTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(interrupted["reason"], "user.mute")
             self.assertEqual(client.aborted, ["fork_1"])
             assert_all_lane_messages_valid(self, websocket.sent)
+
+
+class FakeEchoCanceller:
+    def __init__(self, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+        self.captured: list[bytes] = []
+        self.rendered: list[bytes] = []
+
+    def process_capture(self, data: bytes) -> bytes:
+        self.captured.append(data)
+        return b"\x7f" * len(data)  # marker: processing happened
+
+    def process_render(self, data: bytes) -> None:
+        self.rendered.append(data)
+
+    def set_stream_delay_ms(self, delay_ms: int) -> None:
+        return None
+
+
+class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
+    """Mortic must never hear itself: AEC when available, silence gate otherwise."""
+
+    async def test_aec_mode_runs_mic_frames_through_the_canceller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ), patch("opencode_voice.server.NativeMicSession", FakeNativeMic), patch(
+            "opencode_voice.server.EchoCanceller", FakeEchoCanceller
+        ):
+            connection, _websocket, _client = lane_connection(tmp, voice_duplex="auto")
+            self.assertTrue(await connection.start_native_audio())
+            self.assertIsInstance(connection.echo_canceller, FakeEchoCanceller)
+
+            await connection.handle_native_audio(b"\x11" * 640)
+
+            self.assertEqual(connection.flux.audio, [b"\x7f" * 640])
+            self.assertEqual(connection.echo_canceller.captured, [b"\x11" * 640])
+
+    async def test_half_duplex_gate_feeds_silence_while_tts_is_audible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ), patch("opencode_voice.server.NativeMicSession", FakeNativeMic):
+            connection, _websocket, _client = lane_connection(tmp, voice_duplex="half")
+            self.assertTrue(await connection.start_native_audio())
+            self.assertIsNone(connection.echo_canceller)
+            speaker = FakeNativeSpeaker(None, None, None)
+            speaker.audible = True
+            connection.native_speaker = speaker
+
+            await connection.handle_native_audio(b"\x11" * 640)
+            speaker.audible = False
+            await connection.handle_native_audio(b"\x22" * 640)
+
+            self.assertEqual(connection.flux.audio, [b"\x00" * 640, b"\x22" * 640])
+            self.assertEqual(connection.mic_gated_frames, 1)
+
+    async def test_full_duplex_passes_raw_frames_even_while_speaking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ), patch("opencode_voice.server.NativeMicSession", FakeNativeMic):
+            connection, _websocket, _client = lane_connection(tmp, voice_duplex="full")
+            self.assertTrue(await connection.start_native_audio())
+            speaker = FakeNativeSpeaker(None, None, None)
+            speaker.audible = True
+            connection.native_speaker = speaker
+
+            await connection.handle_native_audio(b"\x11" * 640)
+
+            self.assertEqual(connection.flux.audio, [b"\x11" * 640])
+
+    async def test_gated_speech_start_does_not_interrupt_the_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, websocket, client = lane_connection(tmp, voice_duplex="half")
+            await connection.handle_control(START_PAYLOAD)
+            speaker = FakeNativeSpeaker(None, None, None)
+            speaker.audible = True
+            connection.native_speaker = speaker
+            connection.active_turn_id = 7
+
+            await connection.handle_flux_event({"type": "speech.start"})
+
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertEqual(client.aborted, [])
+            self.assertNotIn("interrupted", [message["type"] for message in websocket.sent])
+
+    async def test_stale_tts_audio_after_barge_in_cannot_resurrect_the_speaker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramSpeakSession", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            await connection.speak("Hello there.", turn_id=1)
+            stale_speaker = connection.speaker
+            self.assertIsNotNone(connection.native_speaker)
+
+            await connection.barge_in("user.mute")
+            self.assertIsNone(connection.native_speaker)
+
+            # Audio still streaming from the barged-in TTS socket must be
+            # dropped, not played, and must not recreate the native speaker.
+            await stale_speaker.on_audio(b"\x01\x02", 1)
+            self.assertIsNone(connection.native_speaker)
+            self.assertEqual(connection.stale_tts_chunks, 1)
 
 
 class SidepodCompactionWiringTests(unittest.IsolatedAsyncioTestCase):

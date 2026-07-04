@@ -33,12 +33,13 @@ from opencode_voice.opencode_client import OpenCodeClient
 from opencode_voice.protocol import check_command as check_sidepod_command
 from opencode_voice.protocol import check_event as check_sidepod_event
 from opencode_voice.protocol import schema_document as sidepod_schema_document
+from opencode_voice.audio_processing import EchoCanceller
 from opencode_voice.state import (
     AssistantTextTracker,
     OpenCodeEventTurnTracker,
     active_context_estimate,
     elapsed_ms,
-    event_properties,
+    event_session_id,
     session_context_tokens,
     session_title,
     session_usage_tokens,
@@ -226,10 +227,12 @@ class NativeSpeakerSession:
         config: VoiceConfig,
         logger: RunLogger,
         on_issue: Callable[[dict[str, Any]], Awaitable[None]],
+        on_render: Callable[[bytes], None] | None = None,
     ) -> None:
         self.config = config
         self.logger = logger
         self.on_issue = on_issue
+        self.on_render = on_render
         self.queue: asyncio.Queue[bytes] | None = None
         self.stream: Any | None = None
         self.pump_task: asyncio.Task[None] | None = None
@@ -239,6 +242,7 @@ class NativeSpeakerSession:
         self.played_bytes = 0
         self.started_at: float | None = None
         self.last_summary_log = 0.0
+        self.speaking_until = 0.0
 
     async def start(self) -> bool:
         try:
@@ -289,8 +293,11 @@ class NativeSpeakerSession:
             return False
         try:
             self.queue.put_nowait(data)
+            now = time.perf_counter()
+            chunk_sec = len(data) / (self.config.deepgram_sample_rate * 2)
+            self.speaking_until = max(now, self.speaking_until) + chunk_sec
             if self.started_at is None:
-                self.started_at = time.perf_counter()
+                self.started_at = now
                 self.last_summary_log = self.started_at
                 self.logger.write("native_tts.first_chunk", bytes=len(data), turn_id=turn_id)
             return True
@@ -300,11 +307,20 @@ class NativeSpeakerSession:
                 self.logger.write("native_tts.drop", dropped_chunks=self.dropped_chunks, turn_id=turn_id)
             return False
 
+    def is_audible(self, tail_sec: float = 0.3) -> bool:
+        return not self.closed and time.perf_counter() < self.speaking_until + tail_sec
+
     async def pump(self) -> None:
         if not self.queue:
             return
         while not self.closed:
             data = await self.queue.get()
+            if self.on_render:
+                try:
+                    self.on_render(data)
+                except Exception as exc:  # noqa: BLE001 - reference feed must not stop playback.
+                    self.logger.write("native_tts.render_ref.error", error=repr(exc))
+                    self.on_render = None
             try:
                 await asyncio.to_thread(self.write_output, data)
             except Exception as exc:  # noqa: BLE001 - surface playback failures but keep transport alive.
@@ -338,6 +354,7 @@ class NativeSpeakerSession:
 
     async def close(self) -> None:
         self.closed = True
+        self.speaking_until = 0.0
         if self.pump_task and not self.pump_task.done():
             self.pump_task.cancel()
             try:
@@ -505,6 +522,7 @@ class VoiceConnection:
         self.send_lock = asyncio.Lock()
         self.source_session_id: str | None = None
         self.fork_session_id: str | None = None
+        self.fork_directory: str | None = None
         self.keep_fork = config.keep_fork_default
         self.closed = False
         self.compaction_task: asyncio.Task[None] | None = None
@@ -519,6 +537,12 @@ class VoiceConnection:
         self.native_mic: NativeMicSession | None = None
         self.native_speaker: NativeSpeakerSession | None = None
         self.native_speaker_unavailable = False
+        self.echo_canceller: EchoCanceller | None = None
+        self.mic_gated_frames = 0
+        self.speak_generation = 0
+        self.stale_tts_chunks = 0
+        self.tts_unavailable_chunks = 0
+        self.speaker_prewarm_task: asyncio.Task[None] | None = None
         self.final_transcript = ""
         self.tts_first_audio_seen = False
         self.audio_input_chunks = 0
@@ -652,6 +676,10 @@ class VoiceConnection:
         self.fork_session_id = fork_id
         self.voice_lane_id = self.voice_lane_id or f"lane_{int(time.time() * 1000)}"
         session = await self.client.get_session(fork_id)
+        # Forks inherit the source thread's directory; /event subscriptions
+        # are directory-scoped, so turns must subscribe with this value or the
+        # stream stays silent and every turn pays the poll-fallback timeout.
+        self.fork_directory = str(fork.get("directory") or session.get("directory") or "") or None
         messages = await self.client.messages(fork_id)
         estimate = active_context_estimate(messages)
         usage_tokens = session_usage_tokens(session)
@@ -706,6 +734,7 @@ class VoiceConnection:
         await self.start_audio(notify_ready=False)
         if self.closed or self.flux is None or self.native_mic:
             return bool(self.native_mic)
+        self.ensure_echo_canceller()
         native_mic = NativeMicSession(
             config=self.config,
             logger=self.logger,
@@ -720,6 +749,49 @@ class VoiceConnection:
         self.native_mic = native_mic
         return True
 
+    def ensure_echo_canceller(self) -> None:
+        if self.config.voice_duplex != "auto" or self.echo_canceller is not None:
+            return
+        try:
+            self.echo_canceller = EchoCanceller(self.config.deepgram_sample_rate)
+            self.logger.write("audio.aec.start", sample_rate=self.config.deepgram_sample_rate)
+        except Exception as exc:  # noqa: BLE001 - degrade to the half-duplex gate.
+            self.echo_canceller = None
+            self.logger.write("audio.aec.unavailable", error=repr(exc))
+
+    def duplex_mode(self) -> str:
+        mode = self.config.voice_duplex
+        if mode == "auto":
+            return "aec" if self.echo_canceller else "half"
+        return mode
+
+    def filter_mic_frame(self, data: bytes) -> bytes:
+        """Keep the assistant's own voice out of STT.
+
+        aec: run WebRTC echo cancellation (voice barge-in stays usable).
+        half: substitute silence while TTS is audible so STT physically
+        cannot hear the assistant; equal length keeps the STT timeline
+        continuous. full: raw passthrough for headphone users.
+        """
+        mode = self.duplex_mode()
+        if mode == "aec" and self.echo_canceller:
+            try:
+                return self.echo_canceller.process_capture(data)
+            except Exception as exc:  # noqa: BLE001 - fall back to the gate for the rest of the lane.
+                self.logger.write("audio.aec.error", error=repr(exc))
+                self.echo_canceller = None
+        if mode != "full" and self.native_speaker and self.native_speaker.is_audible():
+            self.mic_gated_frames += 1
+            return b"\x00" * len(data)
+        return data
+
+    def mic_gate_active(self) -> bool:
+        return (
+            self.duplex_mode() == "half"
+            and self.native_speaker is not None
+            and self.native_speaker.is_audible()
+        )
+
     async def stop_audio(self, reason: str) -> None:
         if self.native_mic:
             await self.native_mic.close()
@@ -731,7 +803,10 @@ class VoiceConnection:
 
     async def handle_native_audio(self, data: bytes) -> None:
         await self.record_audio_input(data)
-        if self.flux:
+        if not self.flux:
+            return
+        data = self.filter_mic_frame(data)
+        if data:
             await self.flux.send_audio(data)
 
     def reset_audio_input_counters(self) -> None:
@@ -781,10 +856,18 @@ class VoiceConnection:
         await self.forward_flux_event(event)
         if event["type"] == "speech.start":
             self.logger.write("speech.start")
+            if self.mic_gate_active():
+                # Gated mic feeds STT silence; anything STT still reports
+                # while TTS is audible can only be residue, never a user.
+                self.logger.write("speech.gated", event_type="speech.start")
+                return
             await self.barge_in(reason="speech_start")
             await self.maybe_start_compaction(reason="speech_start", run_in_background=True)
         elif event["type"] == "speech.resumed":
             self.logger.write("speech.resumed")
+            if self.mic_gate_active():
+                self.logger.write("speech.gated", event_type="speech.resumed")
+                return
             await self.barge_in(reason="speech_resumed")
         elif event["type"] == "speech.transcript" and event.get("is_final") and event.get("transcript"):
             self.final_transcript = str(event["transcript"]).strip()
@@ -816,6 +899,8 @@ class VoiceConnection:
         self.active_turn_id = turn_id
         self.tts_first_audio_seen = False
         started = time.perf_counter()
+        if self.speaker_prewarm_task is None or self.speaker_prewarm_task.done():
+            self.speaker_prewarm_task = asyncio.create_task(self.prewarm_speaker())
         await self.maybe_wait_for_compaction(turn_id)
         session_id = self.fork_session_id
         before_messages = await self.client.messages(session_id)
@@ -982,7 +1067,10 @@ class VoiceConnection:
             last_event_ms = elapsed_ms(started)
             while self.active_turn_id == turn_id and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=8)
+                    # Before the first delta, fail over to polling quickly; a
+                    # stream that produced text already earns a longer stall
+                    # budget (tool calls can pause deltas mid-turn).
+                    event = await asyncio.wait_for(queue.get(), timeout=3 if first_text_ms is None else 8)
                 except asyncio.TimeoutError as exc:
                     if first_text_ms is None:
                         raise OpenCodeEventFallback("event_stream_no_initial_events", prompt_sent=prompt_sent) from exc
@@ -1040,9 +1128,8 @@ class VoiceConnection:
         ready: asyncio.Event,
     ) -> None:
         try:
-            async for event in self.client.events(on_open=ready.set):
-                properties = event_properties(event)
-                if properties.get("sessionID") == session_id:
+            async for event in self.client.events(on_open=ready.set, directory=self.fork_directory):
+                if event_session_id(event) == session_id:
                     await queue.put(event)
         except asyncio.CancelledError:
             raise
@@ -1125,21 +1212,48 @@ class VoiceConnection:
                 await self.compact(reason="context_overflow_error", before_tokens=before_tokens)
                 tracker = AssistantTextTracker(await self.client.messages(session_id))
 
+    def build_speaker(self) -> DeepgramSpeakSession:
+        # Bind the current generation so audio still streaming from a
+        # barged-in speaker cannot reach the lane or resurrect playback.
+        generation = self.speak_generation
+
+        async def deliver(data: bytes, turn_id: int | None) -> None:
+            if generation != self.speak_generation:
+                self.stale_tts_chunks += 1
+                if self.stale_tts_chunks == 1 or self.stale_tts_chunks % 50 == 0:
+                    self.logger.write("tts.stale_audio.drop", chunks=self.stale_tts_chunks, turn_id=turn_id)
+                return
+            await self.send_tts_audio(data, turn_id)
+
+        return DeepgramSpeakSession(
+            config=self.config,
+            on_audio=deliver,
+            on_event=self.send_json,
+        )
+
+    async def prewarm_speaker(self) -> None:
+        """Open the TTS socket while the model is thinking so the handshake
+        is off the first-audio path."""
+        if self.speaker is not None or self.config.credential_issue_for("voice_audio"):
+            return
+        speaker = self.build_speaker()
+        self.speaker = speaker
+        try:
+            await speaker.start()
+        except Exception as exc:  # noqa: BLE001 - speak() retries; prewarm is best-effort.
+            self.logger.write("tts.prewarm.error", error=repr(exc))
+            if self.speaker is speaker:
+                self.speaker = None
+
     async def speak(self, text: str, turn_id: int) -> None:
         issue = self.config.credential_issue_for("voice_audio")
         if issue:
             await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
             return
         if self.speaker is None:
-            speaker = DeepgramSpeakSession(
-                config=self.config,
-                on_audio=self.send_tts_audio,
-                on_event=self.send_json,
-            )
-            self.speaker = speaker
-            await speaker.start()
-        else:
-            speaker = self.speaker
+            self.speaker = self.build_speaker()
+        speaker = self.speaker
+        await speaker.start()
         if self.speaker is not speaker:
             return
         await speaker.speak(text, turn_id=turn_id)
@@ -1153,6 +1267,7 @@ class VoiceConnection:
             await self.websocket.send_bytes(data)
 
     async def barge_in(self, reason: str) -> None:
+        self.speak_generation += 1
         if self.active_turn_id is not None:
             self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
         self.active_turn_id = None
@@ -1546,6 +1661,7 @@ class SidepodConnection(VoiceConnection):
 
     async def stop(self) -> None:
         self.cancel_mic_watchdog()
+        self.speak_generation += 1
         await self.stop_audio(reason="sidepod_stop")
         if self.turn_task and not self.turn_task.done():
             self.turn_task.cancel()
@@ -1582,15 +1698,42 @@ class SidepodConnection(VoiceConnection):
                 config=self.config,
                 logger=self.logger,
                 on_issue=self.send_json,
+                on_render=self.feed_render_reference,
             )
             if not await speaker.start():
                 self.native_speaker_unavailable = True
                 return
             self.native_speaker = speaker
+            self.update_aec_delay()
         if not await self.native_speaker.play(data, turn_id):
-            self.logger.write("native_tts.play.unavailable", turn_id=turn_id, bytes=len(data))
+            self.tts_unavailable_chunks += 1
+            if self.tts_unavailable_chunks == 1 or self.tts_unavailable_chunks % 50 == 0:
+                self.logger.write(
+                    "native_tts.play.unavailable",
+                    turn_id=turn_id,
+                    bytes=len(data),
+                    chunks=self.tts_unavailable_chunks,
+                )
+
+    def feed_render_reference(self, data: bytes) -> None:
+        if self.echo_canceller:
+            self.echo_canceller.process_render(data)
+
+    def update_aec_delay(self) -> None:
+        if not self.echo_canceller:
+            return
+        delay_sec = 0.0
+        for session in (self.native_mic, self.native_speaker):
+            latency = getattr(getattr(session, "stream", None), "latency", None)
+            if isinstance(latency, (int, float)):
+                delay_sec += float(latency)
+        try:
+            self.echo_canceller.set_stream_delay_ms(int(delay_sec * 1000))
+        except Exception as exc:  # noqa: BLE001 - delay hint is an optimization only.
+            self.logger.write("audio.aec.delay.error", error=repr(exc))
 
     async def barge_in(self, reason: str) -> None:
+        self.speak_generation += 1
         turn_id = getattr(self, "protocol_turn_id", "") or None
         # `interrupted` means something was actually cut off; a speech.start
         # with no active turn or speech is just the user starting to talk.
@@ -1879,14 +2022,19 @@ class DeepgramSpeakSession:
         self.reader_task: asyncio.Task[None] | None = None
         self.flush_limiter = FlushLimiter()
         self.current_turn_id: int | None = None
+        self._start_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        api_key = os.environ["DEEPGRAM_API_KEY"]
-        self.websocket = await connect_ws(
-            build_tts_url(self.config.deepgram_tts_model, self.config.deepgram_sample_rate),
-            {"Authorization": f"Token {api_key}"},
-        )
-        self.reader_task = asyncio.create_task(self._read_loop())
+        # Idempotent: prewarm and speak() may both race to open the socket.
+        async with self._start_lock:
+            if self.websocket:
+                return
+            api_key = os.environ["DEEPGRAM_API_KEY"]
+            self.websocket = await connect_ws(
+                build_tts_url(self.config.deepgram_tts_model, self.config.deepgram_sample_rate),
+                {"Authorization": f"Token {api_key}"},
+            )
+            self.reader_task = asyncio.create_task(self._read_loop())
 
     async def speak(self, text: str, turn_id: int) -> None:
         if not self.websocket:

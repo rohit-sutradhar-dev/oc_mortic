@@ -7,6 +7,7 @@ dependencies = [
   "fastapi>=0.115.0",
   "httpx>=0.27.0",
   "jsonschema>=4.21",
+  "livekit>=1.1,<2",
   "sounddevice>=0.5.0",
   "uvicorn[standard]>=0.30.0",
   "websockets>=12.0",
