@@ -158,6 +158,7 @@ class FakeNativeSpeaker:
         self.played: list[bytes] = []
         self.on_render = on_render
         self.audible = False
+        self.silent_for: float | None = None  # seconds since playback ended
         self.paused = False
 
     async def start(self) -> bool:
@@ -170,7 +171,9 @@ class FakeNativeSpeaker:
         return True
 
     def is_audible(self, tail_sec: float = 0.3) -> bool:
-        return self.audible
+        if self.audible:
+            return True
+        return self.silent_for is not None and self.silent_for < tail_sec
 
     def pause(self) -> None:
         self.paused = True
@@ -904,6 +907,81 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(started, ["hold on a second"])
             self.assertIsNone(connection.active_turn_id)
+
+    async def test_one_word_echo_during_playback_is_rejected(self) -> None:
+        # The "great" loop: the assistant opens with "Great," and its echo
+        # comes back as a single confident word — the old >=2-word guard let
+        # it through and it became the next prompt.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = "Great, I will update the config file now."
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "Great.", "eager": True, "confidence": 1.0}
+            )
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "Great.", "eager": False, "confidence": 1.0}
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, [])
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertFalse(speaker.paused)
+
+    async def test_closing_words_echo_in_the_tail_is_rejected(self) -> None:
+        # Echo of the assistant's final words transcribes after playback has
+        # ended; the content check stays armed through the tail window.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            speaker.audible = False
+            speaker.silent_for = 0.8
+            connection.spoken_text_recent = "I pushed the branch, let me know how it looks."
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "let me know how it looks", "eager": False, "confidence": 0.97}
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, [])
+
+    async def test_one_word_answer_right_after_playback_is_admitted(self) -> None:
+        # "Yes." moments after the assistant asked "yes or no?" is a real
+        # reply — the single-word echo rule must not apply once sound stops.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            speaker.audible = False
+            speaker.silent_for = 0.5
+            connection.spoken_text_recent = "Should I apply the change? Yes or no."
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "Yes.", "eager": False, "confidence": 0.99}
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, ["Yes."])
 
     async def test_short_reply_in_silence_is_admitted(self) -> None:
         # The tiny/echo floors only apply while the assistant is audible;

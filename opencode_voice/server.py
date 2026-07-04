@@ -1001,7 +1001,7 @@ class VoiceConnection:
         if verdict == "admit":
             if self.barge_pending:
                 self.clear_pending_barge_in()
-                self.logger.write("barge_in.confirmed", transcript_chars=len(transcript))
+                self.logger.write("barge_in.confirmed", transcript_chars=len(transcript), **detail)
                 await self.barge_in(reason="speech_confirmed")
                 await self.maybe_start_compaction(reason="speech_confirmed", run_in_background=True)
             elif self.native_speaker and self.native_speaker.is_audible():
@@ -1026,6 +1026,11 @@ class VoiceConnection:
     # scores well above this; echo the canceller distorted transcribes as
     # low-confidence garbage that the word-overlap check cannot match.
     ECHO_CONFIDENCE_FLOOR = 0.5
+    # Echo of the assistant's closing words is transcribed after playback has
+    # already ended, so the content checks stay armed this long past the last
+    # audible moment. (Length/one-word rules do not: a quick "Yes." right
+    # after the assistant finishes is a legitimate reply.)
+    ECHO_TAIL_SEC = 1.5
 
     def transcript_verdict(
         self, transcript: str, eager: bool, confidence: float | None = None
@@ -1045,9 +1050,12 @@ class VoiceConnection:
                          that leaked distorted transcribes as novel garbage
                          and defeats the overlap check
 
-        The tiny/echo/low_confidence rules apply only while playback is
-        audible: in silence a short "Yes." is a legitimate reply and overlap
-        with the previous answer is meaningless.
+        The content rules stay armed for ECHO_TAIL_SEC past the last audible
+        moment (echo of closing words transcribes after playback ends); the
+        length-based rules (tiny, single-word echo) apply only while sound is
+        actually on the air, so a quick short answer right after the
+        assistant finishes is still admitted. In full silence none of them
+        apply.
         """
         if not transcript:
             return "empty", {}
@@ -1058,17 +1066,30 @@ class VoiceConnection:
             return "duplicate", {}
         if not eager and self.eager_turn_text == transcript:
             return "confirmed_eager", {"turn_id": self.active_turn_id}
-        if self.native_speaker and self.native_speaker.is_audible():
-            if len(transcript) < self.config.barge_in_min_chars:
+        speaker = self.native_speaker
+        detail: dict[str, Any] = {}
+        if speaker and speaker.is_audible(tail_sec=self.ECHO_TAIL_SEC):
+            audible_now = speaker.is_audible()
+            if audible_now and len(transcript) < self.config.barge_in_min_chars:
                 return "tiny", {}
             words = transcript_words(transcript)
             spoken = set(transcript_words(self.spoken_text_recent))
             overlap = sum(word in spoken for word in words) / len(words) if words else 0.0
-            if len(words) >= 2 and overlap >= 0.75:
-                return "echo", {"overlap": round(overlap, 2)}
+            # Kept on admits too: transcripts are redacted from logs, so the
+            # overlap score is what lets a log reader judge echo-likeness.
+            detail["overlap"] = round(overlap, 2)
+            # A single word the assistant just used ("Great." echoing back)
+            # counts as echo only while sound is actually on the air; once
+            # playback ends, a one-word "Yes." is a legitimate answer even
+            # though the assistant's question contained the word.
+            multiword_echo = len(words) >= 2 and overlap >= 0.75
+            single_word_echo = audible_now and len(words) == 1 and overlap >= 1.0
+            if multiword_echo or single_word_echo:
+                return "echo", detail
             if confidence is not None and confidence < self.ECHO_CONFIDENCE_FLOOR:
-                return "low_confidence", {"confidence": round(confidence, 3)}
-        return "admit", {}
+                detail["confidence"] = round(confidence, 3)
+                return "low_confidence", detail
+        return "admit", detail
 
     def begin_pending_barge_in(self) -> None:
         self.barge_pending = True
