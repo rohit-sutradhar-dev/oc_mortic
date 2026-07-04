@@ -178,6 +178,11 @@ class FakeNativeSpeaker:
     def resume(self) -> None:
         self.paused = False
 
+    def flush(self, reason: str) -> None:
+        self.played.clear()
+        self.audible = False
+        self.paused = False
+
     async def close(self) -> None:
         self.audible = False
 
@@ -625,12 +630,16 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(connection.native_speaker)
 
             await connection.barge_in("user.mute")
-            self.assertIsNone(connection.native_speaker)
+            # The device stream survives the interrupt (echo-canceller
+            # convergence), but its queued audio is flushed.
+            native = connection.native_speaker
+            self.assertIsNotNone(native)
+            self.assertEqual(native.played, [])
 
             # Audio still streaming from the barged-in TTS socket must be
-            # dropped, not played, and must not recreate the native speaker.
+            # dropped by the generation guard, never played.
             await stale_speaker.on_audio(b"\x01\x02", 1)
-            self.assertIsNone(connection.native_speaker)
+            self.assertEqual(native.played, [])
             self.assertEqual(connection.stale_tts_chunks, 1)
 
 
@@ -773,6 +782,52 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(client.aborted), 1)
             self.assertEqual(started, ["wait, try the other file"])
             self.assertFalse(connection.barge_pending)
+
+    async def test_transcript_of_the_assistants_own_words_is_echo_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = "Sure, I can walk you through the config file changes now."
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "I can walk you through", "eager": True}
+            )
+            await asyncio.sleep(0)
+
+            self.assertFalse(speaker.paused)
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertEqual(started, [])
+            self.assertEqual(client.aborted, [])
+
+    async def test_novel_words_during_playback_still_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = "Sure, I can walk you through the config file changes now."
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "no wait, look at the tests instead", "eager": False}
+            )
+            await asyncio.sleep(0)
+
+            self.assertIsNone(connection.active_turn_id)
+            self.assertEqual(started, ["no wait, look at the tests instead"])
 
     async def test_confirm_deadline_expiry_resumes_playback(self) -> None:
         import dataclasses

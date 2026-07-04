@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,6 +101,10 @@ def helper_readiness_issues(
     credentials = load_voice_credentials(dotenv_path=dotenv_path)
     issues.extend(issue.to_voice_bridge_issue(debug_ref=debug_ref) for issue in credentials.issues)
     return tuple(issues)
+
+
+def transcript_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower())
 
 
 class OpenCodeEventFallback(Exception):
@@ -347,6 +352,22 @@ class NativeSpeakerSession:
         self.paused = False
         self.resume_event.set()
         self.logger.write("native_tts.resume")
+
+    def flush(self, reason: str) -> None:
+        """Drop queued audio but keep the device stream open — closing it
+        would make the echo canceller re-converge on the next turn."""
+        discarded = 0
+        if self.queue:
+            while not self.queue.empty():
+                self.queue.get_nowait()
+                discarded += 1
+        if discarded:
+            self.dropped_chunks += discarded
+            self.logger.write("native_tts.drop", dropped_chunks=discarded, reason=reason)
+        self.speaking_until = 0.0
+        if self.paused:
+            self.paused = False
+            self.resume_event.set()
 
     async def pump(self) -> None:
         if not self.queue:
@@ -599,6 +620,7 @@ class VoiceConnection:
         self.speaker_prewarm_task: asyncio.Task[None] | None = None
         self.final_transcript = ""
         self.eager_turn_text: str | None = None
+        self.spoken_text_recent = ""
         self.barge_pending = False
         self.pending_barge_task: asyncio.Task[None] | None = None
         self.aec_delay_error_logged = False
@@ -1013,6 +1035,23 @@ class VoiceConnection:
             return True
         self.clear_pending_barge_in()
         if transcript and len(transcript) >= self.config.barge_in_min_chars:
+            # A transcript whose words are mostly the assistant's own recent
+            # speech is echo the canceller missed, not the user — a length
+            # gate can't tell them apart (live run: 9-13 char echo fragments
+            # "confirmed" five interrupts in a row and chained into turns).
+            words = transcript_words(transcript)
+            spoken = set(transcript_words(self.spoken_text_recent))
+            overlap = sum(word in spoken for word in words) / len(words) if words else 0.0
+            if len(words) >= 2 and overlap >= 0.75:
+                self.logger.write(
+                    "barge_in.echo",
+                    reason=reason,
+                    transcript_chars=len(transcript),
+                    overlap=round(overlap, 2),
+                )
+                if self.native_speaker:
+                    self.native_speaker.resume()
+                return False
             self.logger.write("barge_in.confirmed", reason=reason, transcript_chars=len(transcript))
             await self.barge_in(reason="speech_confirmed")
             await self.maybe_start_compaction(reason="speech_confirmed", run_in_background=True)
@@ -1400,6 +1439,9 @@ class VoiceConnection:
         if issue:
             await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
             return
+        # Rolling record of what the assistant said recently; the pending
+        # barge-in resolver matches transcripts against it to spot echo.
+        self.spoken_text_recent = (self.spoken_text_recent + " " + text)[-1000:]
         if self.speaker is None:
             self.speaker = self.build_speaker()
         speaker = self.speaker
@@ -1428,13 +1470,27 @@ class VoiceConnection:
             self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
         self.active_turn_id = None
         if self.speaker:
-            await self.speaker.close()
+            # Deepgram's graceful close waits for the server to flush the
+            # rest of the utterance (seen live: 4s of dead air after a
+            # confirmed interrupt). Stale audio is generation-guarded, so
+            # detach now and let the socket close in the background.
+            speaker = self.speaker
             self.speaker = None
+            asyncio.create_task(self.close_speaker_quietly(speaker))
         if self.native_speaker:
-            await self.native_speaker.close()
-            self.native_speaker = None
-            self.native_speaker_unavailable = False
+            # Flush instead of close: tearing the device stream down every
+            # interrupt forces the echo canceller to re-converge from scratch
+            # on the next turn, and that first ~1.5s leak is exactly what
+            # triggers the echo barge-ins.
+            self.native_speaker.flush(reason=reason)
+        self.native_speaker_unavailable = False
         return interrupted
+
+    async def close_speaker_quietly(self, speaker: DeepgramSpeakSession) -> None:
+        try:
+            await speaker.close()
+        except Exception as exc:  # noqa: BLE001 - background close is best-effort.
+            self.logger.write("tts.close.error", error=repr(exc))
 
     async def abort_fork_turn(self) -> None:
         if self.fork_session_id:
@@ -1831,6 +1887,11 @@ class SidepodConnection(VoiceConnection):
         if self.turn_task and not self.turn_task.done():
             self.turn_task.cancel()
         await self.interrupt_playback("sidepod_stop")
+        # interrupt_playback keeps the device stream for the next turn; the
+        # session is over, so actually release it here.
+        if self.native_speaker:
+            await self.native_speaker.close()
+            self.native_speaker = None
         # The parent's legacy `stopped` message dies at the translation seam;
         # the v0 ack is handle_stop's job.
         await super().stop()
