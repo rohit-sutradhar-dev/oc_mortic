@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 
@@ -49,22 +50,32 @@ def main(argv: list[str] | None = None) -> int:
             voice_agent_name=args.agent,
         )
 
+    # Only pass these when the CLI explicitly sets them (default=None), so an
+    # unset flag lets VoiceConfig's own dataclass default win instead of a
+    # stale literal baked into argparse silently overriding a config.py edit.
+    model_overrides: dict[str, Any] = {}
+    if args.stt_model is not None:
+        model_overrides["deepgram_stt_model"] = args.stt_model
+    if args.tts_model is not None:
+        model_overrides["deepgram_tts_model"] = args.tts_model
+    if args.sample_rate is not None:
+        model_overrides["deepgram_sample_rate"] = args.sample_rate
+    if args.cartesia_tts_model is not None:
+        model_overrides["cartesia_tts_model"] = args.cartesia_tts_model
+    if args.cartesia_voice_id is not None:
+        model_overrides["cartesia_voice_id"] = args.cartesia_voice_id
+
     config = VoiceConfig(
         opencode_url=opencode_url,
         bridge_host=args.host,
         bridge_port=args.port,
         model=model,
         context_threshold_tokens=args.context_threshold,
-        deepgram_stt_model=args.stt_model,
-        deepgram_tts_model=args.tts_model,
-        deepgram_sample_rate=args.sample_rate,
         # The plugin spawns the helper with a fixed flag set (README's launch
         # chain), so a plugin-side "/mortic" session can't pass --tts-provider
         # directly; the env var (settable in .env like the API keys) is the
         # only way to configure it there.
         tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "deepgram",
-        cartesia_tts_model=args.cartesia_tts_model,
-        cartesia_voice_id=args.cartesia_voice_id,
         flux_eager_eot_threshold=args.eager_eot_threshold or None,
         voice_duplex=args.voice_duplex,
         barge_in_confirm_sec=args.barge_in_confirm_sec,
@@ -74,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         opencode_agent=args.agent,
         voice_agent_prompt_path=args.voice_agent_prompt,
         keep_fork_default=args.keep_fork,
+        **model_overrides,
     )
     if args.print_config:
         print(
@@ -119,9 +131,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Markdown prompt used for the ephemeral managed-server voice agent.",
     )
     parser.add_argument("--context-threshold", type=int, default=70_000, help="Token threshold for proactive compaction.")
-    parser.add_argument("--stt-model", default="flux-general-en", help="Speech-to-text model id.")
-    parser.add_argument("--tts-model", default="aura-2-thalia-en", help="Text-to-speech model id.")
-    parser.add_argument("--sample-rate", type=int, default=16_000, help="PCM sample rate for STT and TTS.")
+    parser.add_argument(
+        "--stt-model", default=None, help="Speech-to-text model id. Defaults to VoiceConfig.deepgram_stt_model."
+    )
+    parser.add_argument(
+        "--tts-model", default=None, help="Deepgram TTS model id. Defaults to VoiceConfig.deepgram_tts_model."
+    )
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=None,
+        help="PCM sample rate for STT and TTS. Defaults to VoiceConfig.deepgram_sample_rate.",
+    )
     parser.add_argument(
         "--tts-provider",
         default=None,
@@ -131,11 +152,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Falls back to OPENCODE_VOICE_TTS_PROVIDER, then 'deepgram'."
         ),
     )
-    parser.add_argument("--cartesia-tts-model", default="sonic-3.5", help="Cartesia TTS model id.")
     parser.add_argument(
-        "--cartesia-voice-id",
-        default="a0e99841-438c-4a64-b679-ae501e7d6091",
-        help="Cartesia voice id.",
+        "--cartesia-tts-model", default=None, help="Cartesia TTS model id. Defaults to VoiceConfig.cartesia_tts_model."
+    )
+    parser.add_argument(
+        "--cartesia-voice-id", default=None, help="Cartesia voice id. Defaults to VoiceConfig.cartesia_voice_id."
     )
     parser.add_argument(
         "--eager-eot-threshold",

@@ -143,12 +143,12 @@ class VoiceConfig:
     run_root: str = "runs/voice"
     deepgram_stt_model: str = "flux-general-en"
     deepgram_tts_model: str = "aura-2-thalia-en"
-    deepgram_sample_rate: int = 16_000
+    deepgram_sample_rate: int = 48_000
     # STT stays on Deepgram Flux regardless of this setting; it only selects
     # which service synthesizes TTS audio.
     tts_provider: str = "deepgram"
     cartesia_tts_model: str = "sonic-3.5"
-    cartesia_voice_id: str = "a0e99841-438c-4a64-b679-ae501e7d6091"
+    cartesia_voice_id: str = "25d7abcb-4d6d-4aca-adce-8a1c85620c8b"
     cartesia_version: str = "2026-03-01"
     flux_eot_threshold: float = 0.7
     flux_eager_eot_threshold: float | None = 0.6
