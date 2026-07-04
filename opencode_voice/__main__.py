@@ -58,6 +58,13 @@ def main(argv: list[str] | None = None) -> int:
         deepgram_stt_model=args.stt_model,
         deepgram_tts_model=args.tts_model,
         deepgram_sample_rate=args.sample_rate,
+        # The plugin spawns the helper with a fixed flag set (README's launch
+        # chain), so a plugin-side "/mortic" session can't pass --tts-provider
+        # directly; the env var (settable in .env like the API keys) is the
+        # only way to configure it there.
+        tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "deepgram",
+        cartesia_tts_model=args.cartesia_tts_model,
+        cartesia_voice_id=args.cartesia_voice_id,
         flux_eager_eot_threshold=args.eager_eot_threshold or None,
         voice_duplex=args.voice_duplex,
         barge_in_confirm_sec=args.barge_in_confirm_sec,
@@ -115,6 +122,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stt-model", default="flux-general-en", help="Speech-to-text model id.")
     parser.add_argument("--tts-model", default="aura-2-thalia-en", help="Text-to-speech model id.")
     parser.add_argument("--sample-rate", type=int, default=16_000, help="PCM sample rate for STT and TTS.")
+    parser.add_argument(
+        "--tts-provider",
+        default=None,
+        choices=["deepgram", "cartesia"],
+        help=(
+            "TTS engine for playback (STT always stays on Deepgram Flux). "
+            "Falls back to OPENCODE_VOICE_TTS_PROVIDER, then 'deepgram'."
+        ),
+    )
+    parser.add_argument("--cartesia-tts-model", default="sonic-3.5", help="Cartesia TTS model id.")
+    parser.add_argument(
+        "--cartesia-voice-id",
+        default="a0e99841-438c-4a64-b679-ae501e7d6091",
+        help="Cartesia voice id.",
+    )
     parser.add_argument(
         "--eager-eot-threshold",
         type=float,

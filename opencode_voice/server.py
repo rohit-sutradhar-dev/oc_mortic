@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -15,6 +17,7 @@ import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from opencode_voice.cartesia import build_tts_url as build_cartesia_tts_url
 from opencode_voice.config import (
     VoiceConfig,
     iso_utc_now,
@@ -78,6 +81,7 @@ def helper_readiness_issues(
     audio_ready: bool | None = None,
     debug_ref: str | None = None,
     dotenv_path: str | Path = ".env",
+    tts_provider: str = "deepgram",
 ) -> tuple[dict[str, Any], ...]:
     issues: list[dict[str, Any]] = []
     if not transport_ready:
@@ -98,7 +102,7 @@ def helper_readiness_issues(
                 debug_ref=debug_ref,
             )
         )
-    credentials = load_voice_credentials(dotenv_path=dotenv_path)
+    credentials = load_voice_credentials(dotenv_path=dotenv_path, tts_provider=tts_provider)
     issues.extend(issue.to_voice_bridge_issue(debug_ref=debug_ref) for issue in credentials.issues)
     return tuple(issues)
 
@@ -295,13 +299,6 @@ class NativeSpeakerSession:
                 samplerate=self.config.deepgram_sample_rate,
                 channels=1,
                 dtype="int16",
-                # A deeper device buffer than the low-latency default: the pump
-                # feeds from the event loop, which also runs per-frame echo
-                # cancellation, so its wake-up jitters. A larger buffer rides
-                # that out instead of underrunning between chunks (~6% gaps
-                # measured on long replies). Costs a few tens of ms to first
-                # audio — well under the TTS round-trip.
-                latency="high",
             )
             self.stream.start()
         except Exception as exc:  # noqa: BLE001 - device/permission failures become safe UI issues.
@@ -512,20 +509,25 @@ def create_app(
     client_factory: Callable[[str, float], OpenCodeClient] = OpenCodeClient,
 ) -> FastAPI:
     app = FastAPI(title="OpenCode Mercury Voice Bridge")
-    load_voice_credentials()
+    load_voice_credentials(tts_provider=config.tts_provider)
     logger = RunLogger(config.run_root)
 
     @app.on_event("startup")
     async def _startup() -> None:
-        readiness_issues = helper_readiness_issues(transport_ready=True, debug_ref=str(logger.run_dir))
+        readiness_issues = helper_readiness_issues(
+            transport_ready=True, debug_ref=str(logger.run_dir), tts_provider=config.tts_provider
+        )
         logger.write(
             "bridge.start",
             opencode_url=config.opencode_url,
             model=config.model.opencode_name,
             deepgram_stt_model=config.deepgram_stt_model,
+            tts_provider=config.tts_provider,
             deepgram_tts_model=config.deepgram_tts_model,
+            cartesia_tts_model=config.cartesia_tts_model,
             has_deepgram_key=config.has_deepgram_key,
             has_inception_key=config.has_inception_key,
+            has_cartesia_key=config.has_cartesia_key,
             ready=not readiness_issues,
             diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
             run_dir=str(logger.run_dir),
@@ -550,8 +552,10 @@ def create_app(
 
     @app.get("/api/health")
     async def health() -> JSONResponse:
-        credentials = load_voice_credentials()
-        readiness_issues = helper_readiness_issues(transport_ready=True, debug_ref=str(logger.run_dir))
+        credentials = load_voice_credentials(tts_provider=config.tts_provider)
+        readiness_issues = helper_readiness_issues(
+            transport_ready=True, debug_ref=str(logger.run_dir), tts_provider=config.tts_provider
+        )
         client = client_factory(config.opencode_url, 10)
         try:
             opencode_health = await client.health()
@@ -570,10 +574,16 @@ def create_app(
                     issue.to_voice_bridge_issue(debug_ref=str(logger.run_dir)) for issue in credentials.issues
                 ],
                 "issues": list(readiness_issues),
+                "tts_provider": config.tts_provider,
                 "deepgram": {
                     "enabled": config.has_deepgram_key,
                     "stt_model": config.deepgram_stt_model,
                     "tts_model": config.deepgram_tts_model,
+                    "sample_rate": config.deepgram_sample_rate,
+                },
+                "cartesia": {
+                    "enabled": config.has_cartesia_key,
+                    "tts_model": config.cartesia_tts_model,
                     "sample_rate": config.deepgram_sample_rate,
                 },
             }
@@ -667,7 +677,7 @@ class VoiceConnection:
         self.protocol_turn_id = ""
         self.sidepod_readiness_issues: tuple[dict[str, Any], ...] = ()
         self.flux: DeepgramFluxSession | None = None
-        self.speaker: DeepgramSpeakSession | None = None
+        self.speaker: DeepgramSpeakSession | CartesiaSpeakSession | None = None
         self.native_mic: NativeMicSession | None = None
         self.native_speaker: NativeSpeakerSession | None = None
         self.native_speaker_unavailable = False
@@ -695,6 +705,7 @@ class VoiceConnection:
         readiness_issues = helper_readiness_issues(
             transport_ready=True,
             debug_ref=str(self.logger.run_dir),
+            tts_provider=self.config.tts_provider,
         )
         if readiness_issues:
             self.logger.state_transition(
@@ -1567,7 +1578,7 @@ class VoiceConnection:
                 await self.compact(reason="context_overflow_error", before_tokens=before_tokens)
                 tracker = AssistantTextTracker(await self.client.messages(session_id))
 
-    def build_speaker(self) -> DeepgramSpeakSession:
+    def build_speaker(self) -> DeepgramSpeakSession | CartesiaSpeakSession:
         # Bind the current generation so audio still streaming from a
         # barged-in speaker cannot reach the lane or resurrect playback.
         generation = self.speak_generation
@@ -1580,7 +1591,17 @@ class VoiceConnection:
                 return
             await self.send_tts_audio(data, turn_id)
 
-        return DeepgramSpeakSession(
+        # Built fresh each call (not a module-level constant) so tests can
+        # patch opencode_voice.server.DeepgramSpeakSession/CartesiaSpeakSession
+        # and have the swap take effect; adding a provider is one entry here
+        # plus one class with the same start/speak/close(config, on_audio,
+        # on_event) shape.
+        tts_provider_sessions: dict[str, type] = {
+            "deepgram": DeepgramSpeakSession,
+            "cartesia": CartesiaSpeakSession,
+        }
+        session_cls = tts_provider_sessions.get(self.config.tts_provider, DeepgramSpeakSession)
+        return session_cls(
             config=self.config,
             on_audio=deliver,
             on_event=self.send_json,
@@ -1659,7 +1680,7 @@ class VoiceConnection:
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
-    async def close_speaker_quietly(self, speaker: DeepgramSpeakSession) -> None:
+    async def close_speaker_quietly(self, speaker: DeepgramSpeakSession | CartesiaSpeakSession) -> None:
         try:
             await speaker.close()
         except Exception as exc:  # noqa: BLE001 - background close is best-effort.
@@ -1843,6 +1864,7 @@ class SidepodConnection(VoiceConnection):
         readiness_issues = helper_readiness_issues(
             transport_ready=True,
             debug_ref=str(self.logger.run_dir),
+            tts_provider=self.config.tts_provider,
         )
         self.sidepod_readiness_issues = readiness_issues
         if readiness_issues:
@@ -2482,6 +2504,127 @@ class DeepgramSpeakSession:
                     await self.on_audio(bytes(message), self.current_turn_id)
                 elif isinstance(message, str):
                     await self.on_event({"type": "tts.metadata", "raw": json.loads(message)})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI for visibility.
+            await self.on_event({"type": "tts.error", "message": repr(exc)})
+
+
+class CartesiaSpeakSession:
+    """Same start/speak/close/on_audio surface as DeepgramSpeakSession, so
+    build_speaker() can pick either without the rest of the connection caring.
+
+    Cartesia has no single-context Flush primitive: each speak() call opens
+    its own context_id, one complete non-continued request per chunk. Unlike
+    Deepgram's single always-open context (inherently ordered), Cartesia
+    synthesizes concurrent contexts on the same socket and interleaves their
+    audio as it arrives — confirmed live: three back-to-back context_ids came
+    back with chunks alternating between contexts, not in send order. Two
+    contexts in flight together means two sentences' audio interleaved into
+    one playback queue, which is audible as garbled/simultaneous speech.
+    speak() therefore holds a lock for a context's entire lifetime — sent,
+    streamed, and done — so the next call can't start a second context until
+    the first one's audio has fully arrived. (An Event doesn't work here:
+    Event.set() wakes every waiter at once, so two speak() calls queued
+    behind one Event would both slip through together and race exactly like
+    the bug this is fixing.)
+    """
+
+    def __init__(
+        self,
+        config: VoiceConfig,
+        on_audio: Callable[[bytes, int | None], Awaitable[None]],
+        on_event: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        self.config = config
+        self.on_audio = on_audio
+        self.on_event = on_event
+        self.websocket: Any = None
+        self.reader_task: asyncio.Task[None] | None = None
+        self.current_turn_id: int | None = None
+        self._context_turns: dict[str, int | None] = {}
+        self._context_done: dict[str, asyncio.Event] = {}
+        self._context_lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
+        self.closed = False
+
+    async def start(self) -> None:
+        async with self._start_lock:
+            if self.websocket:
+                return
+            api_key = os.environ["CARTESIA_API_KEY"]
+            self.websocket = await connect_ws(
+                build_cartesia_tts_url(self.config.cartesia_version),
+                {"X-API-Key": api_key},
+            )
+            self.reader_task = asyncio.create_task(self._read_loop())
+
+    async def speak(self, text: str, turn_id: int) -> None:
+        if not self.websocket:
+            await self.start()
+        async with self._context_lock:
+            if self.closed:
+                return
+            self.current_turn_id = turn_id
+            context_id = str(uuid.uuid4())
+            done_event = asyncio.Event()
+            self._context_turns[context_id] = turn_id
+            self._context_done[context_id] = done_event
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "model_id": self.config.cartesia_tts_model,
+                        "transcript": text,
+                        "context_id": context_id,
+                        "voice": {"mode": "id", "id": self.config.cartesia_voice_id},
+                        "output_format": {
+                            "container": "raw",
+                            "encoding": "pcm_s16le",
+                            "sample_rate": self.config.deepgram_sample_rate,
+                        },
+                        "language": "en",
+                    }
+                )
+            )
+            await self.on_event({"type": "tts.flush", "turn_id": turn_id, "chars": len(text)})
+            # Held until this context's audio has fully arrived (or close()
+            # force-releases it), keeping the lock so no other context opens.
+            await done_event.wait()
+
+    async def close(self) -> None:
+        self.closed = True
+        for done_event in self._context_done.values():
+            done_event.set()
+        if self.reader_task and not self.reader_task.done():
+            self.reader_task.cancel()
+        if self.websocket:
+            await self.websocket.close()
+            self.websocket = None
+        self._context_turns.clear()
+        self._context_done.clear()
+
+    async def _read_loop(self) -> None:
+        try:
+            async for message in self.websocket:
+                if not isinstance(message, str):
+                    continue
+                payload = json.loads(message)
+                msg_type = payload.get("type")
+                context_id = payload.get("context_id")
+                turn_id = self._context_turns.get(context_id)
+                if msg_type == "chunk" and payload.get("data"):
+                    await self.on_audio(base64.b64decode(payload["data"]), turn_id)
+                elif msg_type == "done" or payload.get("done"):
+                    self._context_turns.pop(context_id, None)
+                    done_event = self._context_done.pop(context_id, None)
+                    if done_event:
+                        done_event.set()
+                elif msg_type == "error":
+                    self._context_turns.pop(context_id, None)
+                    done_event = self._context_done.pop(context_id, None)
+                    if done_event:
+                        done_event.set()
+                    await self.on_event({"type": "tts.error", "message": payload.get("error") or repr(payload)})
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI for visibility.

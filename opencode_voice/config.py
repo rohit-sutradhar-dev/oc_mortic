@@ -51,6 +51,24 @@ REQUIRED_CREDENTIALS = (
     ),
 )
 
+# Keyed by VoiceConfig.tts_provider: an additional credential required only
+# when that provider is the active one, so a Deepgram-only setup never sees a
+# spurious missing-key issue for a provider it isn't using.
+TTS_PROVIDER_CREDENTIALS: dict[str, CredentialSpec] = {
+    "cartesia": CredentialSpec(
+        env_var="CARTESIA_API_KEY",
+        capability="voice_audio",
+        diagnostic_code="missing_cartesia_api_key",
+        safe_detail="Voice audio unavailable",
+    ),
+}
+ALL_CREDENTIALS = REQUIRED_CREDENTIALS + tuple(TTS_PROVIDER_CREDENTIALS.values())
+
+
+def required_credentials(tts_provider: str = "deepgram") -> tuple[CredentialSpec, ...]:
+    extra = TTS_PROVIDER_CREDENTIALS.get(tts_provider)
+    return REQUIRED_CREDENTIALS + ((extra,) if extra else ())
+
 
 @dataclass(frozen=True)
 class VoiceCredentialIssue:
@@ -126,6 +144,12 @@ class VoiceConfig:
     deepgram_stt_model: str = "flux-general-en"
     deepgram_tts_model: str = "aura-2-thalia-en"
     deepgram_sample_rate: int = 16_000
+    # STT stays on Deepgram Flux regardless of this setting; it only selects
+    # which service synthesizes TTS audio.
+    tts_provider: str = "deepgram"
+    cartesia_tts_model: str = "sonic-3.5"
+    cartesia_voice_id: str = "a0e99841-438c-4a64-b679-ae501e7d6091"
+    cartesia_version: str = "2026-03-01"
     flux_eot_threshold: float = 0.7
     flux_eager_eot_threshold: float | None = 0.6
     flux_eot_timeout_ms: int = 5_000
@@ -161,8 +185,12 @@ class VoiceConfig:
         return bool(os.environ.get("INCEPTION_API_KEY"))
 
     @property
+    def has_cartesia_key(self) -> bool:
+        return bool(os.environ.get("CARTESIA_API_KEY"))
+
+    @property
     def credential_issues(self) -> tuple[VoiceCredentialIssue, ...]:
-        return load_voice_credentials().issues
+        return load_voice_credentials(tts_provider=self.tts_provider).issues
 
     def credential_issue_for(self, capability: str) -> VoiceCredentialIssue | None:
         for issue in self.credential_issues:
@@ -233,6 +261,7 @@ def load_voice_credentials(
     *,
     environ: MutableMapping[str, str] | None = None,
     dotenv_path: str | Path = ".env",
+    tts_provider: str = "deepgram",
 ) -> VoiceCredentials:
     target = environ if environ is not None else os.environ
     load_local_dotenv(dotenv_path, target)
@@ -242,7 +271,7 @@ def load_voice_credentials(
             diagnostic_code=spec.diagnostic_code,
             safe_detail=spec.safe_detail,
         )
-        for spec in REQUIRED_CREDENTIALS
+        for spec in required_credentials(tts_provider)
         if not target.get(spec.env_var)
     ]
     return VoiceCredentials(
@@ -260,7 +289,7 @@ def secret_values(
     target = environ if environ is not None else os.environ
     values = [
         value
-        for value in (target.get(spec.env_var) for spec in REQUIRED_CREDENTIALS)
+        for value in (target.get(spec.env_var) for spec in ALL_CREDENTIALS)
         if value and len(value) > 3
     ]
     values.extend(value for value in extra if value and len(value) > 3)

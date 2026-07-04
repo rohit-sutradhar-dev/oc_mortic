@@ -153,6 +153,11 @@ class FakeSpeakSession:
         return None
 
 
+class FakeCartesiaSpeakSession(FakeSpeakSession):
+    """Distinct type from FakeSpeakSession so provider-selection tests can
+    prove build_speaker() picked the right class, not just *a* class."""
+
+
 class FakeNativeSpeaker:
     def __init__(self, config: Any, logger: Any, on_issue: Any, on_render: Any = None, on_drain: Any = None) -> None:
         self.played: list[bytes] = []
@@ -238,12 +243,18 @@ def lane_connection(
     tmp: str,
     client: LaneFakeClient | None = None,
     voice_duplex: str = "auto",
+    tts_provider: str = "deepgram",
     **kwargs: Any,
 ) -> tuple[SidepodConnection, FakeWebSocket, LaneFakeClient]:
     websocket = FakeWebSocket()
     fake_client = client or LaneFakeClient()
     connection = SidepodConnection(
-        config=VoiceConfig(opencode_url="http://opencode.test", run_root=tmp, voice_duplex=voice_duplex),
+        config=VoiceConfig(
+            opencode_url="http://opencode.test",
+            run_root=tmp,
+            voice_duplex=voice_duplex,
+            tts_provider=tts_provider,
+        ),
         client=fake_client,  # type: ignore[arg-type]
         logger=RunLogger(root=tmp),
         websocket=websocket,  # type: ignore[arg-type]
@@ -390,6 +401,35 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
             deltas = [m for m in websocket.sent if m["type"] == "assistant.delta"]
             self.assertTrue(deltas, "the trailing text must still stream")
             assert_all_lane_messages_valid(self, websocket.sent)
+
+
+class TTSProviderSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_build_speaker_picks_the_configured_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramSpeakSession", FakeSpeakSession
+        ), patch("opencode_voice.server.CartesiaSpeakSession", FakeCartesiaSpeakSession):
+            deepgram_connection, _websocket, _client = lane_connection(tmp, tts_provider="deepgram")
+            cartesia_connection, _websocket2, _client2 = lane_connection(tmp, tts_provider="cartesia")
+
+            self.assertIs(type(deepgram_connection.build_speaker()), FakeSpeakSession)
+            self.assertIs(type(cartesia_connection.build_speaker()), FakeCartesiaSpeakSession)
+
+    async def test_speak_is_gated_when_the_active_providers_key_is_missing(self) -> None:
+        env = {"DEEPGRAM_API_KEY": "audio-key", "INCEPTION_API_KEY": "turn-key"}  # no CARTESIA_API_KEY
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True), patch(
+            # credential_issue_for reads the real project .env by default; a
+            # developer's local CARTESIA_API_KEY must not leak into this
+            # "key absent" scenario.
+            "opencode_voice.config.load_local_dotenv",
+            return_value=(),
+        ):
+            connection, websocket, _client = lane_connection(tmp, tts_provider="cartesia")
+            await connection.speak("Hello there.", turn_id=1)
+
+        self.assertIsNone(connection.speaker)
+        issues = [message for message in websocket.sent if message.get("type") == "voice_bridge_issue"]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["diagnosticCode"], "missing_cartesia_api_key")
 
 
 class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):

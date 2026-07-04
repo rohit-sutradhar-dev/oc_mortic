@@ -24,6 +24,13 @@ export INCEPTION_API_KEY="..."
 export DEEPGRAM_API_KEY="..."
 ```
 
+STT always runs on Deepgram Flux. TTS defaults to Deepgram but can be switched
+to Cartesia with `--tts-provider cartesia` (needs `CARTESIA_API_KEY` set too):
+
+```bash
+export CARTESIA_API_KEY="..."  # only needed when --tts-provider cartesia
+```
+
 ## Run The Helper
 
 ```bash
@@ -40,6 +47,7 @@ mortic-helper --help
 mortic-helper --managed-opencode --opencode-dir "/path/to/project"
 mortic-helper --context-threshold 70000 --model-variant low
 mortic-helper --eager-eot-threshold 0.7   # default 0.6; pass 0 to disable
+mortic-helper --tts-provider cartesia     # switch TTS off Deepgram (STT stays on Flux)
 mortic-helper --voice-duplex full          # headphones: skip echo protection
 mortic-helper --barge-in-confirm-sec 2.0  # pause window while a mid-playback voice confirms
 mortic-helper --barge-in-min-chars 4      # shorter transcripts resume playback instead

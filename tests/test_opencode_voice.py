@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import tempfile
@@ -24,7 +25,7 @@ from opencode_voice.config import (
 from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import SSEParser
-from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, create_app, helper_readiness_issues
+from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, CartesiaSpeakSession, create_app, helper_readiness_issues
 from opencode_voice.state import (
     AssistantTextTracker,
     OpenCodeEventTurnTracker,
@@ -104,6 +105,30 @@ class CredentialConfigTests(unittest.TestCase):
         self.assertNotIn("INCEPTION_API_KEY", serialized)
         self.assertNotIn("Deepgram", serialized)
         self.assertNotIn("Mercury", serialized)
+
+    def test_cartesia_key_only_required_when_it_is_the_active_tts_provider(self) -> None:
+        env = {"DEEPGRAM_API_KEY": "audio-key", "INCEPTION_API_KEY": "turn-key"}
+        with patch.dict(os.environ, env, clear=True):
+            deepgram_default = load_voice_credentials(dotenv_path="/tmp/mortic-missing-dotenv")
+            cartesia_active = load_voice_credentials(
+                dotenv_path="/tmp/mortic-missing-dotenv", tts_provider="cartesia"
+            )
+
+        self.assertEqual(deepgram_default.issues, ())
+        self.assertEqual(len(cartesia_active.issues), 1)
+        self.assertEqual(cartesia_active.issues[0].diagnostic_code, "missing_cartesia_api_key")
+        self.assertEqual(cartesia_active.issues[0].capability, "voice_audio")
+
+    def test_cartesia_key_redacted_even_when_deepgram_is_the_active_provider(self) -> None:
+        env = {
+            "DEEPGRAM_API_KEY": "audio-key",
+            "INCEPTION_API_KEY": "turn-key",
+            "CARTESIA_API_KEY": "cartesia-secret",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            payload = redact_secrets({"headers": {"X-API-Key": "cartesia-secret"}})
+
+        self.assertNotIn("cartesia-secret", json.dumps(payload))
 
     def test_redacts_raw_keys_recursively(self) -> None:
         raw_key = "sk-test-secret-123"
@@ -774,6 +799,97 @@ class DeepgramProtocolTests(unittest.TestCase):
         )
         self.assertEqual(end["type"], "speech.end")
         self.assertTrue(end["is_final"])
+
+
+class FakeCartesiaWebSocket:
+    """Records sent requests and lets the test drive incoming messages on its
+    own schedule, so context timing is fully controlled without a real
+    socket or the network."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self._incoming: asyncio.Queue[str] = asyncio.Queue()
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(json.loads(payload))
+
+    def __aiter__(self) -> "FakeCartesiaWebSocket":
+        return self
+
+    async def __anext__(self) -> str:
+        return await self._incoming.get()
+
+    async def push_chunk(self, context_id: str, data: bytes) -> None:
+        await self._incoming.put(
+            json.dumps({"type": "chunk", "context_id": context_id, "data": base64.b64encode(data).decode()})
+        )
+
+    async def push_done(self, context_id: str) -> None:
+        await self._incoming.put(json.dumps({"type": "done", "context_id": context_id, "done": True}))
+
+    async def close(self) -> None:
+        return None
+
+
+class CartesiaProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_speak_does_not_open_a_second_context_before_the_first_is_done(self) -> None:
+        # Confirmed live against the real API: Cartesia synthesizes concurrent
+        # contexts on one socket and interleaves their audio. Two in flight at
+        # once is audible as two sentences garbled together, so speak() must
+        # hold its context open (sent, streamed, done) before the next call's
+        # request goes out at all.
+        #
+        # Three concurrent calls, not two: an asyncio.Event-based gate (the
+        # first, broken version of this fix) looks correct with only two
+        # callers, because there is never more than one waiter blocked on the
+        # event at once. With three, the second and third calls both queue up
+        # behind the first — Event.set() wakes every waiter at once, so both
+        # would slip through together the instant the first context finishes.
+        # Only a real mutex (asyncio.Lock, what speak() uses below) releases
+        # exactly one waiter at a time and catches that regression here.
+        websocket = FakeCartesiaWebSocket()
+        received: list[tuple[bytes, int | None]] = []
+
+        async def on_audio(data: bytes, turn_id: int | None) -> None:
+            received.append((data, turn_id))
+
+        async def on_event(_: dict[str, Any]) -> None:
+            return None
+
+        session = CartesiaSpeakSession(
+            config=VoiceConfig(opencode_url="http://opencode.test"), on_audio=on_audio, on_event=on_event
+        )
+        session.websocket = websocket
+        session.reader_task = asyncio.create_task(session._read_loop())
+
+        tasks = [
+            asyncio.create_task(session.speak(text, turn_id=turn_id))
+            for text, turn_id in [("First.", 1), ("Second.", 2), ("Third.", 3)]
+        ]
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(websocket.sent), 1, "only the first context should be requested so far")
+
+        # Each push runs a chain of hops (queue wakeup -> done_event.set() ->
+        # lock release -> next speak()'s send), so give it a real tick rather
+        # than a bare sleep(0), which only advances one hop.
+        for expected_sent_count in (2, 3):
+            context_id = websocket.sent[-1]["context_id"]
+            await websocket.push_chunk(context_id, b"\x01\x02")
+            await websocket.push_done(context_id)
+            await asyncio.sleep(0.01)
+            self.assertEqual(
+                len(websocket.sent),
+                expected_sent_count,
+                "exactly one new context should open per completed one, never two at once",
+            )
+
+        final_context_id = websocket.sent[-1]["context_id"]
+        await websocket.push_chunk(final_context_id, b"\x01\x02")
+        await websocket.push_done(final_context_id)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        self.assertEqual([turn_id for _, turn_id in received], [1, 2, 3])
+        await session.close()
 
 
 class TTSTests(unittest.TestCase):
