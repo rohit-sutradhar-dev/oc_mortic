@@ -776,6 +776,7 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
 
             connection.run_text_turn = fake_turn  # type: ignore[method-assign]
             await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0  # the user has been talking a while
             await connection.handle_flux_event(
                 {"type": "speech.end", "transcript": "wait, try the other file", "eager": False}
             )
@@ -824,6 +825,7 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
 
             connection.run_text_turn = fake_turn  # type: ignore[method-assign]
             await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0  # the user has been talking a while
             await connection.handle_flux_event(
                 {"type": "speech.end", "transcript": "no wait, look at the tests instead", "eager": False}
             )
@@ -900,6 +902,7 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
 
             connection.run_text_turn = fake_turn  # type: ignore[method-assign]
             await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0  # the user has been talking a while
             await connection.handle_flux_event(
                 {"type": "speech.end", "transcript": "hold on a second", "eager": False, "confidence": 0.94}
             )
@@ -907,6 +910,33 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(started, ["hold on a second"])
             self.assertIsNone(connection.active_turn_id)
+
+    async def test_speech_cut_short_by_our_own_pause_is_rejected(self) -> None:
+        # Mangled echo (novel words, high confidence — no content rule can
+        # catch it) ends ~250ms after the pause because the pause silenced
+        # its source; a human keeps talking well past 400ms.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            # speech.end arrives almost immediately: the fragment was cut off.
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "blorp nax", "eager": True, "confidence": 0.99}
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, [])
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertFalse(speaker.paused)
+            self.assertEqual(client.aborted, [])
 
     async def test_one_word_echo_during_playback_is_rejected(self) -> None:
         # The "great" loop: the assistant opens with "Great," and its echo

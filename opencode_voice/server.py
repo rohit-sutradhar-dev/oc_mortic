@@ -624,6 +624,7 @@ class VoiceConnection:
         self.dismissed_transcript: str | None = None
         self.dismissed_at = 0.0
         self.barge_pending = False
+        self.barge_pending_since = 0.0
         self.pending_barge_task: asyncio.Task[None] | None = None
         self.aec_delay_error_logged = False
         self.tts_first_audio_seen = False
@@ -1011,7 +1012,7 @@ class VoiceConnection:
             await self.enqueue_text_turn(transcript, source="voice", eager=eager)
             return
         self.logger.write("transcript.rejected", verdict=verdict, transcript_chars=len(transcript), **detail)
-        if verdict in ("tiny", "echo", "low_confidence"):
+        if verdict in ("tiny", "echo", "low_confidence", "cut_short"):
             # The confirming final speech.end repeats the same words moments
             # later; remember the dismissal so it cannot re-enter as a turn.
             self.dismissed_transcript = transcript
@@ -1031,6 +1032,13 @@ class VoiceConnection:
     # audible moment. (Length/one-word rules do not: a quick "Yes." right
     # after the assistant finishes is a legitimate reply.)
     ECHO_TAIL_SEC = 1.5
+    # Speech that ENDS this soon after the pause began is a fragment our own
+    # pause cut off: pausing silences the echo source mid-word, so Flux
+    # end-of-turns it almost immediately (live run: echo fragments ended
+    # 243-251ms after the pause; real interrupts ran 889-1273ms because a
+    # human keeps talking whether or not the assistant went quiet). LiveKit
+    # ships the same rule as min_interruption_duration.
+    PENDING_MIN_SPEECH_SEC = 0.4
 
     def transcript_verdict(
         self, transcript: str, eager: bool, confidence: float | None = None
@@ -1049,6 +1057,11 @@ class VoiceConnection:
         low_confidence   Flux itself doubts the words, while audible — echo
                          that leaked distorted transcribes as novel garbage
                          and defeats the overlap check
+        cut_short        speech that ended almost immediately after our pause
+                         began — the pause silenced the echo source mid-word,
+                         so mangled echo (novel words, high confidence, which
+                         no content rule can catch) EOTs in ~250ms; a human
+                         keeps talking well past PENDING_MIN_SPEECH_SEC
 
         The content rules stay armed for ECHO_TAIL_SEC past the last audible
         moment (echo of closing words transcribes after playback ends); the
@@ -1066,6 +1079,10 @@ class VoiceConnection:
             return "duplicate", {}
         if not eager and self.eager_turn_text == transcript:
             return "confirmed_eager", {"turn_id": self.active_turn_id}
+        if self.barge_pending:
+            pending_sec = time.perf_counter() - self.barge_pending_since
+            if pending_sec < self.PENDING_MIN_SPEECH_SEC:
+                return "cut_short", {"pending_ms": int(pending_sec * 1000)}
         speaker = self.native_speaker
         detail: dict[str, Any] = {}
         if speaker and speaker.is_audible(tail_sec=self.ECHO_TAIL_SEC):
@@ -1093,6 +1110,7 @@ class VoiceConnection:
 
     def begin_pending_barge_in(self) -> None:
         self.barge_pending = True
+        self.barge_pending_since = time.perf_counter()
         if self.native_speaker:
             self.native_speaker.pause()
         self.logger.write("barge_in.pending")
