@@ -116,6 +116,11 @@ class VoiceConfig:
     context_threshold_tokens: int = 70_000
     compaction_wait_sec: float = 10.0
     poll_interval_sec: float = 0.1
+    # Grace after a completion signal that lands before any text, to let the
+    # trailing text parts arrive on the subscription instead of falling back
+    # to polling (which loses incremental streaming). 0 restores immediate
+    # fallback.
+    event_completion_grace_sec: float = 0.6
     max_turn_sec: float = 300.0
     run_root: str = "runs/voice"
     deepgram_stt_model: str = "flux-general-en"

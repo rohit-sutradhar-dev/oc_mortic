@@ -197,6 +197,10 @@ class OpenCodeEventTurnTracker:
         self.active_message_id: str | None = None
         self.part_text: dict[str, str] = {}
         self.part_order: list[str] = []
+        # Text parts can arrive before the message.updated that tags the role;
+        # hold them here keyed by messageID and replay once the role lands
+        # (dropping them was a source of empty-text turns -> poll fallback).
+        self.pending_parts: dict[str, list[dict[str, Any]]] = {}
         self.completed = False
         self.stale_idles = 0
         self.error: Any | None = None
@@ -213,7 +217,7 @@ class OpenCodeEventTurnTracker:
 
         deltas: list[str] = []
         if event_type == "message.updated":
-            self._handle_message_updated(properties)
+            deltas.extend(self._handle_message_updated(properties))
         elif event_type == "message.part.delta":
             delta = self._handle_part_delta(properties)
             if delta:
@@ -244,23 +248,32 @@ class OpenCodeEventTurnTracker:
             error=self.error,
         )
 
-    def _handle_message_updated(self, properties: dict[str, Any]) -> None:
+    def _handle_message_updated(self, properties: dict[str, Any]) -> list[str]:
         info = properties.get("info")
         if not isinstance(info, dict):
-            return
+            return []
         message_id_value = info.get("id")
         role = str(info.get("role") or "")
         if not message_id_value or not role:
-            return
+            return []
         message_id = str(message_id_value)
         self.message_roles[message_id] = role
         if role != "assistant" or message_id in self.existing_message_ids:
-            return
+            # Role now known and not ours: any parts we buffered for it are junk.
+            self.pending_parts.pop(message_id, None)
+            return []
         self.active_message_id = message_id
         self.error = info.get("error") or self.error
         time_info = info.get("time") or {}
         if "completed" in time_info or info.get("error"):
             self.completed = True
+        # Replay parts that arrived before this role-establishing event.
+        deltas: list[str] = []
+        for buffered in self.pending_parts.pop(message_id, []):
+            delta = self._apply_part(buffered)
+            if delta:
+                deltas.append(delta)
+        return deltas
 
     def _handle_part_delta(self, properties: dict[str, Any]) -> str:
         if properties.get("field") != "text":
@@ -268,11 +281,9 @@ class OpenCodeEventTurnTracker:
         message_id = str(properties.get("messageID") or "")
         part_id = str(properties.get("partID") or "")
         delta = str(properties.get("delta") or "")
-        if not part_id or not delta or not self._is_active_assistant_message(message_id):
+        if not part_id or not delta:
             return ""
-        self._remember_part(part_id)
-        self.part_text[part_id] = self.part_text.get(part_id, "") + delta
-        return delta
+        return self._route_part(message_id, {"kind": "delta", "part_id": part_id, "delta": delta})
 
     def _handle_part_updated(self, properties: dict[str, Any]) -> str:
         part = properties.get("part")
@@ -280,14 +291,43 @@ class OpenCodeEventTurnTracker:
             return ""
         message_id = str(part.get("messageID") or "")
         part_id = str(part.get("id") or "")
-        text = str(part.get("text") or "")
-        if not part_id or not self._is_active_assistant_message(message_id):
+        if not part_id:
             return ""
+        return self._route_part(
+            message_id,
+            {
+                "kind": "updated",
+                "part_id": part_id,
+                "text": str(part.get("text") or ""),
+                "delta": properties.get("delta"),
+            },
+        )
+
+    def _route_part(self, message_id: str, part: dict[str, Any]) -> str:
+        """Apply a text part now if its message is a known assistant message,
+        buffer it if the role hasn't arrived yet, or drop it if the message is
+        known to be something other than our assistant reply."""
+        if not message_id or message_id in self.existing_message_ids:
+            return ""
+        role = self.message_roles.get(message_id)
+        if role == "assistant":
+            self.active_message_id = message_id
+            return self._apply_part(part)
+        if role is None:
+            self.pending_parts.setdefault(message_id, []).append(part)
+        return ""
+
+    def _apply_part(self, part: dict[str, Any]) -> str:
+        part_id = str(part["part_id"])
         old = self.part_text.get(part_id, "")
         self._remember_part(part_id)
-        # 1.17 may stream delta-only updates (`properties.delta`) without the
-        # full part text; fall back to diffing full-text snapshots otherwise.
-        delta = properties.get("delta")
+        if part["kind"] == "delta":
+            self.part_text[part_id] = old + str(part["delta"])
+            return str(part["delta"])
+        # updated: 1.17 may stream delta-only updates (`properties.delta`)
+        # without the full part text; diff full-text snapshots otherwise.
+        text = str(part.get("text") or "")
+        delta = part.get("delta")
         if not text and isinstance(delta, str) and delta:
             self.part_text[part_id] = old + delta
             return delta
@@ -295,14 +335,6 @@ class OpenCodeEventTurnTracker:
         if text.startswith(old):
             return text[len(old):]
         return text if not old else ""
-
-    def _is_active_assistant_message(self, message_id: str) -> bool:
-        if not message_id or message_id in self.existing_message_ids:
-            return False
-        if self.message_roles.get(message_id) != "assistant":
-            return False
-        self.active_message_id = message_id
-        return True
 
     def _remember_part(self, part_id: str) -> None:
         if part_id not in self.part_order:

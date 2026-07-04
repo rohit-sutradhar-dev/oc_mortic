@@ -100,7 +100,7 @@ function frame(title, children, color, borderColor, style = "heavy") {
   return lines.map((item) => line(item.text, item.color));
 }
 
-function renderBrailleOrb(phase, active, captionColor) {
+function renderBrailleOrb(phase, active, captionColor, label) {
   const cols = 12;
   const rows = 6;
   const subWidth = cols * 2;
@@ -133,17 +133,34 @@ function renderBrailleOrb(phase, active, captionColor) {
       }
       rowText += bits ? String.fromCharCode(0x2800 + bits) : " ";
     }
-    output.push(orbCaption(rowText, cellY, active, captionColor));
+    output.push(orbCaption(rowText, cellY, active, captionColor, label));
   }
   return output;
 }
 
-function orbCaption(rowText, rowIndex, active, captionColor) {
+// The orb owns the ACTIVITY axis (what Mortic is doing); the hero caption and
+// prompt annex own the control/transport axis (mic + connection). Kept
+// distinct so the two surfaces never say the same thing.
+export function orbLabel(laneStatus, micLive) {
+  if (laneStatus === "connecting") {
+    return "connecting";
+  }
+  if (laneStatus === "thinking") {
+    return "thinking";
+  }
+  if (laneStatus === "speaking") {
+    return "speaking";
+  }
+  // ready / idle: mic state decides whether we're actively listening.
+  return micLive ? "listening" : "muted";
+}
+
+function orbCaption(rowText, rowIndex, active, captionColor, label) {
   if (!active) {
     return rowText;
   }
   if (rowIndex === 2) {
-    return { text: overlayCentered(rowText, "thinking"), color: captionColor };
+    return { text: overlayCentered(rowText, label), color: captionColor };
   }
   return rowText;
 }
@@ -208,7 +225,7 @@ function renderHero(state, theme) {
       [
         center("M O R T I C", INNER),
         center("", INNER),
-        ...renderBrailleOrb(state.phase, active, secondaryAccent).map((item) =>
+        ...renderBrailleOrb(state.phase, active, secondaryAccent, orbLabel(state.laneStatus, state.micLive)).map((item) =>
           typeof item === "string"
             ? center(item, INNER)
             : { text: center(item.text, INNER), color: item.color }

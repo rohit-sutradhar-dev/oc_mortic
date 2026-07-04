@@ -619,6 +619,66 @@ class OpenCodeEventTurnTrackerTests(unittest.TestCase):
 
         self.assertTrue(update.completed)
 
+    def test_parts_before_the_role_event_are_buffered_and_replayed(self) -> None:
+        # On a fast turn the text parts can precede the message.updated that
+        # tags the message as assistant; dropping them left an empty turn that
+        # forced the poll fallback. They must be buffered and replayed.
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
+
+        early = tracker.update(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "part": {
+                        "id": "prt_1",
+                        "sessionID": "ses_1",
+                        "messageID": "msg_new",
+                        "type": "text",
+                        "text": "hello there",
+                    },
+                },
+            }
+        )
+        self.assertEqual(early.deltas, [])  # role unknown: held, not applied yet
+
+        replayed = tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
+            }
+        )
+
+        self.assertEqual(replayed.deltas, ["hello there"])
+        self.assertEqual(replayed.full_text, "hello there")
+
+    def test_buffered_parts_for_a_user_message_are_discarded(self) -> None:
+        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
+        tracker.update(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "part": {
+                        "id": "prt_1",
+                        "sessionID": "ses_1",
+                        "messageID": "msg_user",
+                        "type": "text",
+                        "text": "my question",
+                    },
+                },
+            }
+        )
+
+        resolved = tracker.update(
+            {
+                "type": "message.updated",
+                "properties": {"info": {"id": "msg_user", "role": "user", "sessionID": "ses_1"}},
+            }
+        )
+
+        self.assertEqual(resolved.deltas, [])
+        self.assertEqual(resolved.full_text, "")
+        self.assertEqual(tracker.pending_parts, {})
+
 
 class EventSessionIdTests(unittest.TestCase):
     def test_resolves_top_level_session_id(self) -> None:

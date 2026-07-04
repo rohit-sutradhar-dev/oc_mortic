@@ -154,9 +154,10 @@ class FakeSpeakSession:
 
 
 class FakeNativeSpeaker:
-    def __init__(self, config: Any, logger: Any, on_issue: Any, on_render: Any = None) -> None:
+    def __init__(self, config: Any, logger: Any, on_issue: Any, on_render: Any = None, on_drain: Any = None) -> None:
         self.played: list[bytes] = []
         self.on_render = on_render
+        self.on_drain = on_drain
         self.audible = False
         self.silent_for: float | None = None  # seconds since playback ended
         self.startup = False  # inside the post-start convergence window
@@ -333,6 +334,61 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(transcripts[1]["sequence"], 1)
             completes = [message for message in websocket.sent if message["type"] == "complete"]
             self.assertEqual([message["turnId"] for message in completes], [t["turnId"] for t in transcripts])
+            assert_all_lane_messages_valid(self, websocket.sent)
+
+    async def test_completion_before_text_streams_via_grace_not_poll(self) -> None:
+        # Reproduces the ~20% fallback: session.idle lands before the text
+        # parts. The completion grace must wait for the trailing text and
+        # finish on the event path instead of falling to polling.
+        class IdleFirstLaneClient(LaneFakeClient):
+            async def prompt_async(self, session_id: str, text: str, model: Any, agent: str) -> Any:
+                self.prompts.append((session_id, text))
+                message_id = "msg_reply_1"
+                reply = "On it. I will tighten the summary."
+                self._assistant_messages = [
+                    {
+                        "info": {"id": message_id, "role": "assistant", "time": {"created": 1, "completed": 2}},
+                        "parts": [{"type": "text", "text": reply}],
+                    }
+                ]
+                self._staged_events = [
+                    {
+                        "type": "message.updated",
+                        "properties": {"info": {"id": message_id, "role": "assistant", "sessionID": session_id}},
+                    },
+                    # Completion arrives before any text part.
+                    {"type": "session.idle", "properties": {"sessionID": session_id}},
+                    {
+                        "type": "message.part.updated",
+                        "properties": {
+                            "delta": reply,
+                            "part": {
+                                "id": "prt_reply_1",
+                                "sessionID": session_id,
+                                "messageID": message_id,
+                                "type": "text",
+                                "text": reply,
+                            },
+                        },
+                    },
+                ]
+                self._events_staged.set()
+                return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramSpeakSession", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ):
+            connection, websocket, _client = lane_connection(tmp, client=IdleFirstLaneClient())
+            await connection.handle_control(START_PAYLOAD)
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "Tighten the summary."})
+            await asyncio.wait_for(connection.turn_task, timeout=10)
+
+            complete = next(m for m in websocket.sent if m["type"] == "complete")
+            self.assertEqual(complete["streamSource"], "event")
+            deltas = [m for m in websocket.sent if m["type"] == "assistant.delta"]
+            self.assertTrue(deltas, "the trailing text must still stream")
             assert_all_lane_messages_valid(self, websocket.sent)
 
 
@@ -737,6 +793,49 @@ class EagerTurnConfirmTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(started, ["so what", "so what"])
             release.set()
+
+
+class PlaybackDrainTests(unittest.IsolatedAsyncioTestCase):
+    """When a reply finishes speaking the lane returns to a listening state so
+    the viewer's activity indicator stops reading 'speaking'."""
+
+    async def test_drain_emits_listening_when_mic_live_and_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            connection.native_mic = object()  # type: ignore[assignment]  # mic live
+            connection.active_turn_id = None
+            websocket.sent.clear()
+
+            await connection.on_playback_drained()
+
+            listening = [m for m in websocket.sent if m["type"] == "listening"]
+            self.assertEqual(len(listening), 1)
+            assert_all_lane_messages_valid(self, websocket.sent)
+
+    async def test_drain_is_silent_when_a_new_turn_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            connection.native_mic = object()  # type: ignore[assignment]
+            connection.active_turn_id = 9  # a turn took over before playback drained
+            websocket.sent.clear()
+
+            await connection.on_playback_drained()
+
+            self.assertEqual([m for m in websocket.sent if m["type"] == "listening"], [])
+
+    async def test_drain_is_silent_when_mic_muted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            connection.native_mic = None  # muted
+            connection.active_turn_id = None
+            websocket.sent.clear()
+
+            await connection.on_playback_drained()
+
+            self.assertEqual([m for m in websocket.sent if m["type"] == "listening"], [])
 
 
 class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):

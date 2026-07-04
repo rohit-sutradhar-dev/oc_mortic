@@ -7,6 +7,17 @@ import { fileURLToPath } from "node:url";
 const rootDir = fileURLToPath(new URL("..", import.meta.url));
 const pkg = JSON.parse(await readFile(join(rootDir, "package.json"), "utf8"));
 const src = await readFile(join(rootDir, "src/tui.js"), "utf8");
+const { orbLabel } = await import(join(rootDir, "src/tui.js"));
+
+test("orb label reflects the live lane activity, not a constant", () => {
+  assert.equal(orbLabel("thinking", true), "thinking");
+  assert.equal(orbLabel("speaking", true), "speaking");
+  assert.equal(orbLabel("connecting", true), "connecting");
+  assert.equal(orbLabel("ready", true), "listening");
+  assert.equal(orbLabel("ready", false), "muted");
+  // Regression: the orb no longer stamps a hardcoded "thinking".
+  assert.doesNotMatch(src, /overlayCentered\(rowText, "thinking"\)/);
+});
 
 test("package remains installable as an OpenCode TUI plugin", () => {
   assert.equal(pkg.type, "module");

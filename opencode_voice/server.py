@@ -248,11 +248,13 @@ class NativeSpeakerSession:
         logger: RunLogger,
         on_issue: Callable[[dict[str, Any]], Awaitable[None]],
         on_render: Callable[[bytes], None] | None = None,
+        on_drain: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.config = config
         self.logger = logger
         self.on_issue = on_issue
         self.on_render = on_render
+        self.on_drain = on_drain
         self.queue: asyncio.Queue[bytes] | None = None
         self.stream: Any | None = None
         self.pump_task: asyncio.Task[None] | None = None
@@ -268,6 +270,7 @@ class NativeSpeakerSession:
         self.paused = False
         self.paused_at = 0.0
         self.burst_started_at = 0.0
+        self.burst_active = False
 
     async def start(self) -> bool:
         try:
@@ -377,6 +380,9 @@ class NativeSpeakerSession:
             self.dropped_chunks += discarded
             self.logger.write("native_tts.drop", dropped_chunks=discarded, reason=reason)
         self.speaking_until = 0.0
+        # A flush precedes a barge-in teardown or a new turn; that path owns the
+        # UI state, so suppress the drain->listening signal for this burst.
+        self.burst_active = False
         if self.paused:
             self.paused = False
             self.resume_event.set()
@@ -385,7 +391,19 @@ class NativeSpeakerSession:
         if not self.queue:
             return
         while not self.closed:
-            data = await self.queue.get()
+            if self.burst_active and not self.paused:
+                # Nothing queued and the played audio should be finished:
+                # the burst has drained, so signal a return to listening.
+                remaining = max(0.0, self.speaking_until - time.perf_counter())
+                try:
+                    data = await asyncio.wait_for(self.queue.get(), timeout=remaining + 0.15)
+                except asyncio.TimeoutError:
+                    self.burst_active = False
+                    if self.on_drain:
+                        await self.on_drain()
+                    continue
+            else:
+                data = await self.queue.get()
             await self.resume_event.wait()
             if self.closed:
                 break
@@ -405,6 +423,7 @@ class NativeSpeakerSession:
                 break
             self.played_chunks += 1
             self.played_bytes += len(data)
+            self.burst_active = True
             now = time.perf_counter()
             if self.started_at is not None and now - self.last_summary_log >= 5:
                 self.last_summary_log = now
@@ -1353,14 +1372,27 @@ class VoiceConnection:
             first_text_ms: int | None = None
             full_text = ""
             stale_idle_logged = False
+            # Set once completion is signalled before any text: a short window
+            # to let text parts that trail the idle/completed event on the
+            # subscription still land, instead of bailing straight to polling.
+            completion_grace_deadline: float | None = None
             last_event_ms = elapsed_ms(started)
             while self.active_turn_id == turn_id and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
-                try:
+                if completion_grace_deadline is not None:
+                    remaining = completion_grace_deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise OpenCodeEventFallback("event_stream_completed_without_text", prompt_sent=prompt_sent)
+                    get_timeout: float = min(remaining, 0.2)
+                else:
                     # Before the first delta, fail over to polling quickly; a
                     # stream that produced text already earns a longer stall
                     # budget (tool calls can pause deltas mid-turn).
-                    event = await asyncio.wait_for(queue.get(), timeout=3 if first_text_ms is None else 8)
+                    get_timeout = 3 if first_text_ms is None else 8
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=get_timeout)
                 except asyncio.TimeoutError as exc:
+                    if completion_grace_deadline is not None:
+                        continue  # keep draining for trailing text until the grace expires
                     if first_text_ms is None:
                         raise OpenCodeEventFallback("event_stream_no_initial_events", prompt_sent=prompt_sent) from exc
                     raise OpenCodeEventFallback("event_stream_stalled", prompt_sent=prompt_sent) from exc
@@ -1383,7 +1415,12 @@ class VoiceConnection:
                         await self.speak(chunk, turn_id=turn_id)
                 if update.completed:
                     if not update.full_text and not full_text:
-                        raise OpenCodeEventFallback("event_stream_completed_without_text", prompt_sent=prompt_sent)
+                        if completion_grace_deadline is None:
+                            completion_grace_deadline = (
+                                time.perf_counter() + self.config.event_completion_grace_sec
+                            )
+                            self.logger.write("opencode.stream.completion_grace", turn_id=turn_id)
+                        continue  # wait out the grace for trailing text parts
                     await self.complete_event_text_turn(
                         session_id=session_id,
                         before_messages=before_messages,
@@ -2035,6 +2072,7 @@ class SidepodConnection(VoiceConnection):
                 logger=self.logger,
                 on_issue=self.send_json,
                 on_render=self.feed_render_reference,
+                on_drain=self.on_playback_drained,
             )
             if not await speaker.start():
                 self.native_speaker_unavailable = True
@@ -2053,6 +2091,23 @@ class SidepodConnection(VoiceConnection):
     def feed_render_reference(self, data: bytes) -> None:
         if self.echo_canceller:
             self.echo_canceller.process_render(data)
+
+    async def on_playback_drained(self) -> None:
+        # Reply finished speaking: return the lane to a resting listening
+        # state so the viewer's activity indicator stops reading "speaking".
+        # Only while the mic is still live and no new turn has taken over.
+        if self.native_mic is None or self.active_turn_id is not None or self.barge_pending:
+            return
+        if not self.voice_lane_id:
+            return
+        await self.send_json(
+            {
+                "type": "listening",
+                "sentAt": iso_utc_now(),
+                "voiceLaneId": self.voice_lane_id,
+                "mode": "live",
+            }
+        )
 
     async def barge_in(self, reason: str) -> None:
         turn_id = self.protocol_turn_id or None

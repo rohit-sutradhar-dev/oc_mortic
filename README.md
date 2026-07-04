@@ -44,7 +44,12 @@ mortic-helper --voice-duplex full          # headphones: skip echo protection
 mortic-helper --barge-in-confirm-sec 2.0  # pause window while a mid-playback voice confirms
 mortic-helper --barge-in-min-chars 4      # shorter transcripts resume playback instead
 mortic-helper --playback-mute-sec 0.6     # STT deaf window at each playback start; 0 disables
+mortic-helper --event-completion-grace-sec 0.6  # wait for trailing text before polling; 0 disables
 ```
+
+The orb in the sidepod shows Mortic's live activity — `listening` / `thinking` /
+`speaking` / `muted` — while the caption and prompt annex show mic and connection
+state; the two never report the same thing.
 
 ## Echo Protection
 

@@ -63,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         barge_in_confirm_sec=args.barge_in_confirm_sec,
         barge_in_min_chars=args.barge_in_min_chars,
         playback_mute_sec=args.playback_mute_sec,
+        event_completion_grace_sec=args.event_completion_grace_sec,
         opencode_agent=args.agent,
         voice_agent_prompt_path=args.voice_agent_prompt,
         keep_fork_default=args.keep_fork,
@@ -147,6 +148,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.6,
         help="STT hears silence this long at each playback start (echo-canceller convergence window); 0 disables.",
+    )
+    parser.add_argument(
+        "--event-completion-grace-sec",
+        type=float,
+        default=0.6,
+        help="Wait this long for trailing text after a completion signal before polling; 0 disables.",
     )
     parser.add_argument("--keep-fork", action="store_true", help="Keep ephemeral forks by default.")
     parser.add_argument("--print-config", action="store_true", help="Print the generated OpenCode config overlay.")
