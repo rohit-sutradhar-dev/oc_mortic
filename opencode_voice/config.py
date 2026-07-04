@@ -133,6 +133,12 @@ class VoiceConfig:
     # shorter than barge_in_min_chars resume playback instead of interrupting.
     barge_in_confirm_sec: float = 2.0
     barge_in_min_chars: int = 4
+    # STT hears silence for this long at the start of each playback burst:
+    # the echo canceller converges during roughly the first second of new
+    # audio, and that leak is what fired spurious barge-ins and phantom
+    # captions. The canceller still adapts (mic frames keep flowing through
+    # it); only STT is deaf during the window.
+    playback_mute_sec: float = 0.6
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False

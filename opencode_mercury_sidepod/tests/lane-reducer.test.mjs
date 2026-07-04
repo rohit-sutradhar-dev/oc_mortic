@@ -41,6 +41,25 @@ test("a full turn drives user text, assistant buffer, and transcript", () => {
   assert.equal(state.activeTurnId, null);
 });
 
+test("a poll-fallback turn with no deltas renders via fullSpokenText", () => {
+  const { intents } = play([
+    { type: "ready", sentAt: at, voiceLaneId: "lane_1", state: "ready", forkSessionId: "fork_1" },
+    { type: "transcript", sentAt: at, turnId: "turn_0001", sequence: 1, text: "Summarize it.", final: true },
+    { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live" },
+    {
+      type: "complete",
+      sentAt: at,
+      turnId: "turn_0001",
+      latency: { totalMs: 5100 },
+      streamSource: "poll_after_event",
+      fullSpokenText: "Here is the summary.",
+    },
+  ]);
+
+  assert.equal(intents[3].assistantText, "Here is the summary.");
+  assert.deepEqual(intents[3].appendTranscript, [{ role: "assistant", text: "Here is the summary." }]);
+});
+
 test("stale and duplicate sequences never regress state", () => {
   const { intents } = play([
     { type: "transcript", sentAt: at, turnId: "turn_0001", sequence: 3, text: "newer", final: false },

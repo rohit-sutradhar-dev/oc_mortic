@@ -43,6 +43,7 @@ mortic-helper --eager-eot-threshold 0.7   # default 0.6; pass 0 to disable
 mortic-helper --voice-duplex full          # headphones: skip echo protection
 mortic-helper --barge-in-confirm-sec 2.0  # pause window while a mid-playback voice confirms
 mortic-helper --barge-in-min-chars 4      # shorter transcripts resume playback instead
+mortic-helper --playback-mute-sec 0.6     # STT deaf window at each playback start; 0 disables
 ```
 
 ## Echo Protection

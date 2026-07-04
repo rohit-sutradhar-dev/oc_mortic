@@ -267,6 +267,7 @@ class NativeSpeakerSession:
         self.resume_event.set()
         self.paused = False
         self.paused_at = 0.0
+        self.burst_started_at = 0.0
 
     async def start(self) -> bool:
         try:
@@ -324,6 +325,10 @@ class NativeSpeakerSession:
         if self.closed:
             return False
         now = time.perf_counter()
+        if not self.is_audible(tail_sec=0.0):
+            # Silence -> audio transition: a new playback burst begins and
+            # the echo canceller starts re-converging on it.
+            self.burst_started_at = now
         chunk_sec = len(data) / (self.config.deepgram_sample_rate * 2)
         self.speaking_until = max(now, self.speaking_until) + chunk_sec
         if self.started_at is None:
@@ -334,6 +339,13 @@ class NativeSpeakerSession:
 
     def is_audible(self, tail_sec: float = 0.3) -> bool:
         return not self.closed and time.perf_counter() < self.speaking_until + tail_sec
+
+    def in_startup_window(self, window_sec: float) -> bool:
+        """True during the first moments of a playback burst — the canceller's
+        convergence window, when echo leaks are all but guaranteed."""
+        if window_sec <= 0 or self.paused or not self.is_audible(tail_sec=0.0):
+            return False
+        return time.perf_counter() - self.burst_started_at < window_sec
 
     def pause(self) -> None:
         """Hold playback between chunks; the queue keeps its audio."""
@@ -864,6 +876,10 @@ class VoiceConnection:
                 if self.echo_canceller.delay_error and not self.aec_delay_error_logged:
                     self.aec_delay_error_logged = True
                     self.logger.write("audio.aec.delay.error", error=self.echo_canceller.delay_error)
+                if self.native_speaker and self.native_speaker.in_startup_window(self.config.playback_mute_sec):
+                    # The canceller above still adapted on the real frames;
+                    # STT just doesn't get to hear its convergence leak.
+                    return b"\x00" * len(processed)
                 return processed
             except Exception as exc:  # noqa: BLE001 - fall back to the gate for the rest of the lane.
                 self.logger.write("audio.aec.error", error=repr(exc))
@@ -2214,13 +2230,20 @@ class SidepodConnection(VoiceConnection):
             latency["totalMs"] = total_ms
         stream_source = seam.stream_source if seam else "event"
         self.logger.write("sidepod.turn.latency", turn_id=lane_id, stream_source=stream_source, **latency)
-        return {
+        out: dict[str, Any] = {
             "type": "complete",
             "sentAt": iso_utc_now(),
             "turnId": lane_id,
             "latency": latency,
             "streamSource": stream_source,
         }
+        # Poll-fallback turns stream no assistant.delta events, so this is
+        # the viewer's only copy of the reply text (the reducer falls back
+        # to fullSpokenText when its delta buffer is empty).
+        text = str(payload.get("text") or "")
+        if text:
+            out["fullSpokenText"] = text
+        return out
 
     def translate_turn_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
         timed_out = payload.get("type") == "turn.timeout"

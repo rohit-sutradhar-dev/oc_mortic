@@ -159,6 +159,7 @@ class FakeNativeSpeaker:
         self.on_render = on_render
         self.audible = False
         self.silent_for: float | None = None  # seconds since playback ended
+        self.startup = False  # inside the post-start convergence window
         self.paused = False
 
     async def start(self) -> bool:
@@ -174,6 +175,9 @@ class FakeNativeSpeaker:
         if self.audible:
             return True
         return self.silent_for is not None and self.silent_for < tail_sec
+
+    def in_startup_window(self, window_sec: float) -> bool:
+        return self.startup and window_sec > 0
 
     def pause(self) -> None:
         self.paused = True
@@ -575,6 +579,29 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(connection.flux.audio, [b"\x7f" * 640])
             self.assertEqual(connection.echo_canceller.captured, [b"\x11" * 640])
+
+    async def test_startup_mute_window_feeds_stt_silence_but_canceller_real_audio(self) -> None:
+        # First ~0.6s of each playback burst: the canceller is converging and
+        # leaks echo, so STT hears silence while the canceller keeps adapting
+        # on the real frames.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ), patch("opencode_voice.server.NativeMicSession", FakeNativeMic), patch(
+            "opencode_voice.server.EchoCanceller", FakeEchoCanceller
+        ):
+            connection, _websocket, _client = lane_connection(tmp, voice_duplex="auto")
+            self.assertTrue(await connection.start_native_audio())
+            speaker = FakeNativeSpeaker(None, None, None)
+            speaker.audible = True
+            speaker.startup = True
+            connection.native_speaker = speaker
+
+            await connection.handle_native_audio(b"\x11" * 640)
+            speaker.startup = False
+            await connection.handle_native_audio(b"\x22" * 640)
+
+            self.assertEqual(connection.flux.audio, [b"\x00" * 640, b"\x7f" * 640])
+            self.assertEqual(connection.echo_canceller.captured, [b"\x11" * 640, b"\x22" * 640])
 
     async def test_half_duplex_gate_feeds_silence_while_tts_is_audible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
