@@ -628,6 +628,9 @@ class VoiceConnection:
         self.websocket = websocket
         self.send_lock = asyncio.Lock()
         self.dropped_sends = 0
+        # Fire-and-forget tasks (e.g. background speaker close) kept referenced
+        # so the loop can't garbage-collect them mid-run.
+        self.background_tasks: set[asyncio.Task[Any]] = set()
         self.source_session_id: str | None = None
         self.fork_session_id: str | None = None
         self.fork_directory: str | None = None
@@ -1616,7 +1619,7 @@ class VoiceConnection:
             # detach now and let the socket close in the background.
             speaker = self.speaker
             self.speaker = None
-            asyncio.create_task(self.close_speaker_quietly(speaker))
+            self.spawn_background(self.close_speaker_quietly(speaker))
         if self.native_speaker:
             # Flush instead of close: tearing the device stream down every
             # interrupt forces the echo canceller to re-converge from scratch
@@ -1625,6 +1628,13 @@ class VoiceConnection:
             self.native_speaker.flush(reason=reason)
         self.native_speaker_unavailable = False
         return interrupted
+
+    def spawn_background(self, coro: Awaitable[None]) -> None:
+        # Retain a strong reference until the task finishes; a bare
+        # create_task can be garbage-collected mid-run (CPython footgun).
+        task = asyncio.ensure_future(coro)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
 
     async def close_speaker_quietly(self, speaker: DeepgramSpeakSession) -> None:
         try:

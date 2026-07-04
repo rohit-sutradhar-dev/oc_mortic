@@ -728,6 +728,37 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(native.played, [])
             self.assertEqual(connection.stale_tts_chunks, 1)
 
+    async def test_background_speaker_close_is_retained_and_runs_to_completion(self) -> None:
+        # The detached TTS-socket close must keep a strong task reference or
+        # the loop can garbage-collect it mid-run, leaking the Deepgram socket.
+        class SlowCloseSpeaker(FakeSpeakSession):
+            def __init__(self, config: Any, on_audio: Any, on_event: Any) -> None:
+                super().__init__(config, on_audio, on_event)
+                self.gate = asyncio.Event()
+                self.closed = False
+
+            async def close(self) -> None:
+                await self.gate.wait()
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramSpeakSession", SlowCloseSpeaker
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            await connection.speak("Hello there.", turn_id=1)
+            speaker = connection.speaker
+
+            await connection.barge_in("user.mute")
+            # Close is still pending (gated) and must be tracked, not orphaned.
+            self.assertEqual(len(connection.background_tasks), 1)
+            self.assertFalse(speaker.closed)
+
+            speaker.gate.set()
+            await asyncio.wait_for(asyncio.gather(*connection.background_tasks), timeout=5)
+            self.assertTrue(speaker.closed)
+            self.assertEqual(connection.background_tasks, set())
+
 
 class EagerTurnConfirmTests(unittest.IsolatedAsyncioTestCase):
     """Flux fires an eager end-of-turn and then a confirming final one for the
