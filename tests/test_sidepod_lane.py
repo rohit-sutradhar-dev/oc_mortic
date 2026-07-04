@@ -911,6 +911,47 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(started, ["hold on a second"])
             self.assertIsNone(connection.active_turn_id)
 
+    async def test_rejected_transcripts_never_render_as_the_users_words(self) -> None:
+        # Echo of the assistant saying "3" was gate-rejected as a turn but
+        # still appeared in the transcript pane as user speech: the final
+        # lane transcript used to be emitted before the verdict ran.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = "The answer is 3 in this case."
+            connection.barge_pending_since = 0.0
+
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "is 3 in this case", "eager": False, "confidence": 1.0}
+            )
+            await asyncio.sleep(0)
+
+            finals = [m for m in websocket.sent if m.get("type") == "transcript" and m.get("final")]
+            self.assertEqual(finals, [])
+            self.assertFalse(speaker.paused)
+
+            # A real interrupt is still recorded exactly once.
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "now use 4 instead", "eager": False, "confidence": 1.0}
+            )
+            await asyncio.sleep(0)
+
+            finals = [m for m in websocket.sent if m.get("type") == "transcript" and m.get("final")]
+            self.assertEqual([m["text"] for m in finals], ["now use 4 instead"])
+            self.assertEqual(started, ["now use 4 instead"])
+
     async def test_speech_cut_short_by_our_own_pause_is_rejected(self) -> None:
         # Mangled echo (novel words, high confidence — no content rule can
         # catch it) ends ~250ms after the pause because the pause silenced

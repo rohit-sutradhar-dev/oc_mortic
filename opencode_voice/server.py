@@ -952,6 +952,12 @@ class VoiceConnection:
         # this seam to translate them into protocol v0 `transcript` events.
         await self.send_json(event)
 
+    async def on_transcript_admitted(self, transcript: str, confidence: float | None) -> None:
+        # Sidepod hook: only admitted transcripts may become durable
+        # transcript entries in the UI (rejected echo must not be recorded
+        # as the user's words). The browser lane shows raw events already.
+        return None
+
     async def handle_flux_event(self, event: dict[str, Any]) -> None:
         await self.forward_flux_event(event)
         if event["type"] == "speech.start":
@@ -1009,6 +1015,7 @@ class VoiceConnection:
                 # No pause in flight but stale audio is still playing (e.g. a
                 # timeout resumed it): the new turn supersedes that playback.
                 await self.interrupt_playback("new_turn")
+            await self.on_transcript_admitted(transcript, confidence)
             await self.enqueue_text_turn(transcript, source="voice", eager=eager)
             return
         self.logger.write("transcript.rejected", verdict=verdict, transcript_chars=len(transcript), **detail)
@@ -2037,12 +2044,14 @@ class SidepodConnection(VoiceConnection):
             if text.strip():
                 await self.send_lane_transcript(text, final=False, confidence=event.get("confidence"))
             return
-        if etype == "speech.end":
-            text = str(event.get("transcript") or self.final_transcript or "").strip()
-            if text:
-                await self.send_lane_transcript(text, final=True, confidence=event.get("confidence"))
-            return
+        # speech.end is deliberately NOT forwarded here: the durable
+        # (final) transcript entry is emitted from on_transcript_admitted
+        # only after the admission gate accepts it — rejected echo used to
+        # render in the transcript as words the user never said.
         # Other raw STT events (speech.resumed, socket notices) stay off the lane.
+
+    async def on_transcript_admitted(self, transcript: str, confidence: float | None) -> None:
+        await self.send_lane_transcript(transcript, final=True, confidence=confidence)
 
     async def send_lane_transcript(self, text: str, final: bool, confidence: Any = None) -> None:
         turn_id = self.ensure_pending_turn()
