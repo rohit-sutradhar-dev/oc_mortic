@@ -608,6 +608,7 @@ class VoiceConnection:
         self.logger = logger
         self.websocket = websocket
         self.send_lock = asyncio.Lock()
+        self.dropped_sends = 0
         self.source_session_id: str | None = None
         self.fork_session_id: str | None = None
         self.fork_directory: str | None = None
@@ -1703,12 +1704,29 @@ class VoiceConnection:
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         if self.closed:
+            # A frozen viewer with working audio means sends are dying here;
+            # leave a trace instead of vanishing (rate-limited).
+            self.dropped_sends += 1
+            if self.dropped_sends == 1 or self.dropped_sends % 50 == 0:
+                self.logger.write(
+                    "lane.send.dropped",
+                    message_type=str(payload.get("type")),
+                    dropped=self.dropped_sends,
+                )
             return
         async with self.send_lock:
             try:
                 await self.websocket.send_text(json.dumps(redact_secrets(payload), ensure_ascii=False))
             except WebSocketDisconnect:
                 self.closed = True
+                self.logger.write("lane.send.disconnect", message_type=str(payload.get("type")))
+            except Exception as exc:  # noqa: BLE001 - a dying lane socket must not kill the voice engine.
+                self.closed = True
+                self.logger.write(
+                    "lane.send.error",
+                    message_type=str(payload.get("type")),
+                    error=repr(exc),
+                )
 
 
 @dataclass
