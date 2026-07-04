@@ -277,13 +277,11 @@ function handoffText(userText, assistantText) {
   ].join("\n");
 }
 
-// console output in a raw TUI is painted over by screen redraws and never
-// reaches opencode.log, so smoke diagnostics only exist behind the durable
-// opt-in sink: MORTIC_SMOKE_LOG=/tmp/mortic-smoke.log opencode
+// The file sink is always on (appendSmoke defaults it) so a live viewer bug
+// leaves a client-side trace without the owner pre-arming an env var. The
+// console echo stays opt-in: console output in a raw TUI is painted over by
+// redraws and can corrupt the frame, so only emit it under MORTIC_SMOKE_LOG.
 function logSmoke(api, event, details = {}) {
-  if (!SMOKE_SINK) {
-    return;
-  }
   const payload = {
     event,
     mode: api.mode.current?.(),
@@ -291,7 +289,9 @@ function logSmoke(api, event, details = {}) {
     at: new Date().toISOString(),
     ...details
   };
-  console.info("[mortic smoke]", JSON.stringify(payload));
+  if (SMOKE_SINK) {
+    console.info("[mortic smoke]", JSON.stringify(payload));
+  }
   appendSmoke(payload);
 }
 

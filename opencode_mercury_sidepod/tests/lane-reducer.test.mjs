@@ -60,6 +60,17 @@ test("a poll-fallback turn with no deltas renders via fullSpokenText", () => {
   assert.deepEqual(intents[3].appendTranscript, [{ role: "assistant", text: "Here is the summary." }]);
 });
 
+test("interrupt clears the transcript sequence like complete does", () => {
+  const { state, intents } = play([
+    { type: "transcript", sentAt: at, turnId: "turn_0001", sequence: 4, text: "long dropped question", final: true },
+    { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live" },
+    { type: "interrupted", sentAt: at, turnId: "turn_0001", reason: "speech_confirmed" },
+  ]);
+
+  assert.equal(state.transcriptSeq, 0, "a stale high-water mark would silently drop the next turn's transcript");
+  assert.equal(intents[2].userText, "Interrupted.");
+});
+
 test("stale and duplicate sequences never regress state", () => {
   const { intents } = play([
     { type: "transcript", sentAt: at, turnId: "turn_0001", sequence: 3, text: "newer", final: false },

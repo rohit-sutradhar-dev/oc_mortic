@@ -102,8 +102,12 @@ export function reduceLaneEvent(state, event) {
     };
   }
   if (type === "interrupted") {
+    // Reset the same counters `complete` does. Omitting transcriptSeq left a
+    // stale high-water mark after an aborted turn, so a later transcript at a
+    // lower sequence could be dropped as "already seen" — the class of
+    // silent drop that can freeze the viewer mid-turn.
     return {
-      state: { ...state, activeTurnId: null, assistantBuffer: "", deltaSeq: 0 },
+      state: { ...state, activeTurnId: null, assistantBuffer: "", deltaSeq: 0, transcriptSeq: 0 },
       ui: { status: "ready", userText: "Interrupted." },
     };
   }
