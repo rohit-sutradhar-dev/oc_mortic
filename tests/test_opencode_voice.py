@@ -676,6 +676,26 @@ class DeepgramProtocolTests(unittest.TestCase):
         end = parse_flux_message(json.dumps({"type": "EndOfTurn"}))
         self.assertEqual(end["type"], "speech.end")
 
+    def test_parse_flux_mean_word_confidence(self) -> None:
+        end = parse_flux_message(
+            json.dumps(
+                {
+                    "type": "TurnInfo",
+                    "event": "EndOfTurn",
+                    "transcript": "stop that",
+                    "words": [
+                        {"word": "stop", "confidence": 0.9},
+                        {"word": "that", "confidence": 0.5},
+                    ],
+                }
+            )
+        )
+        self.assertEqual(end["type"], "speech.end")
+        self.assertAlmostEqual(end["confidence"], 0.7)
+
+        no_words = parse_flux_message(json.dumps({"type": "TurnInfo", "event": "EndOfTurn"}))
+        self.assertNotIn("confidence", no_words)
+
     def test_parse_flux_turninfo_shape(self) -> None:
         start = parse_flux_message(
             json.dumps({"type": "TurnInfo", "event": "StartOfTurn", "transcript": "Hello."})

@@ -987,15 +987,17 @@ class VoiceConnection:
             transcript = str(event.get("transcript") or self.final_transcript).strip()
             self.final_transcript = ""
             eager = bool(event.get("eager"))
-            self.logger.write("speech.end", transcript_chars=len(transcript), eager=eager)
-            await self.handle_transcript(transcript, eager=eager)
+            confidence = event.get("confidence")
+            confidence = float(confidence) if isinstance(confidence, (int, float)) else None
+            self.logger.write("speech.end", transcript_chars=len(transcript), eager=eager, confidence=confidence)
+            await self.handle_transcript(transcript, eager=eager, confidence=confidence)
 
-    async def handle_transcript(self, transcript: str, eager: bool) -> None:
+    async def handle_transcript(self, transcript: str, eager: bool, confidence: float | None = None) -> None:
         """The single admission path for every voice transcript. The verdict
         both decides whether a turn starts and resolves any paused playback,
         so eager/final duplicates and echo cannot slip in through one code
         path while another filters them."""
-        verdict, detail = self.transcript_verdict(transcript, eager)
+        verdict, detail = self.transcript_verdict(transcript, eager, confidence)
         if verdict == "admit":
             if self.barge_pending:
                 self.clear_pending_barge_in()
@@ -1009,7 +1011,7 @@ class VoiceConnection:
             await self.enqueue_text_turn(transcript, source="voice", eager=eager)
             return
         self.logger.write("transcript.rejected", verdict=verdict, transcript_chars=len(transcript), **detail)
-        if verdict in ("tiny", "echo"):
+        if verdict in ("tiny", "echo", "low_confidence"):
             # The confirming final speech.end repeats the same words moments
             # later; remember the dismissal so it cannot re-enter as a turn.
             self.dismissed_transcript = transcript
@@ -1019,7 +1021,15 @@ class VoiceConnection:
         if self.barge_pending:
             self.dismiss_pending_barge_in(verdict)
 
-    def transcript_verdict(self, transcript: str, eager: bool) -> tuple[str, dict[str, Any]]:
+    # Below this mean word confidence, speech heard while the assistant is
+    # audible is treated as mangled echo rather than the user. Clean speech
+    # scores well above this; echo the canceller distorted transcribes as
+    # low-confidence garbage that the word-overlap check cannot match.
+    ECHO_CONFIDENCE_FLOOR = 0.5
+
+    def transcript_verdict(
+        self, transcript: str, eager: bool, confidence: float | None = None
+    ) -> tuple[str, dict[str, Any]]:
         """Classify a transcript: "admit" starts a turn, anything else drops it.
 
         empty            nothing was said
@@ -1031,10 +1041,13 @@ class VoiceConnection:
         echo             mostly the assistant's own recent words while audible
                          (a length gate cannot tell echo from a user: live run
                          had 9-13 char echo fragments confirm 5 interrupts)
+        low_confidence   Flux itself doubts the words, while audible — echo
+                         that leaked distorted transcribes as novel garbage
+                         and defeats the overlap check
 
-        The tiny/echo rules apply only while playback is audible: in silence
-        a short "Yes." is a legitimate reply and overlap with the previous
-        answer is meaningless.
+        The tiny/echo/low_confidence rules apply only while playback is
+        audible: in silence a short "Yes." is a legitimate reply and overlap
+        with the previous answer is meaningless.
         """
         if not transcript:
             return "empty", {}
@@ -1053,6 +1066,8 @@ class VoiceConnection:
             overlap = sum(word in spoken for word in words) / len(words) if words else 0.0
             if len(words) >= 2 and overlap >= 0.75:
                 return "echo", {"overlap": round(overlap, 2)}
+            if confidence is not None and confidence < self.ECHO_CONFIDENCE_FLOOR:
+                return "low_confidence", {"confidence": round(confidence, 3)}
         return "admit", {}
 
     def begin_pending_barge_in(self) -> None:

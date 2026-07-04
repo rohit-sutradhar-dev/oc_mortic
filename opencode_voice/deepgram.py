@@ -56,6 +56,17 @@ def parse_flux_message(raw: str) -> dict[str, Any]:
         "is_final": bool(payload.get("is_final") or payload.get("speech_final") or kind == "EndOfTurn"),
         "raw": payload,
     }
+    words = payload.get("words")
+    if isinstance(words, list) and words:
+        confidences = [
+            float(word["confidence"])
+            for word in words
+            if isinstance(word, dict) and isinstance(word.get("confidence"), (int, float))
+        ]
+        if confidences:
+            # Mean word confidence: clean speech scores high; echo the
+            # canceller mangled transcribes as garbage with low scores.
+            normalized["confidence"] = round(sum(confidences) / len(confidences), 3)
     lowered = kind.lower()
     if lowered == "startofturn":
         normalized["type"] = "speech.start"
