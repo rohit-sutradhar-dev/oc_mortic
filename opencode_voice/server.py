@@ -295,6 +295,13 @@ class NativeSpeakerSession:
                 samplerate=self.config.deepgram_sample_rate,
                 channels=1,
                 dtype="int16",
+                # A deeper device buffer than the low-latency default: the pump
+                # feeds from the event loop, which also runs per-frame echo
+                # cancellation, so its wake-up jitters. A larger buffer rides
+                # that out instead of underrunning between chunks (~6% gaps
+                # measured on long replies). Costs a few tens of ms to first
+                # audio — well under the TTS round-trip.
+                latency="high",
             )
             self.stream.start()
         except Exception as exc:  # noqa: BLE001 - device/permission failures become safe UI issues.
@@ -329,15 +336,20 @@ class NativeSpeakerSession:
             return False
         now = time.perf_counter()
         if not self.is_audible(tail_sec=0.0):
-            # Silence -> audio transition: a new playback burst begins and
-            # the echo canceller starts re-converging on it.
+            # Silence -> audio transition: a new playback burst begins. Reset
+            # the rate counters here — the speaker now persists across turns,
+            # so a session-cumulative native_tts.summary would fold the idle
+            # gaps between replies into the byte/duration rate and read as
+            # choppy when playback is actually realtime. Per-burst counters
+            # measure this reply's playback honestly.
             self.burst_started_at = now
+            self.started_at = now
+            self.last_summary_log = now
+            self.played_chunks = 0
+            self.played_bytes = 0
+            self.logger.write("native_tts.first_chunk", bytes=len(data), turn_id=turn_id)
         chunk_sec = len(data) / (self.config.deepgram_sample_rate * 2)
         self.speaking_until = max(now, self.speaking_until) + chunk_sec
-        if self.started_at is None:
-            self.started_at = now
-            self.last_summary_log = self.started_at
-            self.logger.write("native_tts.first_chunk", bytes=len(data), turn_id=turn_id)
         return True
 
     def is_audible(self, tail_sec: float = 0.3) -> bool:
@@ -399,6 +411,17 @@ class NativeSpeakerSession:
                     data = await asyncio.wait_for(self.queue.get(), timeout=remaining + 0.15)
                 except asyncio.TimeoutError:
                     self.burst_active = False
+                    if self.started_at is not None:
+                        # Final rate for the burst that just finished playing;
+                        # bytes/duration_ms == sample_rate*2 means realtime.
+                        self.logger.write(
+                            "native_tts.summary",
+                            chunks=self.played_chunks,
+                            bytes=self.played_bytes,
+                            dropped_chunks=self.dropped_chunks,
+                            duration_ms=elapsed_ms(self.started_at),
+                            reason="drained",
+                        )
                     if self.on_drain:
                         await self.on_drain()
                     continue
