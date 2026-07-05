@@ -21,7 +21,7 @@ from collections import deque
 
 import numpy as np
 
-BYTES_PER_SAMPLE = 2  # mono int16 throughout the native lane
+from opencode_voice.audio_processing import BYTES_PER_SAMPLE
 
 
 class PcmRingBuffer:
