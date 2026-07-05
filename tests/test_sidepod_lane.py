@@ -1187,6 +1187,73 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(connection.active_turn_id, 7)
             self.assertFalse(speaker.paused)
 
+    async def test_early_probe_dismisses_clear_echo_before_any_transcript(self) -> None:
+        # The pause must not wait out the STT round-trip when the audio
+        # already matches the render (live run 192451Z: 8 pauses burned the
+        # full 2s confirm deadline waiting for a transcript of pure echo).
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            await connection.handle_flux_event({"type": "speech.start"})
+            self.assertTrue(speaker.paused)
+            connection.barge_pending_since -= 1.0  # window already has audio
+            self.fill_echo_rings(connection, correlated=True)
+
+            dismissed = connection.try_early_echo_dismiss()
+
+            self.assertTrue(dismissed)
+            self.assertFalse(connection.barge_pending)
+            self.assertFalse(speaker.paused)
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertEqual(client.aborted, [])
+            log_lines = connection.logger.path.read_text(encoding="utf-8").splitlines()
+            events = [json.loads(line) for line in log_lines]
+            self.assertTrue(any(e["event"] == "barge_in.echo_probe" for e in events))
+            self.assertTrue(
+                any(e["event"] == "barge_in.false_alarm" and e["verdict"] == "echo_audio" for e in events)
+            )
+
+    async def test_early_probe_keeps_waiting_when_audio_is_novel(self) -> None:
+        # A real interrupt must NOT be resumed over: low correlation leaves
+        # the pending barge in place for the transcript to decide.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0
+            self.fill_echo_rings(connection, correlated=False)
+
+            dismissed = connection.try_early_echo_dismiss()
+
+            self.assertFalse(dismissed)
+            self.assertTrue(connection.barge_pending)
+            self.assertTrue(speaker.paused)
+            log_lines = connection.logger.path.read_text(encoding="utf-8").splitlines()
+            events = [json.loads(line) for line in log_lines]
+            # The correlation is still logged for live calibration.
+            self.assertTrue(any(e["event"] == "barge_in.echo_probe" for e in events))
+
+    async def test_probe_task_starts_with_pending_and_dies_with_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            self.audible_speaker(connection)
+            connection.active_turn_id = 7
+
+            await connection.handle_flux_event({"type": "speech.start"})
+            probe = connection.pending_probe_task
+            self.assertIsNotNone(probe)
+            self.assertFalse(probe.done())
+
+            connection.clear_pending_barge_in()
+            await asyncio.sleep(0)
+            self.assertTrue(probe.cancelled() or probe.done())
+            self.assertIsNone(connection.pending_probe_task)
+
     async def test_tie_band_transcript_with_uncorrelated_audio_still_interrupts(self) -> None:
         # Same borderline transcript, but the mic audio does NOT match the
         # render: a real user quoting the assistant must still barge in.

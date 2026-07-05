@@ -729,6 +729,7 @@ class VoiceConnection:
         self.barge_pending = False
         self.barge_pending_since = 0.0
         self.pending_barge_task: asyncio.Task[None] | None = None
+        self.pending_probe_task: asyncio.Task[None] | None = None
         self.aec_delay_error_logged = False
         self.tts_first_audio_seen = False
         self.turn_spoken_any = False
@@ -1178,6 +1179,12 @@ class VoiceConnection:
     # loudness contour (live fixture: shifted+attenuated copies score ~0.9);
     # independent speech stays well under 0.4.
     ECHO_CORRELATION_FLOOR = 0.6
+    # The early probe resolves the PAUSE before any transcript exists, so it
+    # has no text corroboration and demands a stronger match than the
+    # tie-band check. Wrong early resumes self-correct (the transcript still
+    # gets its verdict and a real interrupt still barges in), but each one
+    # costs the user a restarted playback stutter — keep this conservative.
+    ECHO_EARLY_CORRELATION_FLOOR = 0.75
 
     def transcript_verdict(
         self, transcript: str, eager: bool, confidence: float | None = None
@@ -1282,6 +1289,8 @@ class VoiceConnection:
             self.native_speaker.pause()
         self.logger.write("barge_in.pending")
         self.arm_pending_barge_in_deadline()
+        if self.config.echo_probe_enabled:
+            self.pending_probe_task = asyncio.create_task(self.early_echo_probe())
 
     def arm_pending_barge_in_deadline(self) -> None:
         task = self.pending_barge_task
@@ -1294,12 +1303,51 @@ class VoiceConnection:
         if self.barge_pending:
             self.dismiss_pending_barge_in("timeout")
 
+    async def early_echo_probe(self) -> None:
+        """Resolve the pending pause by AUDIO, before any transcript exists.
+
+        Waiting for the transcript costs the full STT round-trip while
+        playback sits paused — live run 20260705T192451Z: text-resolved echo
+        pauses ran 1.1-1.7s and eight more hit the whole 2s confirm deadline
+        because Flux transcribed the echo only after the window. The mic and
+        render rings already hold the answer; checkpoints start at 0.5s (the
+        correlator needs ~0.4s of mic audio) and stay ahead of the deadline.
+        A wrong dismissal self-corrects: the transcript still gets its
+        verdict, so a real interrupt still barges in via the text path.
+        """
+        for checkpoint_sec in (0.5, 1.0, 1.5):
+            remaining = self.barge_pending_since + checkpoint_sec - time.perf_counter()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            if not self.barge_pending:
+                return
+            if self.try_early_echo_dismiss():
+                return
+
+    def try_early_echo_dismiss(self) -> bool:
+        """One audio check of the pending window; dismisses on a clear match.
+        Always logs the correlation so live runs calibrate the floor."""
+        correlation = self.pending_barge_echo_correlation()
+        self.logger.write(
+            "barge_in.echo_probe",
+            corr=round(correlation, 2),
+            at_ms=int((time.perf_counter() - self.barge_pending_since) * 1000),
+        )
+        if correlation >= self.ECHO_EARLY_CORRELATION_FLOOR:
+            self.dismiss_pending_barge_in("echo_audio")
+            return True
+        return False
+
     def clear_pending_barge_in(self) -> None:
         self.barge_pending = False
         task = self.pending_barge_task
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
         self.pending_barge_task = None
+        probe = self.pending_probe_task
+        if probe and probe is not asyncio.current_task() and not probe.done():
+            probe.cancel()
+        self.pending_probe_task = None
 
     def dismiss_pending_barge_in(self, verdict: str) -> None:
         self.clear_pending_barge_in()
