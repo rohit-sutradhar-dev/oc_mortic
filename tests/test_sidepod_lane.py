@@ -1471,6 +1471,65 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.aborted, [])
 
 
+class SilentCompletionLoggingTests(unittest.IsolatedAsyncioTestCase):
+    """A completed turn with real reply text but zero speak() calls (e.g. an
+    all-code, no-prose reply the speech filter strips to nothing) finishes
+    normally and silently — indistinguishable from a hang unless it's
+    logged. No behavior change: still no audio, just a diagnostic event."""
+
+    async def test_speak_marks_the_turn_as_having_produced_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramSpeakSession", FakeSpeakSession
+        ):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            self.assertFalse(connection.turn_spoken_any)
+
+            await connection.speak("Hello there.", turn_id=1)
+
+            self.assertTrue(connection.turn_spoken_any)
+
+    async def test_silent_completion_with_real_text_logs_a_diagnostic_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+
+            connection.turn_spoken_any = False
+            connection.log_if_silent_completion(9, "```python\ndef foo():\n    pass\n```")
+
+            log_lines = connection.logger.path.read_text(encoding="utf-8").splitlines()
+            events = [json.loads(line) for line in log_lines]
+            silent = [e for e in events if e["event"] == "tts.no_speakable_text"]
+            self.assertEqual(len(silent), 1)
+            self.assertEqual(silent[0]["turn_id"], 9)
+
+    async def test_normal_completion_that_spoke_does_not_log_the_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+
+            connection.turn_spoken_any = True
+            connection.log_if_silent_completion(9, "A normal spoken reply.")
+
+            log_lines = connection.logger.path.read_text(encoding="utf-8").splitlines()
+            events = [json.loads(line)["event"] for line in log_lines]
+            self.assertNotIn("tts.no_speakable_text", events)
+
+    async def test_empty_completion_does_not_log_the_diagnostic(self) -> None:
+        # A genuinely empty reply is a different (already-handled) case, not
+        # speech-filtered-to-nothing — don't conflate the two in the logs.
+        with tempfile.TemporaryDirectory() as tmp:
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+
+            connection.turn_spoken_any = False
+            connection.log_if_silent_completion(9, "")
+
+            log_lines = connection.logger.path.read_text(encoding="utf-8").splitlines()
+            events = [json.loads(line)["event"] for line in log_lines]
+            self.assertNotIn("tts.no_speakable_text", events)
+
+
 class SidepodCompactionWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_kicks_a_context_check_without_leaking_tokens_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

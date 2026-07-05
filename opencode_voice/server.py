@@ -731,6 +731,7 @@ class VoiceConnection:
         self.pending_barge_task: asyncio.Task[None] | None = None
         self.aec_delay_error_logged = False
         self.tts_first_audio_seen = False
+        self.turn_spoken_any = False
         self.audio_input_chunks = 0
         self.audio_input_bytes = 0
         self.audio_input_started: float | None = None
@@ -1328,6 +1329,7 @@ class VoiceConnection:
         turn_id = self.turn_seq
         self.active_turn_id = turn_id
         self.tts_first_audio_seen = False
+        self.turn_spoken_any = False
         started = time.perf_counter()
         if self.speaker_prewarm_task is None or self.speaker_prewarm_task.done():
             self.speaker_prewarm_task = asyncio.create_task(self.prewarm_speaker())
@@ -1425,6 +1427,7 @@ class VoiceConnection:
             if update.completed:
                 for chunk in chunker.push(speech_filter.flush()) + chunker.flush():
                     await self.speak(chunk, turn_id=turn_id)
+                self.log_if_silent_completion(turn_id, update.full_text or full_text)
                 if update.error:
                     await self.send_json(
                         {"type": "turn.error", "turn_id": turn_id, "message": str(update.error)[:1000]}
@@ -1606,6 +1609,7 @@ class VoiceConnection:
         final_tracker = AssistantTextTracker(before_messages)
         final_update = final_tracker.update(messages)
         final_text = final_update.full_text or event_text
+        self.log_if_silent_completion(turn_id, final_text)
         if final_update.error:
             await self.send_json({"type": "turn.error", "turn_id": turn_id, "message": str(final_update.error)[:1000]})
             self.logger.write("turn.error", turn_id=turn_id, error=final_update.error)
@@ -1712,6 +1716,7 @@ class VoiceConnection:
         if issue:
             await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
             return
+        self.turn_spoken_any = True
         # Rolling record of what the assistant said recently; the pending
         # barge-in resolver matches transcripts against it to spot echo.
         self.spoken_text_recent = (self.spoken_text_recent + " " + text)[-1000:]
@@ -1722,6 +1727,15 @@ class VoiceConnection:
         if self.speaker is not speaker:
             return
         await speaker.speak(text, turn_id=turn_id)
+
+    def log_if_silent_completion(self, turn_id: int, response_text: str) -> None:
+        """A completed turn with real reply text but zero speak() calls means
+        the speech filter stripped everything (e.g. an all-code, no-prose
+        reply) — the turn finishes normally and silently, which looks
+        identical to a hang from the user's side. Diagnostic only; no
+        fallback utterance is sent."""
+        if response_text.strip() and not self.turn_spoken_any:
+            self.logger.write("tts.no_speakable_text", turn_id=turn_id, response_chars=len(response_text))
 
     async def send_tts_audio(self, data: bytes, turn_id: int | None) -> None:
         if not self.tts_first_audio_seen:
