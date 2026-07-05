@@ -168,6 +168,11 @@ class VoiceConfig:
     # captions. The canceller still adapts (mic frames keep flowing through
     # it); only STT is deaf during the window.
     playback_mute_sec: float = 0.6
+    # Audio-domain echo backstop: on an ambiguous pending barge-in, compare
+    # the mic signal against the render reference we actually played and
+    # dismiss as echo when they correlate. Costs a few ms once per pending
+    # transcript; disable to fall back to the text-only gates.
+    echo_probe_enabled: bool = True
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False

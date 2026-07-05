@@ -892,6 +892,136 @@ class CartesiaProtocolTests(unittest.IsolatedAsyncioTestCase):
         await session.close()
 
 
+class SpokenSequenceRatioTests(unittest.TestCase):
+    SPOKEN = (
+        "We just explored the repository, looking at its overall architecture, "
+        "key directories, the eight agents and their services, configuration files, "
+        "and the current development status. That should give you a solid picture "
+        "of where things stand right now."
+    )
+
+    def test_in_order_mangled_echo_scores_above_the_gate(self) -> None:
+        from opencode_voice.server import spoken_sequence_ratio
+
+        # STT substitutions that defeat bag-of-words membership but keep order
+        # (the 2026-07-05 incident shape) must stay above ECHO_SEQUENCE_RATIO.
+        mangled = [
+            "the eight agents in their servaces configuration file and the currents development status",
+            "that should give you a solid pitcher of where things stands right now",
+            "looking at its overhaul architecture key director ease the eight agents",
+            # heavy mangling, ~45% substituted
+            "the ate agents an there servaces configure ration piles and the parents develop mint status",
+        ]
+        for transcript in mangled:
+            self.assertGreaterEqual(spoken_sequence_ratio(transcript, self.SPOKEN), 0.75, transcript)
+
+    def test_novel_and_quoting_interrupts_score_below_the_gate(self) -> None:
+        from opencode_voice.server import spoken_sequence_ratio
+
+        novel = [
+            "actually stop for a second I want you to focus on the tests instead",
+            "wait can you explain the configuration part again more slowly please",
+            "hold on what about the services you mentioned do they share state",
+            # partially quoting the assistant is still a legitimate interrupt
+            "you said the eight agents share services is that actually true",
+        ]
+        for transcript in novel:
+            self.assertLess(spoken_sequence_ratio(transcript, self.SPOKEN), 0.70, transcript)
+
+    def test_empty_inputs_score_zero(self) -> None:
+        from opencode_voice.server import spoken_sequence_ratio
+
+        self.assertEqual(spoken_sequence_ratio("", self.SPOKEN), 0.0)
+        self.assertEqual(spoken_sequence_ratio("hello there", ""), 0.0)
+
+
+class EchoProbeTests(unittest.TestCase):
+    SAMPLE_RATE = 16_000
+
+    @staticmethod
+    def speechlike_pcm(seconds: float, sample_rate: int, seed: int) -> bytes:
+        """Noise with syllable-like amplitude modulation AND per-utterance
+        spectral coloration (random resonances standing in for formants).
+        Both matter: all human speech shares roughly the same syllable rate,
+        so single-envelope periodicity alone makes unrelated segments look
+        alike — which is exactly the false positive the multi-band probe is
+        built to avoid, and what this fixture must be able to expose."""
+        import numpy as np
+
+        rng = np.random.default_rng(seed)
+        n = int(seconds * sample_rate)
+        t = np.arange(n) / sample_rate
+        envelope = 0.4 + 0.6 * np.abs(
+            np.sin(2 * np.pi * 4 * t + rng.uniform(0, 6)) * np.sin(2 * np.pi * 0.7 * t)
+        )
+        signal = rng.standard_normal(n)
+        for _ in range(3):
+            frequency = rng.uniform(200, 3500)
+            signal += np.sin(2 * np.pi * frequency * t + rng.uniform(0, 6)) * rng.uniform(0.3, 1.0)
+        return (signal * envelope * 6000).astype(np.int16).tobytes()
+
+    def test_shifted_attenuated_copy_correlates_high(self) -> None:
+        from opencode_voice.echo_probe import echo_correlation
+
+        import numpy as np
+
+        render = self.speechlike_pcm(2.0, self.SAMPLE_RATE, seed=1)
+        samples = np.frombuffer(render, dtype=np.int16).astype(np.float32)
+        # Echo: 200ms acoustic delay, 70% attenuation, a little room noise.
+        delay = int(0.2 * self.SAMPLE_RATE)
+        echoed = np.concatenate([np.zeros(delay, dtype=np.float32), samples * 0.3])
+        echoed += np.random.default_rng(2).standard_normal(len(echoed)) * 200
+        mic = echoed.astype(np.int16).tobytes()
+
+        self.assertGreaterEqual(echo_correlation(mic, render, self.SAMPLE_RATE), 0.75)
+
+    def test_independent_speech_correlates_low(self) -> None:
+        from opencode_voice.echo_probe import echo_correlation
+
+        render = self.speechlike_pcm(2.0, self.SAMPLE_RATE, seed=3)
+        for seed in (42, 7, 11, 99, 123):
+            mic = self.speechlike_pcm(1.2, self.SAMPLE_RATE, seed=seed)
+            self.assertLess(echo_correlation(mic, render, self.SAMPLE_RATE), 0.55, f"seed={seed}")
+
+    def test_user_talking_over_playback_stays_below_the_floor(self) -> None:
+        # The mixed-voice case: a real barge-in while the reply's echo tail is
+        # still in the mic. The probe must NOT read this as echo (0.6 floor).
+        import numpy as np
+
+        from opencode_voice.echo_probe import echo_correlation
+
+        render = self.speechlike_pcm(2.0, self.SAMPLE_RATE, seed=3)
+        render_samples = np.frombuffer(render, dtype=np.int16).astype(np.float32)
+        delay = int(0.2 * self.SAMPLE_RATE)
+        echo_tail = np.concatenate([np.zeros(delay, dtype=np.float32), render_samples * 0.3])
+        user = np.frombuffer(self.speechlike_pcm(1.2, self.SAMPLE_RATE, seed=42), dtype=np.int16).astype(np.float32)
+        mixed = (user * 0.8 + echo_tail[: len(user)] * 0.5).astype(np.int16).tobytes()
+
+        self.assertLess(echo_correlation(mixed, render, self.SAMPLE_RATE), 0.6)
+
+    def test_too_short_segments_score_zero(self) -> None:
+        from opencode_voice.echo_probe import echo_correlation
+
+        blip = self.speechlike_pcm(0.1, self.SAMPLE_RATE, seed=5)
+        render = self.speechlike_pcm(2.0, self.SAMPLE_RATE, seed=6)
+
+        self.assertEqual(echo_correlation(blip, render, self.SAMPLE_RATE), 0.0)
+        self.assertEqual(echo_correlation(b"", render, self.SAMPLE_RATE), 0.0)
+
+    def test_ring_buffer_extracts_by_wall_clock_and_trims(self) -> None:
+        from opencode_voice.echo_probe import PcmRingBuffer
+
+        ring = PcmRingBuffer(self.SAMPLE_RATE, max_sec=2.0, direction="ending")
+        base = 1000.0
+        frame = b"\x01\x00" * int(0.08 * self.SAMPLE_RATE)  # 80ms
+        for i in range(50):  # 4s of frames; only the last 2s survive
+            ring.append(frame, at=base + i * 0.08)
+        self.assertLessEqual(len(ring.frames), 26)
+        segment = ring.extract(base + 3.8, base + 4.0)
+        self.assertGreaterEqual(len(segment), len(frame) * 2)
+        self.assertEqual(ring.extract(base + 100, base + 101), b"")
+
+
 class TTSTests(unittest.TestCase):
     def test_chunker_flushes_sentences_and_caps_long_chunks(self) -> None:
         chunker = TTSChunker(preferred_chars=20, max_chars=40)

@@ -1031,6 +1031,188 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(connection.active_turn_id)
             self.assertEqual(started, ["no wait, look at the tests instead"])
 
+    async def test_mangled_in_order_echo_is_dismissed_despite_low_word_overlap(self) -> None:
+        # Replay of run 20260705T174112Z 17:58:45: 21s into a long reply the
+        # AEC leaked, STT transcribed the echo with ~1/3 of the words
+        # substituted, and the bag-of-words overlap (0.64) slipped under the
+        # 0.75 gate — Mortic's own words came back as a confirmed interrupt.
+        # The words changed but the order didn't: the sequence gate must
+        # classify this as echo and resume playback.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = (
+                "We just explored the repository, looking at its overall architecture, "
+                "key directories, the eight agents and their services, configuration "
+                "files, and the current development status."
+            )
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0  # long enough to defeat cut_short
+            await connection.handle_flux_event(
+                {
+                    "type": "speech.end",
+                    # In-order echo, mangled: word overlap ~0.69 (< 0.75).
+                    "transcript": "the eight agents in their servaces configuration file and the currents development status",
+                    "eager": False,
+                    "confidence": 0.9,
+                }
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, [])
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertFalse(speaker.paused)
+            self.assertEqual(client.aborted, [])
+
+    async def test_long_novel_interrupt_still_admits_with_sequence_gate_armed(self) -> None:
+        # A real interrupt of the same length as the incident echo must not
+        # be swallowed by the sequence gate.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = (
+                "We just explored the repository, looking at its overall architecture, "
+                "key directories, the eight agents and their services, configuration "
+                "files, and the current development status."
+            )
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0
+            transcript = "actually stop for a second I want you to focus on the failing tests instead"
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": transcript, "eager": False, "confidence": 0.95}
+            )
+            await asyncio.sleep(0)
+
+            self.assertIsNone(connection.active_turn_id)
+            self.assertEqual(started, [transcript])
+
+    async def test_mangled_closing_words_echo_in_the_tail_window_is_rejected(self) -> None:
+        # Echo of the reply's closing words transcribes after playback has
+        # ended; the sequence gate stays armed for ECHO_TAIL_SEC like the
+        # other content rules.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            speaker.audible = False
+            speaker.silent_for = 0.5  # inside ECHO_TAIL_SEC, past the audible-now rules
+            connection.spoken_text_recent = (
+                "That should give you a solid picture of where things stand right now."
+            )
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event(
+                {
+                    "type": "speech.end",
+                    "transcript": "a solid pitcher of where things stands right now",
+                    "eager": False,
+                    "confidence": 0.9,
+                }
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, [])
+
+    TIE_BAND_SPOKEN = (
+        "We just explored the repository, looking at its overall architecture, "
+        "key directories, the eight agents and their services, configuration "
+        "files, and the current development status."
+    )
+    # Word overlap ~0.55, sequence ratio ~0.60: between ECHO_PROBE_TEXT_FLOOR
+    # (0.45) and the echo thresholds — the band where the audio probe decides.
+    TIE_BAND_TRANSCRIPT = "you said the eight agents share services is that actually true"
+
+    def fill_echo_rings(self, connection: SidepodConnection, correlated: bool) -> None:
+        from tests.test_opencode_voice import EchoProbeTests
+
+        import numpy as np
+
+        rate = connection.config.deepgram_sample_rate
+        start = connection.barge_pending_since
+        render = EchoProbeTests.speechlike_pcm(2.0, rate, seed=3)
+        connection.render_audio_ring.append(render, at=start - 0.2)
+        if correlated:
+            samples = np.frombuffer(render, dtype=np.int16).astype(np.float32)
+            delay = int(0.2 * rate)
+            echoed = np.concatenate([np.zeros(delay, dtype=np.float32), samples * 0.3])
+            mic = echoed[: int(1.2 * rate)].astype(np.int16).tobytes()
+        else:
+            mic = EchoProbeTests.speechlike_pcm(1.2, rate, seed=42)
+        connection.mic_audio_ring.append(mic, at=start + 1.2)
+
+    async def test_tie_band_transcript_with_correlated_audio_dismisses_as_echo(self) -> None:
+        # Text alone can't decide (score in the ambiguous band); the mic
+        # signal matching the render reference is what settles it as echo.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = self.TIE_BAND_SPOKEN
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0
+            self.fill_echo_rings(connection, correlated=True)
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": self.TIE_BAND_TRANSCRIPT, "eager": False, "confidence": 0.9}
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(started, [])
+            self.assertEqual(connection.active_turn_id, 7)
+            self.assertFalse(speaker.paused)
+
+    async def test_tie_band_transcript_with_uncorrelated_audio_still_interrupts(self) -> None:
+        # Same borderline transcript, but the mic audio does NOT match the
+        # render: a real user quoting the assistant must still barge in.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.spoken_text_recent = self.TIE_BAND_SPOKEN
+            started: list[str] = []
+
+            async def fake_turn(text: str, source: str, eager: bool) -> None:
+                started.append(text)
+
+            connection.run_text_turn = fake_turn  # type: ignore[method-assign]
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0
+            self.fill_echo_rings(connection, correlated=False)
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": self.TIE_BAND_TRANSCRIPT, "eager": False, "confidence": 0.9}
+            )
+            await asyncio.sleep(0)
+
+            self.assertIsNone(connection.active_turn_id)
+            self.assertEqual(started, [self.TIE_BAND_TRANSCRIPT])
+
     async def test_dismissed_transcripts_final_copy_never_becomes_a_turn(self) -> None:
         # The regression from run 20260704T093645Z: the eager copy of an echo
         # was correctly dismissed, then its confirming final speech.end

@@ -78,6 +78,13 @@ resumes playback where it left off. And when Flux fires an eager end-of-turn
 followed by the confirming final one for the same words, the final confirms
 the already-running turn instead of restarting it.
 
+Echo that leaks past the canceller is classified in layers: exact word
+overlap with what the assistant just said, ordered character-level sequence
+matching (STT transcribes mangled echo with substituted words but in the
+assistant's word order), and — for text scores too ambiguous to call — a
+comparison of the mic signal against the exact audio the speaker played
+(spectral band-envelope correlation; disable with `echo_probe_enabled` off).
+
 Turns stream from OpenCode's `/event` feed scoped to the fork's directory
 (forks inherit the source thread's directory; an unscoped subscription never
 sees their events and every turn would pay the poll-fallback timeout).

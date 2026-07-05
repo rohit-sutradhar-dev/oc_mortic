@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import importlib.util
 import json
 import os
@@ -18,6 +19,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from opencode_voice.cartesia import build_tts_url as build_cartesia_tts_url
+from opencode_voice.echo_probe import PcmRingBuffer, echo_correlation
 from opencode_voice.config import (
     VoiceConfig,
     iso_utc_now,
@@ -109,6 +111,39 @@ def helper_readiness_issues(
 
 def transcript_words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def spoken_sequence_ratio(transcript: str, spoken_text: str, tail_chars: int = 400) -> float:
+    """Best character-level similarity between the transcript and any
+    transcript-sized window of the recently spoken text.
+
+    The bag-of-words overlap check misses echo that STT mangled: substitute a
+    third of the words and membership drops below the echo threshold even
+    though the transcript is still the assistant's sentence *in order*
+    (live incident 2026-07-05: 72-char echo scored 0.64 overlap and was
+    confirmed as a real interrupt). SequenceMatcher on sliding windows keeps
+    the word order and survives substitutions like "directories"->"directors".
+    """
+    words = transcript_words(transcript)
+    if not words:
+        return 0.0
+    target = " ".join(words)
+    spoken_words = transcript_words(spoken_text[-tail_chars:])
+    if not spoken_words:
+        return 0.0
+    matcher = difflib.SequenceMatcher(autojunk=False)
+    matcher.set_seq2(target)  # seq2 is cached; slide seq1 across it
+    best = 0.0
+    # Windows from 70% to 130% of the transcript length, stepped one word.
+    low = max(1, int(len(words) * 0.7))
+    high = min(len(spoken_words), max(1, int(len(words) * 1.3)))
+    for size in range(low, high + 1):
+        for start in range(0, len(spoken_words) - size + 1):
+            matcher.set_seq1(" ".join(spoken_words[start : start + size]))
+            if matcher.real_quick_ratio() <= best or matcher.quick_ratio() <= best:
+                continue
+            best = max(best, matcher.ratio())
+    return best
 
 
 class OpenCodeEventFallback(Exception):
@@ -700,6 +735,10 @@ class VoiceConnection:
         self.audio_input_bytes = 0
         self.audio_input_started: float | None = None
         self.audio_input_last_log = 0.0
+        # Rolling audio windows for the echo probe: what the mic heard
+        # (post-AEC, i.e. what STT hears) and what the speaker played.
+        self.mic_audio_ring = PcmRingBuffer(config.deepgram_sample_rate, direction="ending")
+        self.render_audio_ring = PcmRingBuffer(config.deepgram_sample_rate, direction="starting")
 
     async def run(self) -> None:
         readiness_issues = helper_readiness_issues(
@@ -980,6 +1019,9 @@ class VoiceConnection:
             return
         data = self.filter_mic_frame(data)
         if data:
+            # The probe compares what STT hears against what we played, so
+            # the ring gets the post-AEC frame, not the raw capture.
+            self.mic_audio_ring.append(data)
             await self.flux.send_audio(data)
 
     def reset_audio_input_counters(self) -> None:
@@ -1119,6 +1161,22 @@ class VoiceConnection:
     # human keeps talking whether or not the assistant went quiet). LiveKit
     # ships the same rule as min_interruption_duration.
     PENDING_MIN_SPEECH_SEC = 0.4
+    # Character-level similarity (ordered window match) at or above this is
+    # echo even when word membership fails: STT transcribes AEC-mangled echo
+    # with substituted words, but in the assistant's word order (live
+    # incident: overlap 0.64 slipped the 0.75 gate; its sequence ratio was
+    # far higher). Calibrated by test against mangled vs novel transcripts.
+    ECHO_SEQUENCE_RATIO = 0.72
+    # The audio probe only breaks ties: below this text score the transcript
+    # is clearly novel and no audio evidence may dismiss it (protects real
+    # barge-ins, including the user talking over playback), above the echo
+    # thresholds the text rules already decided.
+    ECHO_PROBE_TEXT_FLOOR = 0.45
+    # Peak mic-vs-render energy-envelope correlation at or above this means
+    # the mic heard what the speaker played. Echo replays the render's
+    # loudness contour (live fixture: shifted+attenuated copies score ~0.9);
+    # independent speech stays well under 0.4.
+    ECHO_CORRELATION_FLOOR = 0.6
 
     def transcript_verdict(
         self, transcript: str, eager: bool, confidence: float | None = None
@@ -1172,21 +1230,49 @@ class VoiceConnection:
             words = transcript_words(transcript)
             spoken = set(transcript_words(self.spoken_text_recent))
             overlap = sum(word in spoken for word in words) / len(words) if words else 0.0
+            seq_ratio = spoken_sequence_ratio(transcript, self.spoken_text_recent)
             # Kept on admits too: transcripts are redacted from logs, so the
-            # overlap score is what lets a log reader judge echo-likeness.
+            # overlap and sequence scores are what let a log reader judge
+            # echo-likeness.
             detail["overlap"] = round(overlap, 2)
+            detail["seq_ratio"] = round(seq_ratio, 2)
             # A single word the assistant just used ("Great." echoing back)
             # counts as echo only while sound is actually on the air; once
             # playback ends, a one-word "Yes." is a legitimate answer even
             # though the assistant's question contained the word.
             multiword_echo = len(words) >= 2 and overlap >= 0.75
             single_word_echo = audible_now and len(words) == 1 and overlap >= 1.0
-            if multiword_echo or single_word_echo:
+            # STT-mangled echo defeats word membership but keeps word order:
+            # the character-level window match catches it (>=3 words so short
+            # legitimate replies never ride the fuzzy path).
+            sequence_echo = len(words) >= 3 and seq_ratio >= self.ECHO_SEQUENCE_RATIO
+            if multiword_echo or single_word_echo or sequence_echo:
                 return "echo", detail
+            if (
+                self.config.echo_probe_enabled
+                and self.barge_pending
+                and len(words) >= 3
+                and max(overlap, seq_ratio) >= self.ECHO_PROBE_TEXT_FLOOR
+            ):
+                # Text score is in the ambiguous band: ask the audio whether
+                # the mic heard what the speaker played during this window.
+                correlation = self.pending_barge_echo_correlation()
+                detail["echo_corr"] = round(correlation, 2)
+                if correlation >= self.ECHO_CORRELATION_FLOOR:
+                    return "echo", detail
             if confidence is not None and confidence < self.ECHO_CONFIDENCE_FLOOR:
                 detail["confidence"] = round(confidence, 3)
                 return "low_confidence", detail
         return "admit", detail
+
+    def pending_barge_echo_correlation(self) -> float:
+        """Correlate the pending window's mic audio with the render audio
+        played around it (padded for AEC/device delay error)."""
+        now = time.perf_counter()
+        start = self.barge_pending_since
+        mic_pcm = self.mic_audio_ring.extract(start, now)
+        render_pcm = self.render_audio_ring.extract(start - 0.6, now + 0.6)
+        return echo_correlation(mic_pcm, render_pcm, self.config.deepgram_sample_rate)
 
     def begin_pending_barge_in(self) -> None:
         self.barge_pending = True
@@ -2144,6 +2230,9 @@ class SidepodConnection(VoiceConnection):
                 )
 
     def feed_render_reference(self, data: bytes) -> None:
+        # Called on the playback worker thread just before the device write,
+        # so the timestamp approximates when this chunk starts playing.
+        self.render_audio_ring.append(data)
         if self.echo_canceller:
             self.echo_canceller.process_render(data)
 
