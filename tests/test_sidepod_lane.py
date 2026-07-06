@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from typing import Any
 from unittest.mock import patch
@@ -1253,6 +1254,37 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.assertTrue(probe.cancelled() or probe.done())
             self.assertIsNone(connection.pending_probe_task)
+
+    async def test_early_probe_repolls_until_correlation_crosses(self) -> None:
+        # Frame-driven: the probe rechecks on a fine cadence rather than
+        # firing a fixed set of ticks, so echo that only correlates once
+        # enough mic frames have arrived still resolves the pause.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.ECHO_PROBE_MIN_SEC = 0.0  # type: ignore[attr-defined]
+            connection.ECHO_PROBE_POLL_SEC = 0.0  # type: ignore[attr-defined]
+            connection.barge_pending = True
+            connection.barge_pending_since = time.perf_counter() - 1.0
+            self.fill_echo_rings(connection, correlated=True)
+
+            calls = {"n": 0}
+            real = connection.try_early_echo_dismiss
+
+            def gated() -> bool:
+                calls["n"] += 1
+                # The audio only becomes conclusive after a few frames.
+                return real() if calls["n"] >= 3 else False
+
+            connection.try_early_echo_dismiss = gated  # type: ignore[method-assign]
+
+            await connection.early_echo_probe()
+
+            self.assertGreaterEqual(calls["n"], 3)
+            self.assertFalse(connection.barge_pending)
+            self.assertFalse(speaker.paused)
 
     async def test_tie_band_transcript_with_uncorrelated_audio_still_interrupts(self) -> None:
         # Same borderline transcript, but the mic audio does NOT match the

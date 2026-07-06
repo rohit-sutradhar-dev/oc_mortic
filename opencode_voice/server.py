@@ -1180,11 +1180,21 @@ class VoiceConnection:
     # independent speech stays well under 0.4.
     ECHO_CORRELATION_FLOOR = 0.6
     # The early probe resolves the PAUSE before any transcript exists, so it
-    # has no text corroboration and demands a stronger match than the
-    # tie-band check. Wrong early resumes self-correct (the transcript still
-    # gets its verdict and a real interrupt still barges in), but each one
-    # costs the user a restarted playback stutter — keep this conservative.
-    ECHO_EARLY_CORRELATION_FLOOR = 0.75
+    # has no text corroboration. It still sits well above where real
+    # interrupts land — live run 162018Z: confirmed interrupts peaked at corr
+    # 0.34 while leaked echo reached 0.75 — and a wrong dismissal self-corrects:
+    # the transcript still gets its verdict, so a real interrupt barges in via
+    # the text path, costing one restarted-playback stutter, not a lost
+    # interrupt. That recoverability is why this can sit at the corroborated
+    # floor rather than above it. If a live run shows a real interrupt in the
+    # 0.6-0.75 band, raise it.
+    ECHO_EARLY_CORRELATION_FLOOR = 0.6
+    # The correlator needs ~min_overlap_sec (0.4s) of mic audio before it can
+    # judge, so the first audio check waits this long; then it rechecks every
+    # poll interval (mic frames arrive ~80ms apart) so a clear echo resolves
+    # the instant correlation crosses the floor, not at the next fixed tick.
+    ECHO_PROBE_MIN_SEC = 0.5
+    ECHO_PROBE_POLL_SEC = 0.05
 
     def transcript_verdict(
         self, transcript: str, eager: bool, confidence: float | None = None
@@ -1310,19 +1320,22 @@ class VoiceConnection:
         playback sits paused — live run 20260705T192451Z: text-resolved echo
         pauses ran 1.1-1.7s and eight more hit the whole 2s confirm deadline
         because Flux transcribed the echo only after the window. The mic and
-        render rings already hold the answer; checkpoints start at 0.5s (the
-        correlator needs ~0.4s of mic audio) and stay ahead of the deadline.
-        A wrong dismissal self-corrects: the transcript still gets its
-        verdict, so a real interrupt still barges in via the text path.
+        render rings already hold the answer; the first check waits
+        ECHO_PROBE_MIN_SEC for enough mic audio, then rechecks every
+        ECHO_PROBE_POLL_SEC (mic-frame cadence) so a clear echo resolves the
+        instant the correlation crosses the floor instead of at a fixed tick.
+        The confirm deadline (expire_pending_barge_in) still bounds the loop:
+        it flips barge_pending false and the loop exits. A wrong dismissal
+        self-corrects: the transcript still gets its verdict, so a real
+        interrupt still barges in via the text path.
         """
-        for checkpoint_sec in (0.5, 1.0, 1.5):
-            remaining = self.barge_pending_since + checkpoint_sec - time.perf_counter()
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-            if not self.barge_pending:
-                return
+        first = self.barge_pending_since + self.ECHO_PROBE_MIN_SEC - time.perf_counter()
+        if first > 0:
+            await asyncio.sleep(first)
+        while self.barge_pending:
             if self.try_early_echo_dismiss():
                 return
+            await asyncio.sleep(self.ECHO_PROBE_POLL_SEC)
 
     def try_early_echo_dismiss(self) -> bool:
         """One audio check of the pending window; dismisses on a clear match.
