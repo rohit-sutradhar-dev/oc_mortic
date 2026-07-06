@@ -146,6 +146,45 @@ def spoken_sequence_ratio(transcript: str, spoken_text: str, tail_chars: int = 4
     return best
 
 
+# Maps a turn-failure reason to the lane's (diagnostic_code, safe_detail,
+# retryable). Everything here is provider-agnostic and text-safe: the raw
+# model-provider error never reaches the wire, only the bucket it fell into.
+# "language model" stays generic on purpose — no provider name leaks.
+TURN_FAILURE_DETAILS: dict[str, tuple[str, str, bool]] = {
+    "provider_quota": (
+        "model_provider_quota",
+        "Language-model provider quota reached — check the model plan or billing",
+        False,
+    ),
+    "provider_auth": (
+        "model_provider_auth",
+        "Language-model provider rejected the API key — check the model credentials",
+        False,
+    ),
+    "turn_timeout": ("turn_timeout", "Voice turn timed out", True),
+    "failed": ("turn_failed", "Voice turn failed", True),
+}
+
+
+def classify_turn_failure(error: Any) -> str:
+    """Bucket an OpenCode turn error so the lane can show a useful cause
+    without carrying any provider text. Digs the HTTP status and error code
+    out of the (possibly nested) error object; an unknown shape falls through
+    to "failed", so a new error class degrades to the generic message rather
+    than leaking raw detail."""
+    data = error.get("data") if isinstance(error, dict) else None
+    if not isinstance(data, dict):
+        data = error if isinstance(error, dict) else {}
+    status = data.get("statusCode")
+    status = status if isinstance(status, int) else None
+    code = str(data.get("code") or "").lower()
+    if status == 402 or "quota" in code or "billing" in code:
+        return "provider_quota"
+    if status in (401, 403) or "auth" in code or "api_key" in code or "access_denied" in code:
+        return "provider_auth"
+    return "failed"
+
+
 class OpenCodeEventFallback(Exception):
     def __init__(self, reason: str, prompt_sent: bool = False) -> None:
         super().__init__(reason)
@@ -1530,7 +1569,12 @@ class VoiceConnection:
                 self.log_if_silent_completion(turn_id, update.full_text or full_text)
                 if update.error:
                     await self.send_json(
-                        {"type": "turn.error", "turn_id": turn_id, "message": str(update.error)[:1000]}
+                        {
+                            "type": "turn.error",
+                            "turn_id": turn_id,
+                            "message": str(update.error)[:1000],
+                            "failure": classify_turn_failure(update.error),
+                        }
                     )
                     self.logger.write("turn.error", turn_id=turn_id, error=update.error)
                 await self.send_json(
@@ -1711,7 +1755,14 @@ class VoiceConnection:
         final_text = final_update.full_text or event_text
         self.log_if_silent_completion(turn_id, final_text)
         if final_update.error:
-            await self.send_json({"type": "turn.error", "turn_id": turn_id, "message": str(final_update.error)[:1000]})
+            await self.send_json(
+                {
+                    "type": "turn.error",
+                    "turn_id": turn_id,
+                    "message": str(final_update.error)[:1000],
+                    "failure": classify_turn_failure(final_update.error),
+                }
+            )
             self.logger.write("turn.error", turn_id=turn_id, error=final_update.error)
         await self.send_json(
             {
@@ -2581,10 +2632,17 @@ class SidepodConnection(VoiceConnection):
         if timed_out:
             # A timed-out turn gets no turn.complete, so drop its seam state here.
             self.turn_seams.pop(int(payload.get("turn_id") or 0), None)
+            reason = "turn_timeout"
+        else:
+            reason = str(payload.get("failure") or "failed")
+        diagnostic_code, safe_detail, retryable = TURN_FAILURE_DETAILS.get(
+            reason, TURN_FAILURE_DETAILS["failed"]
+        )
         return voice_bridge_issue_payload(
             capability="voice_turns",
-            diagnostic_code="turn_timeout" if timed_out else "turn_failed",
-            safe_detail="Voice turn timed out" if timed_out else "Voice turn failed",
+            diagnostic_code=diagnostic_code,
+            safe_detail=safe_detail,
+            retryable=retryable,
             debug_ref=str(self.logger.run_dir),
             voice_lane_id=self.voice_lane_id,
         )

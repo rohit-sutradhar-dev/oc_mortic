@@ -21,7 +21,11 @@ from unittest.mock import patch
 from opencode_voice.config import VoiceConfig
 from opencode_voice.logging import RunLogger
 from opencode_voice.protocol import check_event
-from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, SidepodConnection
+from opencode_voice.server import (
+    SIDEPOD_PROTOCOL_VERSION,
+    SidepodConnection,
+    classify_turn_failure,
+)
 from tests.fakes import FakeOpenCodeClient
 
 ENV_WITH_KEYS = {"DEEPGRAM_API_KEY": "audio-key", "INCEPTION_API_KEY": "turn-key"}
@@ -269,6 +273,48 @@ def assert_all_lane_messages_valid(test: unittest.TestCase, sent: list[dict[str,
     for message in sent:
         check = check_event(message)
         test.assertTrue(check.ok, f"{message.get('type')}: {check.errors}")
+
+
+class TurnFailureClassificationTests(unittest.IsolatedAsyncioTestCase):
+    """A model-provider quota/auth failure should reach the sidepod as a
+    specific, actionable issue instead of a generic 'Voice turn failed', with
+    no provider text on the wire."""
+
+    def test_classifier_buckets_provider_errors_and_falls_back_safely(self) -> None:
+        quota = {"name": "APIError", "data": {"message": "Free tier limit reached.", "statusCode": 402}}
+        auth = {"name": "APIError", "data": {"statusCode": 403, "code": "model_access_denied"}}
+        self.assertEqual(classify_turn_failure(quota), "provider_quota")
+        self.assertEqual(classify_turn_failure(auth), "provider_auth")
+        self.assertEqual(classify_turn_failure({"data": {"statusCode": 500}}), "failed")
+        self.assertEqual(classify_turn_failure("raw error string"), "failed")
+        self.assertEqual(classify_turn_failure(None), "failed")
+
+    def _issue_for(self, tmp: str, payload: dict[str, Any]) -> dict[str, Any]:
+        connection, _websocket, _client = lane_connection(tmp)
+        connection.voice_lane_id = "lane_1"
+        return connection.translate_turn_failure(payload)
+
+    def test_quota_failure_maps_to_a_billing_issue_carrying_no_raw_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            issue = self._issue_for(
+                tmp,
+                {"type": "turn.error", "turn_id": 1, "message": "Free tier limit reached.", "failure": "provider_quota"},
+            )
+        self.assertEqual(issue["diagnosticCode"], "model_provider_quota")
+        self.assertFalse(issue["retryable"])
+        self.assertIn("quota", issue["safeDetail"].lower())
+        # No provider name and no raw exception text anywhere on the wire.
+        blob = json.dumps(issue).lower()
+        for leak in ("inception", "mercury", "free tier limit", "402", "api.inceptionlabs"):
+            self.assertNotIn(leak, blob)
+
+    def test_unknown_and_timeout_failures_stay_generic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            failed = self._issue_for(tmp, {"type": "turn.error", "turn_id": 1})
+            timed = self._issue_for(tmp, {"type": "turn.timeout", "turn_id": 1})
+        self.assertEqual(failed["diagnosticCode"], "turn_failed")
+        self.assertTrue(failed["retryable"])
+        self.assertEqual(timed["diagnosticCode"], "turn_timeout")
 
 
 class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
