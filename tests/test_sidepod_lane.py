@@ -9,6 +9,7 @@ runtime-contract conformance proof for the engine side.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import tempfile
@@ -1285,6 +1286,47 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(calls["n"], 3)
             self.assertFalse(connection.barge_pending)
             self.assertFalse(speaker.paused)
+
+    async def test_pending_pcm_capture_writes_replayable_window_when_enabled(self) -> None:
+        # With capture on, a resolved pending barge-in dumps the mic + render
+        # PCM so the decision can be replayed offline; off by default, nothing
+        # is written (raw audio stays only in memory).
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.config = dataclasses.replace(connection.config, echo_capture_enabled=True)
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0
+            self.fill_echo_rings(connection, correlated=True)
+
+            connection.dismiss_pending_barge_in("timeout")
+
+            capture_dir = connection.logger.run_dir / "barge_pcm"
+            self.assertTrue(capture_dir.is_dir())
+            mics = list(capture_dir.glob("*.mic.pcm"))
+            renders = list(capture_dir.glob("*.render.pcm"))
+            metas = list(capture_dir.glob("*.json"))
+            self.assertEqual((len(mics), len(renders), len(metas)), (1, 1, 1))
+            self.assertGreater(mics[0].stat().st_size, 0)
+            meta = json.loads(metas[0].read_text())
+            self.assertEqual(meta["verdict"], "timeout")
+            self.assertEqual(meta["sample_rate"], connection.config.deepgram_sample_rate)
+
+    async def test_pending_pcm_capture_is_off_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            await connection.handle_flux_event({"type": "speech.start"})
+            connection.barge_pending_since -= 1.0
+            self.fill_echo_rings(connection, correlated=True)
+
+            connection.dismiss_pending_barge_in("timeout")
+
+            self.assertFalse((connection.logger.run_dir / "barge_pcm").exists())
 
     async def test_tie_band_transcript_with_uncorrelated_audio_still_interrupts(self) -> None:
         # Same borderline transcript, but the mic audio does NOT match the

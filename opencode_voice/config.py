@@ -173,6 +173,13 @@ class VoiceConfig:
     # dismiss as echo when they correlate. Costs a few ms once per pending
     # transcript; disable to fall back to the text-only gates.
     echo_probe_enabled: bool = True
+    # Dump the mic + render PCM of each resolved pending barge-in to
+    # runs/.../barge_pcm/ so a bad decision can be replayed offline against a
+    # different floor or algorithm (the rings are otherwise in-memory only, so
+    # a live incident is unrecoverable). Off by default — it writes raw
+    # microphone audio; the owner enables it for a debugging session. runs/ is
+    # gitignored, so nothing leaves the machine.
+    echo_capture_enabled: bool = False
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False

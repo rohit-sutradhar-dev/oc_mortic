@@ -1124,6 +1124,7 @@ class VoiceConnection:
         verdict, detail = self.transcript_verdict(transcript, eager, confidence)
         if verdict == "admit":
             if self.barge_pending:
+                self.capture_pending_pcm("confirmed", transcript_chars=len(transcript), **detail)
                 self.clear_pending_barge_in()
                 self.logger.write("barge_in.confirmed", transcript_chars=len(transcript), **detail)
                 await self.barge_in(reason="speech_confirmed")
@@ -1363,10 +1364,48 @@ class VoiceConnection:
         self.pending_probe_task = None
 
     def dismiss_pending_barge_in(self, verdict: str) -> None:
+        self.capture_pending_pcm(verdict)
         self.clear_pending_barge_in()
         self.logger.write("barge_in.false_alarm", verdict=verdict)
         if self.native_speaker:
             self.native_speaker.resume()
+
+    def capture_pending_pcm(self, verdict: str, **meta: Any) -> None:
+        """Persist the pending window's mic + render PCM for offline replay.
+        Gated by echo_capture_enabled — it writes raw microphone audio. The
+        windows are exactly what pending_barge_echo_correlation reads, so a
+        saved incident reproduces the live decision and can be re-scored
+        against a different floor or algorithm; the rings are in-memory only,
+        so without this a bad decision is unrecoverable after the turn."""
+        if not self.config.echo_capture_enabled:
+            return
+        start = self.barge_pending_since
+        now = time.perf_counter()
+        mic = self.mic_audio_ring.extract(start, now)
+        render = self.render_audio_ring.extract(start - 0.6, now + 0.6)
+        if not mic and not render:
+            return
+        out_dir = self.logger.run_dir / "barge_pcm"
+        out_dir.mkdir(exist_ok=True)
+        stamp = f"{iso_utc_now().replace(':', '').replace('-', '')}_{verdict}"
+        (out_dir / f"{stamp}.mic.pcm").write_bytes(mic)
+        (out_dir / f"{stamp}.render.pcm").write_bytes(render)
+        (out_dir / f"{stamp}.json").write_text(
+            json.dumps(
+                {
+                    "verdict": verdict,
+                    "sample_rate": self.config.deepgram_sample_rate,
+                    "mic_bytes": len(mic),
+                    "render_bytes": len(render),
+                    "window_sec": round(now - start, 3),
+                    **meta,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.logger.write(
+            "barge_in.pcm_capture", verdict=verdict, mic_bytes=len(mic), render_bytes=len(render)
+        )
 
     async def enqueue_text_turn(self, text: str, source: str, eager: bool = False) -> None:
         issue = self.config.credential_issue_for("voice_turns")
