@@ -158,9 +158,17 @@ class VoiceConfig:
     # "half": force the gate.
     voice_duplex: str = "auto"
     # speech.start while TTS is audible pauses playback and waits this long
-    # for a transcript before deciding interrupt vs false alarm; transcripts
-    # shorter than barge_in_min_chars resume playback instead of interrupting.
+    # AFTER the last speech signal (interim transcript / resume) before
+    # deciding interrupt vs false alarm; transcripts shorter than
+    # barge_in_min_chars resume playback instead of interrupting. Measuring
+    # from the last speech signal (not from speech.start) keeps the pause held
+    # through a long utterance instead of releasing playback over the speaker
+    # mid-sentence.
     barge_in_confirm_sec: float = 2.0
+    # Hard ceiling on a held pause: even if speech signals keep arriving, a
+    # pending barge-in dismisses this long after it began, so leaked echo that
+    # STT keeps re-transcribing can never freeze playback indefinitely.
+    barge_in_max_sec: float = 6.0
     barge_in_min_chars: int = 4
     # STT hears silence for this long at the start of each playback burst:
     # the echo canceller converges during roughly the first second of new

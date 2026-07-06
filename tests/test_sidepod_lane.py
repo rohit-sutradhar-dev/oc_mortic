@@ -1374,6 +1374,64 @@ class PendingBargeInTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse((connection.logger.run_dir / "barge_pcm").exists())
 
+    async def test_pause_holds_through_a_long_utterance_then_dismisses_when_quiet(self) -> None:
+        # The confirm deadline is measured from the last speech signal, so a
+        # >confirm_sec utterance (interim transcripts still arriving) keeps the
+        # pause held instead of releasing playback mid-sentence.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.config = dataclasses.replace(
+                connection.config, barge_in_confirm_sec=0.15, barge_in_max_sec=5.0, echo_probe_enabled=False
+            )
+            await connection.handle_flux_event({"type": "speech.start"})
+            self.assertTrue(connection.barge_pending)
+
+            # Interim transcripts keep arriving for ~0.4s (well past confirm_sec).
+            for _ in range(4):
+                await asyncio.sleep(0.1)
+                await connection.handle_flux_event(
+                    {"type": "speech.transcript", "transcript": "still talking", "is_final": False}
+                )
+                self.assertTrue(connection.barge_pending, "pause released mid-utterance")
+            self.assertTrue(speaker.paused)
+
+            # Speaker goes quiet: dismiss ~confirm_sec later.
+            await asyncio.sleep(0.35)
+            self.assertFalse(connection.barge_pending)
+            self.assertFalse(speaker.paused)
+
+    async def test_hard_cap_dismisses_even_while_speech_keeps_coming(self) -> None:
+        # Leaked echo that STT keeps re-transcribing must not freeze playback:
+        # the pause dismisses barge_in_max_sec after it began regardless.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            speaker = self.audible_speaker(connection)
+            connection.active_turn_id = 7
+            connection.config = dataclasses.replace(
+                connection.config, barge_in_confirm_sec=0.2, barge_in_max_sec=0.4, echo_probe_enabled=False
+            )
+            await connection.handle_flux_event({"type": "speech.start"})
+
+            # Never stop "talking": feed interim transcripts past the hard cap.
+            for _ in range(10):
+                await asyncio.sleep(0.06)
+                await connection.handle_flux_event(
+                    {"type": "speech.transcript", "transcript": "x", "is_final": False}
+                )
+                if not connection.barge_pending:
+                    break
+
+            self.assertFalse(connection.barge_pending)
+            self.assertFalse(speaker.paused)
+            events = [json.loads(l) for l in connection.logger.path.read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(
+                any(e["event"] == "barge_in.false_alarm" and e["verdict"] == "timeout_max" for e in events)
+            )
+
     async def test_tie_band_transcript_with_uncorrelated_audio_still_interrupts(self) -> None:
         # Same borderline transcript, but the mic audio does NOT match the
         # render: a real user quoting the assistant must still barge in.

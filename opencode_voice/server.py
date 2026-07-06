@@ -767,6 +767,10 @@ class VoiceConnection:
         self.dismissed_at = 0.0
         self.barge_pending = False
         self.barge_pending_since = 0.0
+        # Wall-clock of the last evidence the speaker is still talking (speech
+        # start / interim transcript / resume); the confirm deadline is
+        # measured from here so a long utterance holds the pause.
+        self.last_speech_at = 0.0
         self.pending_barge_task: asyncio.Task[None] | None = None
         self.pending_probe_task: asyncio.Task[None] | None = None
         self.aec_delay_error_logged = False
@@ -1139,13 +1143,18 @@ class VoiceConnection:
                 self.logger.write("speech.gated", event_type="speech.resumed")
                 return
             if self.barge_pending:
-                # Speech is still going; give the transcript a fresh window.
-                self.arm_pending_barge_in_deadline()
+                # Speech is still going; keep the pause held.
+                self.last_speech_at = time.perf_counter()
                 return
             await self.barge_in(reason="speech_resumed")
-        elif event["type"] == "speech.transcript" and event.get("is_final") and event.get("transcript"):
-            self.final_transcript = str(event["transcript"]).strip()
-            self.logger.write("speech.transcript.final", transcript_chars=len(self.final_transcript))
+        elif event["type"] == "speech.transcript":
+            if self.barge_pending:
+                # Interim words prove the speaker is still talking; hold the
+                # pause so the confirm deadline doesn't fire mid-utterance.
+                self.last_speech_at = time.perf_counter()
+            if event.get("is_final") and event.get("transcript"):
+                self.final_transcript = str(event["transcript"]).strip()
+                self.logger.write("speech.transcript.final", transcript_chars=len(self.final_transcript))
         elif event["type"] == "speech.end":
             transcript = str(event.get("transcript") or self.final_transcript).strip()
             self.final_transcript = ""
@@ -1220,15 +1229,15 @@ class VoiceConnection:
     # independent speech stays well under 0.4.
     ECHO_CORRELATION_FLOOR = 0.6
     # The early probe resolves the PAUSE before any transcript exists, so it
-    # has no text corroboration. It still sits well above where real
-    # interrupts land — live run 162018Z: confirmed interrupts peaked at corr
-    # 0.34 while leaked echo reached 0.75 — and a wrong dismissal self-corrects:
-    # the transcript still gets its verdict, so a real interrupt barges in via
-    # the text path, costing one restarted-playback stutter, not a lost
-    # interrupt. That recoverability is why this can sit at the corroborated
-    # floor rather than above it. If a live run shows a real interrupt in the
-    # 0.6-0.75 band, raise it.
-    ECHO_EARLY_CORRELATION_FLOOR = 0.6
+    # has no text corroboration and demands a stronger match than the
+    # corroborated tie-band floor. It sits above where real interrupts land
+    # (live runs: confirmed interrupts peaked at corr ~0.34) with margin.
+    # 0.6 was tried and reverted: run 193837Z dismissed a real interrupt at
+    # corr 0.61 as echo_audio, and the backtest showed 0.6 caught almost
+    # nothing 0.75 did not — pure downside. A wrong early dismissal only
+    # self-corrects via the transcript path at the cost of a restarted-playback
+    # stutter, so keep this conservative.
+    ECHO_EARLY_CORRELATION_FLOOR = 0.75
     # The correlator needs ~min_overlap_sec (0.4s) of mic audio before it can
     # judge, so the first audio check waits this long; then it rechecks every
     # poll interval (mic frames arrive ~80ms apart) so a clear echo resolves
@@ -1335,6 +1344,7 @@ class VoiceConnection:
     def begin_pending_barge_in(self) -> None:
         self.barge_pending = True
         self.barge_pending_since = time.perf_counter()
+        self.last_speech_at = self.barge_pending_since
         if self.native_speaker:
             self.native_speaker.pause()
         self.logger.write("barge_in.pending")
@@ -1349,9 +1359,25 @@ class VoiceConnection:
         self.pending_barge_task = asyncio.create_task(self.expire_pending_barge_in())
 
     async def expire_pending_barge_in(self) -> None:
-        await asyncio.sleep(self.config.barge_in_confirm_sec)
+        # Dismiss only once the speaker has gone quiet for barge_in_confirm_sec,
+        # not a fixed window after speech.start — otherwise a >2s utterance
+        # releases playback over the speaker mid-sentence, then the late
+        # transcript re-interrupts (the "talked over then jerky cut" glitch).
+        # last_speech_at advances on every interim transcript / resume; a hard
+        # ceiling (barge_in_max_sec from the start) stops re-transcribed echo
+        # from freezing playback forever.
+        while self.barge_pending:
+            now = time.perf_counter()
+            quiet_deadline = self.last_speech_at + self.config.barge_in_confirm_sec
+            hard_deadline = self.barge_pending_since + self.config.barge_in_max_sec
+            wait = min(quiet_deadline, hard_deadline) - now
+            if wait <= 0:
+                break
+            await asyncio.sleep(wait)
         if self.barge_pending:
-            self.dismiss_pending_barge_in("timeout")
+            quiet_for = time.perf_counter() - self.last_speech_at
+            reason = "timeout" if quiet_for >= self.config.barge_in_confirm_sec else "timeout_max"
+            self.dismiss_pending_barge_in(reason)
 
     async def early_echo_probe(self) -> None:
         """Resolve the pending pause by AUDIO, before any transcript exists.
