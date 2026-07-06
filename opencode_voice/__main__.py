@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import socket
 import subprocess
@@ -23,9 +24,12 @@ from opencode_voice.server import create_app
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_local_dotenv(Path("~/.mortic/.env").expanduser())
     load_local_dotenv()
     args = parse_args(argv)
     model = parse_model_ref(args.model, variant=args.model_variant)
+    if args.doctor:
+        return run_doctor_cli(args, model)
     opencode_process: subprocess.Popen[str] | None = None
     opencode_url = None
     detected_url = detect_opencode_url()
@@ -97,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 0
+    preflight_startup(config, model, args.agent)
     app = create_app(config)
     try:
         uvicorn.run(app, host=config.bridge_host, port=config.bridge_port, log_level=args.log_level)
@@ -200,8 +205,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--keep-fork", action="store_true", help="Keep ephemeral forks by default.")
     parser.add_argument("--print-config", action="store_true", help="Print the generated OpenCode config overlay.")
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Diagnose the install end-to-end (server, voice agent, model round-trip, keys) and exit.",
+    )
     parser.add_argument("--log-level", default="info", choices=["critical", "error", "warning", "info", "debug"])
     return parser.parse_args(argv)
+
+
+def run_doctor_cli(args: argparse.Namespace, model: "ModelRef") -> int:
+    from opencode_voice import doctor as doctor_mod
+
+    url = args.opencode_url or os.environ.get("OPENCODE_VOICE_OPENCODE_URL") or detect_opencode_url()
+    config = VoiceConfig(
+        opencode_url=url or "http://127.0.0.1:0",
+        model=model,
+        tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "deepgram",
+        opencode_agent=args.agent,
+    )
+    results = asyncio.run(doctor_mod.run_doctor(config, model, args.agent))
+    print(doctor_mod.format_report(results))
+    return 0 if all(r.ok for r in results) else 1
+
+
+def preflight_startup(config: "VoiceConfig", model: "ModelRef", agent: str) -> None:
+    """Warn-only boot check: the cheap half of the doctor (reachable + voice
+    agent, no round-trip) so a misconfigured server screams at startup instead
+    of hanging on the first turn. Never blocks — a slow/absent server here just
+    means the helper starts and surfaces the issue on the lane as usual."""
+    from opencode_voice import doctor as doctor_mod
+
+    try:
+        results = asyncio.run(doctor_mod.run_doctor(config, model, agent, round_trip=False))
+    except Exception as exc:  # noqa: BLE001 - a preflight must never stop the helper booting.
+        print(f"mortic-helper: startup preflight skipped ({type(exc).__name__})", file=sys.stderr)
+        return
+    problems = [r for r in results if not r.ok]
+    if problems:
+        print("mortic-helper: startup preflight found issues (helper still starting):", file=sys.stderr)
+        for r in problems:
+            print(f"  [{r.status.upper()}] {r.name}: {r.detail}", file=sys.stderr)
 
 
 def detect_opencode_url() -> str | None:

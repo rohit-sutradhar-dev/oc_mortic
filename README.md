@@ -35,8 +35,16 @@ export CARTESIA_API_KEY="..."  # only needed when --tts-provider cartesia
 
 ```bash
 source .venv/bin/activate
+mortic-helper --doctor            # step 1: gate the install before a session
 mortic-helper --managed-opencode
 ```
+
+`--doctor` diagnoses the install end-to-end and exits: OpenCode reachable, the
+`voice-build` agent present on that server, a real model round-trip (the "pong"
+test), and the LLM/STT/TTS keys with their source. A server missing
+`voice-build` (the `--no-managed` plugin path against a plain `opencode serve`)
+accepts turns then silently hangs — the doctor turns that into a loud FAIL. The
+same reachable + agent check runs warn-only at every helper start.
 
 `--managed-opencode` starts a clean `opencode serve` process with a runtime config overlay for the current voice model. If a running OpenCode server is detected, managed mode borrows that server's project directory so the clean server can still see the same threads.
 

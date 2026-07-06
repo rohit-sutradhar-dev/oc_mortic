@@ -55,6 +55,18 @@ class OpenCodeClient:
         data = await self._get("/session")
         return data if isinstance(data, list) else []
 
+    async def agents(self) -> list[str]:
+        """Names of the agents this server knows. A voice turn sent with an
+        agent the server lacks is accepted (204) then silently never runs, so
+        the doctor checks membership before a turn is ever attempted."""
+        data = await self._get("/agent")
+        if not isinstance(data, list):
+            return []
+        return [str(a.get("name")) for a in data if isinstance(a, dict) and a.get("name")]
+
+    async def create_session(self) -> dict[str, Any]:
+        return await self._post("/session", {})
+
     async def get_session(self, session_id: str) -> dict[str, Any]:
         return await self._get(f"/session/{session_id}")
 
