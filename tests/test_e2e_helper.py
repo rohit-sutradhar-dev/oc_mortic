@@ -50,6 +50,10 @@ class FakeOpenCode:
         async def health() -> dict[str, Any]:
             return {"ok": True}
 
+        @app.get("/agent")
+        async def agents() -> list[dict[str, str]]:
+            return [{"name": "voice-build"}]
+
         @app.post("/session/{session_id}/fork")
         async def fork(session_id: str) -> dict[str, Any]:
             fork_id = f"fork_{len(self.forks) + 1}"

@@ -19,6 +19,9 @@ class FakeOpenCodeClient:
     async def health(self) -> dict[str, bool]:
         return {"ok": True}
 
+    async def agents(self) -> list[str]:
+        return ["voice-build"]
+
     async def list_sessions(self) -> list[dict[str, object]]:
         return []
 

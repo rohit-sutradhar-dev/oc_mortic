@@ -3,11 +3,15 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  buildHelperArgs,
   buildHelperEnv,
+  healthReason,
+  healthMatchesWorkspace,
   helperCwd,
   helperUrl,
   helperWsUrl,
   isReadyPayload,
+  probeExistingHelper,
   resolveHelperCommand,
   tokenizeCommand
 } from "../src/helper-launcher.mjs";
@@ -76,13 +80,69 @@ test("launch resolution honors override, dev install, repo checkout, then uvx", 
   assert.deepEqual(published, { command: "uvx", args: ["mortic-helper"], source: "uvx" });
 });
 
-test("the spawned helper is pinned to the focused thread's OpenCode server", () => {
+test("dev attach can explicitly pin the helper to an existing OpenCode server", () => {
   const env = buildHelperEnv({ env: { PATH: "/usr/bin" }, opencodeUrl: "http://127.0.0.1:4242" });
   assert.equal(env.OPENCODE_VOICE_OPENCODE_URL, "http://127.0.0.1:4242");
   assert.equal(env.PATH, "/usr/bin");
 
   const bare = buildHelperEnv({ env: { PATH: "/usr/bin" } });
   assert.equal("OPENCODE_VOICE_OPENCODE_URL" in bare, false);
+});
+
+test("managed helper startup uses an explicit managed OpenCode server", () => {
+  assert.deepEqual(
+    buildHelperArgs({ baseArgs: ["run"], port: "8765", managed: true, workspaceDir: "/repo/worktree" }),
+    ["run", "--host", "127.0.0.1", "--port", "8765", "--managed-opencode", "--opencode-dir", "/repo/worktree"]
+  );
+  assert.deepEqual(
+    buildHelperArgs({ baseArgs: ["run"], port: "8765", managed: false }),
+    ["run", "--host", "127.0.0.1", "--port", "8765", "--no-managed"]
+  );
+});
+
+test("managed helper reuse requires the same workspace", () => {
+  assert.equal(healthMatchesWorkspace({ workspace_dir: "/repo/worktree/" }, "/repo/worktree"), true);
+  assert.equal(healthMatchesWorkspace({ workspace_dir: "/other" }, "/repo/worktree"), false);
+  assert.equal(healthMatchesWorkspace({ ready: true }, "/repo/worktree"), false);
+  assert.equal(healthMatchesWorkspace({ ready: true }, undefined), true);
+});
+
+test("existing helper ownership is probed before a managed confirmation", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ ready: true, workspace_dir: "/other/workspace" })
+    });
+    const blocked = await probeExistingHelper({ managed: true, workspaceDir: "/repo/worktree" });
+    assert.equal(blocked.ready, false);
+    assert.equal(blocked.blocked, true);
+    assert.equal(blocked.workspaceMismatch, true);
+    assert.match(blocked.reason, /another workspace/);
+
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        ready: false,
+        workspace_dir: "/other/workspace",
+        issues: [{ safeDetail: "Mortic could not reach its OpenCode voice server." }]
+      })
+    });
+    const unhealthyBlocked = await probeExistingHelper({ managed: true, workspaceDir: "/repo/worktree" });
+    assert.equal(unhealthyBlocked.ready, false);
+    assert.equal(unhealthyBlocked.blocked, true);
+    assert.equal(unhealthyBlocked.workspaceMismatch, true);
+    assert.match(unhealthyBlocked.reason, /another workspace/);
+
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ ready: true, workspace_dir: "/repo/worktree/" })
+    });
+    const ready = await probeExistingHelper({ managed: true, workspaceDir: "/repo/worktree" });
+    assert.equal(ready.ready, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("repo-checkout launches run from the repo root so BYOK .env loads", () => {
@@ -92,11 +152,9 @@ test("repo-checkout launches run from the repo root so BYOK .env loads", () => {
   assert.equal(helperCwd("env", "/repo"), undefined);
 });
 
-test("the recorded server url bridges entries via process env", () => {
-  // The hook and TUI entries load as separate module graphs (verified live),
-  // so module-level state cannot carry serverUrl between them; process env
-  // can, and it also flows to the spawned helper automatically. An explicit
-  // user override always wins.
+test("the recorded server url remains available for diagnostics and explicit override wins", () => {
+  // The hook-provided serverUrl is diagnostic only in v1 because it may not be
+  // TCP-reachable. An explicit user override always wins for dev attach.
   assert.equal(
     opencodeServerUrl({ MORTIC_OPENCODE_SERVER_URL: "http://127.0.0.1:5000" }),
     "http://127.0.0.1:5000"
@@ -109,6 +167,23 @@ test("the recorded server url bridges entries via process env", () => {
     "http://user-override:1"
   );
   assert.equal(opencodeServerUrl({}), undefined);
+});
+
+test("healthReason surfaces the helper's specific cause so offline is never opaque", () => {
+  assert.equal(
+    healthReason({
+      ready: false,
+      issues: [
+        {
+          diagnosticCode: "opencode_unreachable",
+          safeDetail: "Mortic could not reach its OpenCode voice server."
+        }
+      ]
+    }),
+    "Mortic could not reach its OpenCode voice server."
+  );
+  assert.equal(healthReason({ ready: true, issues: [] }), undefined);
+  assert.equal(healthReason(undefined), undefined);
 });
 
 test("helper URLs derive from one base with env overrides", () => {

@@ -161,6 +161,11 @@ TURN_FAILURE_DETAILS: dict[str, tuple[str, str, bool]] = {
         "Language-model provider rejected the API key — check the model credentials",
         False,
     ),
+    "content_policy": (
+        "model_content_policy",
+        "Language-model provider blocked this voice turn for safety policy",
+        False,
+    ),
     "turn_timeout": ("turn_timeout", "Voice turn timed out", True),
     "failed": ("turn_failed", "Voice turn failed", True),
 }
@@ -178,8 +183,18 @@ def classify_turn_failure(error: Any) -> str:
     status = data.get("statusCode")
     status = status if isinstance(status, int) else None
     code = str(data.get("code") or "").lower()
+    message = str(data.get("message") or "").lower()
     if status == 402 or "quota" in code or "billing" in code:
         return "provider_quota"
+    if (
+        "content_policy" in code
+        or "content policy" in message
+        or "policy violation" in message
+        or "filtered" in message
+        or "safety" in code
+        or "safety" in message
+    ):
+        return "content_policy"
     if status in (401, 403) or "auth" in code or "api_key" in code or "access_denied" in code:
         return "provider_auth"
     return "failed"
@@ -585,6 +600,7 @@ def create_app(
     app = FastAPI(title="OpenCode Mercury Voice Bridge")
     load_voice_credentials(tts_provider=config.tts_provider)
     logger = RunLogger(config.run_root)
+    sidepod_lane_registry = ActiveSidepodLaneRegistry()
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -611,7 +627,6 @@ def create_app(
             "ready" if not readiness_issues else "voice_bridge_issue",
             diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
         )
-
     @app.get("/")
     async def index() -> HTMLResponse:
         return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
@@ -627,12 +642,48 @@ def create_app(
     @app.get("/api/health")
     async def health() -> JSONResponse:
         credentials = load_voice_credentials(tts_provider=config.tts_provider)
-        readiness_issues = helper_readiness_issues(
-            transport_ready=True, debug_ref=str(logger.run_dir), tts_provider=config.tts_provider
+        readiness_issues = list(
+            helper_readiness_issues(
+                transport_ready=True, debug_ref=str(logger.run_dir), tts_provider=config.tts_provider
+            )
         )
         client = client_factory(config.opencode_url, 10)
         try:
             opencode_health = await client.health()
+        except Exception as exc:  # noqa: BLE001 - health must describe dependency failures, not 500.
+            opencode_health = {"healthy": False, "reachable": False, "error": type(exc).__name__}
+            readiness_issues.append(
+                voice_bridge_issue_payload(
+                    capability="opencode_server",
+                    diagnostic_code="opencode_unreachable",
+                    safe_detail="Mortic could not reach its OpenCode voice server.",
+                    debug_ref=str(logger.run_dir),
+                )
+            )
+        else:
+            try:
+                agents = await client.agents()
+            except Exception as exc:  # noqa: BLE001 - agent inspection failures must surface before mic start.
+                readiness_issues.append(
+                    voice_bridge_issue_payload(
+                        capability="opencode_agent",
+                        diagnostic_code="opencode_agent_check_failed",
+                        safe_detail="Mortic could not inspect its OpenCode voice agent.",
+                        debug_ref=str(logger.run_dir),
+                    )
+                )
+                opencode_health = {**opencode_health, "agent_check_error": type(exc).__name__}
+            else:
+                if config.opencode_agent not in agents:
+                    readiness_issues.append(
+                        voice_bridge_issue_payload(
+                            capability="opencode_agent",
+                            diagnostic_code="opencode_agent_missing",
+                            safe_detail="Mortic voice agent is missing from the OpenCode voice server.",
+                            debug_ref=str(logger.run_dir),
+                        )
+                    )
+                opencode_health = {**opencode_health, "agent_present": config.opencode_agent in agents}
         finally:
             await client.close()
         return JSONResponse(
@@ -641,6 +692,7 @@ def create_app(
                 "ready": not readiness_issues,
                 "opencode": opencode_health,
                 "opencode_url": config.opencode_url,
+                "workspace_dir": config.workspace_dir,
                 "run_dir": str(logger.run_dir),
                 "model": config.model.opencode_name,
                 "context_threshold_tokens": config.context_threshold_tokens,
@@ -710,6 +762,7 @@ def create_app(
             logger=logger,
             websocket=websocket,
             client_factory=client_factory,
+            lane_registry=sidepod_lane_registry,
         )
         try:
             await connection.run()
@@ -879,7 +932,9 @@ class VoiceConnection:
             self.keep_fork = bool(payload.get("value"))
             await self.send_json({"type": "fork.keep", "keep_fork": self.keep_fork})
 
-    async def create_voice_fork(self, session_id: str, keep_fork: bool) -> dict[str, Any]:
+    async def create_voice_fork(
+        self, session_id: str, keep_fork: bool, original: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         self.keep_fork = keep_fork
         self.source_session_id = session_id
         fork_started = time.perf_counter()
@@ -887,7 +942,7 @@ class VoiceConnection:
         fork_id = str(fork.get("id") or "")
         if not fork_id:
             raise RuntimeError("OpenCode did not return a fork session id.")
-        original = await self.client.get_session(session_id)
+        original = original or await self.client.get_session(session_id)
         title = f"{EPHEMERAL_PREFIX} {session_title(original)}"
         try:
             await self.client.switch_model(fork_id, self.config.model)
@@ -2097,6 +2152,33 @@ class VoiceConnection:
                 )
 
 
+async def reap_stale_voice_forks(
+    client: OpenCodeClient, logger: RunLogger, exclude_ids: set[str] | None = None
+) -> int:
+    exclude_ids = exclude_ids or set()
+    try:
+        rows = await client.list_sessions()
+    except Exception as exc:  # noqa: BLE001 - stale cleanup must not block helper startup.
+        logger.write("fork.reap.error", error=repr(exc), stage="list")
+        return 0
+    deleted = 0
+    for row in rows:
+        title = str(row.get("title") or session_title(row))
+        session_id = str(row.get("id") or "")
+        if not session_id or session_id in exclude_ids or not title.startswith(EPHEMERAL_PREFIX):
+            continue
+        try:
+            await client.delete_session(session_id)
+        except Exception as exc:  # noqa: BLE001 - best-effort stale cleanup.
+            logger.write("fork.reap.error", session_id=session_id, error=repr(exc), stage="delete")
+            continue
+        deleted += 1
+        logger.write("fork.reap.delete", session_id=session_id, title=title)
+    if deleted:
+        logger.write("fork.reap.complete", deleted=deleted)
+    return deleted
+
+
 @dataclass
 class TurnSeam:
     """Per-turn bookkeeping for translating one legacy engine turn to v0."""
@@ -2109,6 +2191,44 @@ class TurnSeam:
     # Kept (not popped) after turn.complete so a first TTS chunk arriving
     # after the text finished can still report firstAudioMs.
     completed: bool = False
+    pending_complete: dict[str, Any] | None = None
+
+
+@dataclass
+class ActiveLaneRecord:
+    owner_id: str
+    source_session_id: str
+    voice_lane_id: str
+    acquired_at: float
+
+
+class ActiveSidepodLaneRegistry:
+    """Process-local guard for the single managed helper/workspace.
+
+    V1 deliberately rejects a second active lane instead of trying to merge or
+    take over audio state across TUI windows.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._active: ActiveLaneRecord | None = None
+
+    async def acquire(self, *, owner_id: str, source_session_id: str, voice_lane_id: str) -> ActiveLaneRecord | None:
+        async with self._lock:
+            if self._active is not None and self._active.owner_id != owner_id:
+                return self._active
+            self._active = ActiveLaneRecord(
+                owner_id=owner_id,
+                source_session_id=source_session_id,
+                voice_lane_id=voice_lane_id,
+                acquired_at=time.time(),
+            )
+            return None
+
+    async def release(self, owner_id: str) -> None:
+        async with self._lock:
+            if self._active is not None and self._active.owner_id == owner_id:
+                self._active = None
 
 
 class SidepodConnection(VoiceConnection):
@@ -2123,9 +2243,13 @@ class SidepodConnection(VoiceConnection):
         logger: RunLogger,
         websocket: WebSocket,
         client_factory: Callable[[str, float], OpenCodeClient] = OpenCodeClient,
+        lane_registry: ActiveSidepodLaneRegistry | None = None,
     ) -> None:
         super().__init__(config=config, client=client, logger=logger, websocket=websocket)
         self.client_factory = client_factory
+        self.connection_id = f"sidepod_{id(self)}"
+        self.lane_registry = lane_registry or ActiveSidepodLaneRegistry()
+        self.lane_registered = False
         self.lane_event_types = frozenset(sidepod_schema_document()["events"])
         self.mic_watchdog_task: asyncio.Task[None] | None = None
         self.lane_turn_counter = 0
@@ -2243,8 +2367,57 @@ class SidepodConnection(VoiceConnection):
             await self.stop()
         self.voice_lane_id = self.voice_lane_id or f"lane_{int(time.time() * 1000)}"
         try:
-            fork = await self.create_voice_fork(source_session_id, keep_fork=bool(payload.get("keepFork")))
+            source_session = await self.client.get_session(source_session_id)
         except Exception as exc:  # noqa: BLE001 - keep sidepod transport alive.
+            self.logger.write("sidepod.start.source_error", source_session_id=source_session_id, error=repr(exc))
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_start_failed",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+        source_title = str(source_session.get("title") or session_title(source_session))
+        if source_title.startswith(EPHEMERAL_PREFIX):
+            self.logger.write(
+                "sidepod.start.voice_tmp_source",
+                source_session_id=source_session_id,
+                source_title=source_title,
+            )
+            await self.send_protocol_issue(
+                diagnostic_code="voice_tmp_source_session",
+                safe_detail="Switch to the original chat before starting Mortic voice.",
+                retryable=True,
+            )
+            return
+        blocking_lane = await self.lane_registry.acquire(
+            owner_id=self.connection_id,
+            source_session_id=source_session_id,
+            voice_lane_id=self.voice_lane_id,
+        )
+        if blocking_lane is not None:
+            self.logger.write(
+                "sidepod.lane.busy",
+                source_session_id=source_session_id,
+                active_source_session_id=blocking_lane.source_session_id,
+                active_voice_lane_id=blocking_lane.voice_lane_id,
+            )
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_already_active",
+                safe_detail="Mortic voice is already active in this workspace.",
+                retryable=True,
+            )
+            return
+        self.lane_registered = True
+        if not self.config.keep_fork_default:
+            await reap_stale_voice_forks(self.client, self.logger, exclude_ids={source_session_id})
+        try:
+            fork = await self.create_voice_fork(
+                source_session_id,
+                keep_fork=bool(payload.get("keepFork")),
+                original=source_session,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep sidepod transport alive.
+            self.lane_registered = False
+            await self.lane_registry.release(self.connection_id)
             self.logger.write("sidepod.start.error", source_session_id=source_session_id, error=repr(exc))
             await self.send_protocol_issue(
                 diagnostic_code="voice_lane_start_failed",
@@ -2375,6 +2548,7 @@ class SidepodConnection(VoiceConnection):
         await self.stop_audio(reason="sidepod_stop")
         if self.turn_task and not self.turn_task.done():
             self.turn_task.cancel()
+        self.clear_pending_completions()
         await self.interrupt_playback("sidepod_stop")
         # interrupt_playback keeps the device stream for the next turn; the
         # session is over, so actually release it here.
@@ -2386,10 +2560,16 @@ class SidepodConnection(VoiceConnection):
         await super().stop()
         self.protocol_turn_id = ""
         self.pending_turn_id = None
+        self.lane_registered = False
+        await self.lane_registry.release(self.connection_id)
 
     async def close(self) -> None:
         self.cancel_mic_watchdog()
-        await super().close()
+        try:
+            await super().close()
+        finally:
+            self.lane_registered = False
+            await self.lane_registry.release(self.connection_id)
 
     async def send_tts_audio(self, data: bytes, turn_id: int | None) -> None:
         if not self.tts_first_audio_seen:
@@ -2428,6 +2608,7 @@ class SidepodConnection(VoiceConnection):
             self.echo_canceller.process_render(data)
 
     async def on_playback_drained(self) -> None:
+        await self.flush_pending_completions(reason="playback_drained")
         # Reply finished speaking: return the lane to a resting listening
         # state so the viewer's activity indicator stops reading "speaking".
         # Only while the mic is still live and no new turn has taken over.
@@ -2450,6 +2631,7 @@ class SidepodConnection(VoiceConnection):
         # with no active turn or speech is just the user starting to talk.
         if not await self.interrupt_playback(reason):
             return
+        self.clear_pending_completions()
         await self.abort_fork_turn()
         payload: dict[str, Any] = {"type": "interrupted", "sentAt": iso_utc_now(), "reason": reason}
         if self.voice_lane_id:
@@ -2503,6 +2685,8 @@ class SidepodConnection(VoiceConnection):
         return self.pending_turn_id
 
     async def send_json(self, payload: dict[str, Any]) -> None:
+        if str(payload.get("type") or "") == "turn.start":
+            await self.flush_pending_completions(reason="new_turn")
         outbound = self.translate_to_v0(payload)
         if outbound is None:
             self.logger.write("sidepod.lane.internal", message_type=payload.get("type"))
@@ -2611,6 +2795,10 @@ class SidepodConnection(VoiceConnection):
         if seam:
             first_audio_ms = elapsed_ms(seam.started_at)
             seam.latency["firstAudioMs"] = first_audio_ms
+            if seam.pending_complete is not None:
+                seam.pending_complete["latency"] = {
+                    key: value for key, value in seam.latency.items() if isinstance(value, (int, float))
+                }
             out["firstAudioLatencyMs"] = first_audio_ms
             if seam.completed:
                 # The turn's latency record already went out at text-complete;
@@ -2622,7 +2810,7 @@ class SidepodConnection(VoiceConnection):
                 )
         return out
 
-    def translate_turn_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def translate_turn_complete(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         legacy_id = int(payload.get("turn_id") or 0)
         seam = self.turn_seams.get(legacy_id)
         if seam:
@@ -2651,7 +2839,34 @@ class SidepodConnection(VoiceConnection):
         text = str(payload.get("text") or "")
         if text:
             out["fullSpokenText"] = text
+        if seam and self.turn_spoken_any and not self.native_speaker_unavailable:
+            seam.pending_complete = out
+            self.logger.write("sidepod.turn.complete.pending_playback", turn_id=lane_id)
+            self.spawn_background(self.flush_pending_completion_after_timeout(legacy_id))
+            return None
         return out
+
+    async def flush_pending_completion_after_timeout(self, legacy_id: int, delay_sec: float = 10.0) -> None:
+        await asyncio.sleep(delay_sec)
+        seam = self.turn_seams.get(legacy_id)
+        if not seam or seam.pending_complete is None:
+            return
+        await self.flush_pending_completions(reason="playback_timeout", legacy_id=legacy_id)
+
+    async def flush_pending_completions(self, *, reason: str, legacy_id: int | None = None) -> None:
+        for item_id, seam in list(self.turn_seams.items()):
+            if legacy_id is not None and item_id != legacy_id:
+                continue
+            if seam.pending_complete is None:
+                continue
+            complete = seam.pending_complete
+            seam.pending_complete = None
+            self.logger.write("sidepod.turn.complete.flush", turn_id=seam.lane_id, reason=reason)
+            await self.send_json(complete)
+
+    def clear_pending_completions(self) -> None:
+        for seam in self.turn_seams.values():
+            seam.pending_complete = None
 
     def translate_turn_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
         timed_out = payload.get("type") == "turn.timeout"

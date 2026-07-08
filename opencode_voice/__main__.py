@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -20,6 +21,11 @@ from opencode_voice.config import (
     parse_model_ref,
     render_opencode_config_content,
 )
+from opencode_voice.managed_opencode import (
+    ManagedOpenCodeLease,
+    reap_stale_managed_opencode_leases,
+    terminate_managed_process,
+)
 from opencode_voice.server import create_app
 
 
@@ -31,7 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.doctor:
         return run_doctor_cli(args, model)
     opencode_process: subprocess.Popen[str] | None = None
+    managed_lease: ManagedOpenCodeLease | None = None
     opencode_url = None
+    opencode_dir = args.opencode_dir
     detected_url = detect_opencode_url()
     if not args.managed_opencode:
         opencode_url = args.opencode_url or os.environ.get("OPENCODE_VOICE_OPENCODE_URL") or detected_url
@@ -45,7 +53,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     if not opencode_url:
-        opencode_dir = args.opencode_dir or (detect_opencode_directory(detected_url) if detected_url else None)
+        opencode_dir = opencode_dir or (detect_opencode_directory(detected_url) if detected_url else None)
+        reap_stale_managed_opencode_leases()
         opencode_url, opencode_process = start_managed_opencode(
             model_name=args.model,
             model_variant=args.model_variant,
@@ -69,10 +78,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cartesia_voice_id is not None:
         model_overrides["cartesia_voice_id"] = args.cartesia_voice_id
 
+    workspace_dir = str(Path(opencode_dir).expanduser()) if opencode_dir else None
     config = VoiceConfig(
         opencode_url=opencode_url,
         bridge_host=args.host,
         bridge_port=args.port,
+        workspace_dir=workspace_dir,
         model=model,
         context_threshold_tokens=args.context_threshold,
         # The plugin spawns the helper with a fixed flag set (README's launch
@@ -101,17 +112,18 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 0
+    if opencode_process:
+        managed_lease = ManagedOpenCodeLease(process=opencode_process, url=opencode_url, workspace=workspace_dir).start()
+        install_signal_exit_handlers()
     preflight_startup(config, model, args.agent)
     app = create_app(config)
     try:
         uvicorn.run(app, host=config.bridge_host, port=config.bridge_port, log_level=args.log_level)
     finally:
         if opencode_process:
-            opencode_process.terminate()
-            try:
-                opencode_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                opencode_process.kill()
+            terminate_managed_process(opencode_process)
+        if managed_lease:
+            managed_lease.close(remove=True)
     return 0
 
 
@@ -229,6 +241,17 @@ def run_doctor_cli(args: argparse.Namespace, model: "ModelRef") -> int:
     return 0 if all(r.ok for r in results) else 1
 
 
+def install_signal_exit_handlers() -> None:
+    def _exit(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, _exit)
+        except Exception:
+            pass
+
+
 def preflight_startup(config: "VoiceConfig", model: "ModelRef", agent: str) -> None:
     """Warn-only boot check: the cheap half of the doctor (reachable + voice
     agent, no round-trip) so a misconfigured server screams at startup instead
@@ -321,6 +344,7 @@ def start_managed_opencode(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        start_new_session=True,
     )
     url = f"http://127.0.0.1:{port}"
     deadline = time.time() + 20
@@ -330,7 +354,7 @@ def start_managed_opencode(
         if is_healthy(url):
             return url, process
         time.sleep(0.25)
-    process.terminate()
+    terminate_managed_process(process)
     raise RuntimeError("Managed OpenCode server did not become healthy within 20 seconds.")
 
 

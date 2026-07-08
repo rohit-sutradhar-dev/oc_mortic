@@ -22,6 +22,7 @@ from opencode_voice.config import VoiceConfig
 from opencode_voice.logging import RunLogger
 from opencode_voice.protocol import check_event
 from opencode_voice.server import (
+    ActiveSidepodLaneRegistry,
     SIDEPOD_PROTOCOL_VERSION,
     SidepodConnection,
     classify_turn_failure,
@@ -283,8 +284,12 @@ class TurnFailureClassificationTests(unittest.IsolatedAsyncioTestCase):
     def test_classifier_buckets_provider_errors_and_falls_back_safely(self) -> None:
         quota = {"name": "APIError", "data": {"message": "Free tier limit reached.", "statusCode": 402}}
         auth = {"name": "APIError", "data": {"statusCode": 403, "code": "model_access_denied"}}
+        policy = {"name": "UnknownError", "data": {"message": '"The request was filtered due to content policy violation."'}}
+        policy_403 = {"name": "APIError", "data": {"message": "Blocked by content policy.", "statusCode": 403}}
         self.assertEqual(classify_turn_failure(quota), "provider_quota")
         self.assertEqual(classify_turn_failure(auth), "provider_auth")
+        self.assertEqual(classify_turn_failure(policy), "content_policy")
+        self.assertEqual(classify_turn_failure(policy_403), "content_policy")
         self.assertEqual(classify_turn_failure({"data": {"statusCode": 500}}), "failed")
         self.assertEqual(classify_turn_failure("raw error string"), "failed")
         self.assertEqual(classify_turn_failure(None), "failed")
@@ -304,7 +309,8 @@ class TurnFailureClassificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(issue["retryable"])
         self.assertIn("quota", issue["safeDetail"].lower())
         # No provider name and no raw exception text anywhere on the wire.
-        blob = json.dumps(issue).lower()
+        stable_issue = {key: value for key, value in issue.items() if key not in {"sentAt", "debugRef"}}
+        blob = json.dumps(stable_issue).lower()
         for leak in ("inception", "mercury", "free tier limit", "402", "api.inceptionlabs"):
             self.assertNotIn(leak, blob)
 
@@ -316,8 +322,34 @@ class TurnFailureClassificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(failed["retryable"])
         self.assertEqual(timed["diagnosticCode"], "turn_timeout")
 
+    def test_content_policy_failure_maps_to_specific_safe_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True):
+            issue = self._issue_for(tmp, {"type": "turn.error", "turn_id": 1, "failure": "content_policy"})
+
+        self.assertEqual(issue["diagnosticCode"], "model_content_policy")
+        self.assertFalse(issue["retryable"])
+        self.assertIn("safety policy", issue["safeDetail"])
+
 
 class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_turn_flushes_pending_completion_before_pruning_old_seam(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            connection, websocket, _client = lane_connection(tmp)
+            connection.voice_lane_id = "lane_1"
+
+            await connection.send_json({"type": "turn.start", "turn_id": 1, "source": "live", "text": "First"})
+            connection.turn_spoken_any = True
+            await connection.send_json({"type": "turn.complete", "turn_id": 1, "latency_ms": 10, "text": "Done"})
+            self.assertFalse(any(message["type"] == "complete" for message in websocket.sent))
+
+            await connection.send_json({"type": "turn.start", "turn_id": 2, "source": "live", "text": "Second"})
+
+            tail_types = [message["type"] for message in websocket.sent[-2:]]
+            self.assertEqual(tail_types, ["complete", "thinking"])
+            self.assertEqual(websocket.sent[-2]["turnId"], "turn_0001")
+            self.assertEqual(websocket.sent[-2]["fullSpokenText"], "Done")
+            assert_all_lane_messages_valid(self, websocket.sent)
+
     async def test_full_voice_turn_emits_the_v0_sequence_with_real_latency(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramSpeakSession", FakeSpeakSession
@@ -335,6 +367,11 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNotNone(connection.turn_task)
             await asyncio.wait_for(connection.turn_task, timeout=10)
+            self.assertFalse(
+                any(message["type"] == "complete" for message in websocket.sent),
+                "visible completion must wait until native playback drains",
+            )
+            await connection.on_playback_drained()
 
             types = [message["type"] for message in websocket.sent]
             self.assertEqual(
@@ -386,6 +423,7 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
                 await connection.handle_flux_event({"type": "speech.start"})
                 await connection.handle_flux_event({"type": "speech.end", "transcript": phrase})
                 await asyncio.wait_for(connection.turn_task, timeout=10)
+                await connection.on_playback_drained()
 
             transcripts = [message for message in websocket.sent if message["type"] == "transcript"]
             self.assertEqual(len(transcripts), 2)
@@ -443,6 +481,7 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
             await connection.handle_control(START_PAYLOAD)
             await connection.handle_flux_event({"type": "speech.end", "transcript": "Tighten the summary."})
             await asyncio.wait_for(connection.turn_task, timeout=10)
+            await connection.on_playback_drained()
 
             complete = next(m for m in websocket.sent if m["type"] == "complete")
             self.assertEqual(complete["streamSource"], "event")
@@ -481,6 +520,68 @@ class TTSProviderSelectionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_same_workspace_lane_is_rejected_until_first_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ActiveSidepodLaneRegistry()
+            first, first_ws, first_client = lane_connection(tmp, lane_registry=registry)
+            second, second_ws, second_client = lane_connection(tmp, lane_registry=registry)
+
+            await first.handle_control(START_PAYLOAD)
+            await second.handle_control({**START_PAYLOAD, "clientEventId": "evt_start_2"})
+
+            self.assertEqual(first_ws.sent[-1]["type"], "ready")
+            self.assertEqual(second_ws.sent[-1]["type"], "voice_bridge_issue")
+            self.assertEqual(second_ws.sent[-1]["diagnosticCode"], "voice_lane_already_active")
+            self.assertEqual(first_client.fork_count, 1)
+            self.assertEqual(second_client.fork_count, 0)
+
+            await first.handle_control(
+                {
+                    "type": "stop",
+                    "clientEventId": "evt_stop_first",
+                    "sentAt": "2026-07-04T00:00:30.000Z",
+                    "reason": "user.end_session",
+                }
+            )
+            await second.handle_control({**START_PAYLOAD, "clientEventId": "evt_start_3"})
+
+            self.assertEqual(second_ws.sent[-1]["type"], "ready")
+            self.assertEqual(second_client.fork_count, 1)
+            assert_all_lane_messages_valid(self, first_ws.sent)
+            assert_all_lane_messages_valid(self, second_ws.sent)
+
+    async def test_voice_tmp_source_session_is_rejected_without_forking(self) -> None:
+        class VoiceTmpSourceClient(LaneFakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.listed = False
+
+            async def get_session(self, session_id: str) -> dict[str, Any]:
+                if session_id == "fork_tmp":
+                    return {
+                        "id": "fork_tmp",
+                        "title": "[voice tmp] Old voice lane",
+                        "tokens": {},
+                        "directory": "/project/source-thread",
+                    }
+                return await super().get_session(session_id)
+
+            async def list_sessions(self) -> list[dict[str, object]]:
+                self.listed = True
+                return [{"id": "fork_other", "title": "[voice tmp] Other"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            connection, websocket, client = lane_connection(tmp, client=VoiceTmpSourceClient())
+            await connection.handle_control({**START_PAYLOAD, "sourceSessionId": "fork_tmp"})
+
+            self.assertEqual(websocket.sent[-1]["type"], "voice_bridge_issue")
+            self.assertEqual(websocket.sent[-1]["diagnosticCode"], "voice_tmp_source_session")
+            self.assertIn("original chat", websocket.sent[-1]["safeDetail"])
+            self.assertEqual(client.fork_count, 0)
+            self.assertFalse(client.listed)
+            self.assertEqual(client.deleted, [])
+            assert_all_lane_messages_valid(self, websocket.sent)
+
     async def test_stop_command_tears_down_and_acknowledges(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             connection, websocket, client = lane_connection(tmp)

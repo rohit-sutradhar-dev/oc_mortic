@@ -197,23 +197,41 @@ test("normal UI source does not expose provider or runtime names", async () => {
   }
 });
 
-test("focus starts the voice lane bound to the focused thread", () => {
+test("focus starts a confirmed managed voice lane for the focused thread", () => {
   // Focus is non-blocking: the helper is discovered/launched asynchronously
   // while the caption shows CONNECTING/OFFLINE instead of a silent wait.
   assert.match(src, /recordSmoke\("focus"\);\s*\}\);\s*startVoiceLane\(\)/);
+  assert.match(src, /DialogConfirm/);
+  assert.match(src, /Start Mortic Voice\?/);
+  assert.match(src, /probeExistingHelper/);
+  assert.match(src, /managedStartPromptOpen[\s\S]*?name === "enter" \|\| name === "return"[\s\S]*?acceptManagedStart\(\)/);
+  assert.match(src, /managedConsentKey/);
   assert.match(src, /ensureHelper\(\{/);
+  assert.match(src, /managed,\s*workspaceDir/);
+  assert.match(src, /const failVoiceStartup = \(reason, \{ restoreFocus = false \} = \{\}\)/);
+  assert.match(src, /if \(restoreFocus\) \{[\s\S]*?restorePromptFocus\(\)/);
+  assert.match(src, /laneStatus === "offline"[\s\S]*?offlineToastShown = false/);
+  assert.match(src, /failVoiceStartup\(result\.reason, \{ restoreFocus: true \}\)/);
+  assert.match(src, /START_BLOCKING_ISSUES/);
+  assert.match(src, /voice_lane_already_active/);
+  assert.match(src, /voice_tmp_source_session/);
+  assert.match(src, /restorePromptFocus\(\);[\s\S]*?recordSmoke\("lane\.start\.blocked"/);
   assert.match(src, /CONNECTING VOICE/);
   assert.match(src, /VOICE OFFLINE · M TO RETRY/);
-  // start carries the focused thread's session id and pins the engine to the
-  // OpenCode server that owns it.
+  // start carries the focused thread's session id. The normal path uses the
+  // helper's managed voice server; only an explicit env override supplies
+  // start.opencodeUrl for dev attach.
   assert.match(src, /protocolBase\("start"\)/);
   assert.match(src, /sourceSessionId:\s*String\(sessionId\)/);
   assert.match(src, /keepFork:\s*false/);
+  assert.match(src, /devOpencodeUrl/);
   assert.match(src, /start\.opencodeUrl\s*=/);
+  assert.equal(src.includes("opencodeServerUrl"), false);
   assert.match(src, /protocolVersion:\s*PROTOCOL_VERSION/);
   // The helper is only ever launched from the focus path, never at load time.
   assert.equal(src.match(/ensureHelper\(/g).length, 1);
-  assert.match(src, /const startVoiceLane = \(\) => \{[\s\S]*?ensureHelper\(\{/);
+  assert.match(src, /const continueVoiceLaneStart = \(\{ opencodeUrl, managed, workspaceDir \}\) => \{[\s\S]*?ensureHelper\(\{/);
+  assert.match(src, /const startVoiceLane = \(\{ confirmed = false \} = \{\}\) => \{/);
 });
 
 test("the lane client validates both directions against the shared schema", () => {
@@ -228,11 +246,14 @@ test("the lane client validates both directions against the shared schema", () =
 });
 
 test("end session sends stop and muting mid-reply barges in", () => {
-  assert.match(src, /stopVoiceLane\("user\.end_session"\)/);
+  assert.match(src, /stopVoiceLane\("user\.end_session", \{ releaseHelper: true \}\)/);
   assert.match(src, /protocolBase\("stop"\)/);
   assert.match(src, /STOP_ACK_TIMEOUT_MS/);
   assert.match(src, /event\.type === "stopped" && stopAckTimer/);
-  assert.match(src, /stopVoiceLane\("client\.shutdown"\)/);
+  assert.match(src, /helper\.stop\.after_ack/);
+  assert.match(src, /helper\.stop\.after_timeout/);
+  assert.match(src, /helper\.stop\.immediate/);
+  assert.match(src, /stopVoiceLane\("client\.shutdown", \{ releaseHelper: true, immediateHelperStop: true \}\)/);
   assert.match(src, /protocolBase\("barge_in"\)/);
   assert.match(src, /reason:\s*"user\.mute"/);
 });

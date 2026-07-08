@@ -64,13 +64,26 @@ export function resolveHelperCommand({
   return { command: "uvx", args: ["mortic-helper"], source: "uvx" };
 }
 
-/** Env for the spawned helper: pin it to the OpenCode server that owns the thread. */
+/** Env for the spawned helper: explicit dev attach to an existing OpenCode server. */
 export function buildHelperEnv({ env = globalThis.process?.env ?? {}, opencodeUrl } = {}) {
   const child = { ...env };
   if (opencodeUrl) {
     child.OPENCODE_VOICE_OPENCODE_URL = String(opencodeUrl);
   }
   return child;
+}
+
+export function buildHelperArgs({ baseArgs = [], port, managed = false, workspaceDir } = {}) {
+  const args = [...baseArgs, "--host", "127.0.0.1", "--port", String(port)];
+  if (managed) {
+    args.push("--managed-opencode");
+    if (workspaceDir) {
+      args.push("--opencode-dir", String(workspaceDir));
+    }
+  } else {
+    args.push("--no-managed");
+  }
+  return args;
 }
 
 /**
@@ -83,33 +96,91 @@ export function helperCwd(source, repoRoot = REPO_ROOT) {
   return source === "venv" || source === "uv-project" ? repoRoot : undefined;
 }
 
-async function healthy(url, fetchImpl = globalThis.fetch) {
+/** The most user-actionable line from a health payload, if it carries one. */
+export function healthReason(payload) {
+  const issues = Array.isArray(payload?.issues) ? payload.issues : [];
+  const named = issues.find((issue) => issue && issue.safeDetail) ?? issues[0];
+  return named?.safeDetail;
+}
+
+function normalizePath(value) {
+  return value ? String(value).replace(/\/+$/, "") : undefined;
+}
+
+export function healthMatchesWorkspace(payload, workspaceDir) {
+  if (!workspaceDir) {
+    return true;
+  }
+  return normalizePath(payload?.workspace_dir) === normalizePath(workspaceDir);
+}
+
+async function probe(url, fetchImpl = globalThis.fetch) {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
     const response = await fetchImpl(`${url}/api/health`, { signal: controller.signal });
     clearTimeout(timer);
     if (!response.ok) {
-      return false;
+      return { ready: false };
     }
-    return isReadyPayload(await response.json());
+    const payload = await response.json();
+    return { ready: isReadyPayload(payload), reason: healthReason(payload), payload };
   } catch {
-    return false;
+    return { ready: false };
   }
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Ensure a ready helper: reuse a healthy one, otherwise spawn and poll until
- * ready or timeout. Never throws — returns { ready, reused, source }.
- */
-export async function ensureHelper({ opencodeUrl, log = () => {} } = {}) {
+function workspaceMismatch(status, managed, workspaceDir) {
+  return Boolean(status.payload && managed && !healthMatchesWorkspace(status.payload, workspaceDir));
+}
+
+function workspaceBlockedResult(payload, { url, managed, reason, reused = false } = {}) {
+  return {
+    ready: false,
+    exists: true,
+    blocked: true,
+    reused,
+    workspaceMismatch: true,
+    source: "existing",
+    reason,
+    payload,
+  };
+}
+
+export async function probeExistingHelper({ managed = false, workspaceDir, log = () => {} } = {}) {
   const url = helperUrl();
-  if (await healthy(url)) {
-    log("helper.reuse", { url });
+  const status = await probe(url);
+  if (workspaceMismatch(status, managed, workspaceDir)) {
+    const reason = "Mortic Voice is already running for another workspace.";
+    log("helper.ownership.blocked", { url, managed, reason });
+    return workspaceBlockedResult(status.payload, { url, managed, reason });
+  }
+  if (!status.ready) {
+    return { ready: false, exists: Boolean(status.reason || status.payload), reason: status.reason, payload: status.payload };
+  }
+  log("helper.ownership.ready", { url, managed });
+  return { ready: true, exists: true, source: "existing", payload: status.payload };
+}
+
+/**
+ * Ensure a ready helper: reuse a healthy matching one, otherwise spawn and
+ * poll until ready or timeout. Never throws — returns { ready, reused, source }.
+ */
+export async function ensureHelper({ opencodeUrl, managed = false, workspaceDir, log = () => {} } = {}) {
+  const url = helperUrl();
+  const first = await probe(url);
+  if (workspaceMismatch(first, managed, workspaceDir)) {
+    const reason = "Mortic Voice is already running for another workspace.";
+    log("helper.reuse.rejected", { url, managed, reason });
+    return workspaceBlockedResult(first.payload, { url, managed, reason, reused: false });
+  }
+  if (first.ready) {
+    log("helper.reuse", { url, managed });
     return { ready: true, reused: true, source: "existing" };
   }
+  let reason = first.reason;
 
   const resolved = resolveHelperCommand({});
   const port = new URL(url).port || "8765";
@@ -119,11 +190,7 @@ export async function ensureHelper({ opencodeUrl, log = () => {} } = {}) {
       const sink = openSync(logPath, "a");
       spawnedProcess = spawn(
         resolved.command,
-        // --no-managed: a plugin-spawned helper must never start a shadow
-        // OpenCode server; with no reachable server it exits and the lane
-        // reports VOICE OFFLINE instead (found live: a detection miss
-        // silently spawned and leaked a managed `opencode serve`).
-        [...resolved.args, "--host", "127.0.0.1", "--port", port, "--no-managed"],
+        buildHelperArgs({ baseArgs: resolved.args, port, managed, workspaceDir }),
         {
           cwd: helperCwd(resolved.source),
           env: buildHelperEnv({ opencodeUrl }),
@@ -134,23 +201,32 @@ export async function ensureHelper({ opencodeUrl, log = () => {} } = {}) {
       spawnedProcess.on("error", () => {
         spawnedProcess = undefined;
       });
-      log("helper.spawn", { source: resolved.source, port });
+      log("helper.spawn", { source: resolved.source, port, managed, workspaceDir: Boolean(workspaceDir) });
     }
   } catch {
     log("helper.spawn.failed", { source: resolved.source });
-    return { ready: false, reused: false, source: resolved.source };
+    return { ready: false, reused: false, source: resolved.source, reason };
   }
 
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (await healthy(url)) {
+    const status = await probe(url);
+    if (status.ready) {
+      if (managed && !healthMatchesWorkspace(status.payload, workspaceDir)) {
+        reason = "Mortic Voice is already running for another workspace.";
+        await sleep(POLL_INTERVAL_MS);
+        continue;
+      }
       log("helper.ready", { source: resolved.source });
       return { ready: true, reused: false, source: resolved.source };
     }
+    if (status.reason) {
+      reason = status.reason;
+    }
     await sleep(POLL_INTERVAL_MS);
   }
-  log("helper.timeout", { source: resolved.source });
-  return { ready: false, reused: false, source: resolved.source };
+  log("helper.timeout", { source: resolved.source, reason });
+  return { ready: false, reused: false, source: resolved.source, reason };
 }
 
 export function stopHelper() {

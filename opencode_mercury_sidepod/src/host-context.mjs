@@ -1,9 +1,7 @@
-// Bridges the plugin's hook entry (src/index.js, which receives PluginInput
-// including serverUrl) to the TUI entry (src/tui.js, which does not). The two
-// entries can be loaded as separate module graphs (verified live: module
-// state did NOT cross), so the value is carried on process env — process
-// state is global to the plugin host and inherited by the spawned helper.
-// A user-set OPENCODE_VOICE_OPENCODE_URL always wins as an explicit override.
+// Shared diagnostics for the plugin hook and TUI entry. The hook's serverUrl
+// is useful evidence, but a bare OpenCode TUI can advertise a URL that is not
+// TCP-reachable, so v1 does not route through it. A user-set
+// OPENCODE_VOICE_OPENCODE_URL remains an explicit dev/debug override.
 import { appendFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

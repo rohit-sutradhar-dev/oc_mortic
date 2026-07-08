@@ -1,11 +1,11 @@
 import { createElement, insert, setProp } from "@opentui/solid";
 import { createMemo, createSignal } from "solid-js";
 
-import { ensureHelper, helperWsUrl, stopHelper } from "./helper-launcher.mjs";
+import { ensureHelper, helperWsUrl, probeExistingHelper, stopHelper } from "./helper-launcher.mjs";
 import { createLaneState, reduceLaneEvent } from "./lane-reducer.mjs";
 import { checkMessage } from "./protocol-validate.mjs";
 import { PROTOCOL_VERSION } from "./protocol.gen.mjs";
-import { appendSmoke, opencodeServerUrl } from "./host-context.mjs";
+import { appendSmoke } from "./host-context.mjs";
 
 const WIDTH = 36;
 const INNER = WIDTH - 2;
@@ -14,6 +14,7 @@ const MODAL_INNER = 60;
 const MODAL_PAGE = 14;
 const SMOKE_SINK = globalThis.process?.env?.MORTIC_SMOKE_LOG;
 const STOP_ACK_TIMEOUT_MS = 2000;
+const START_BLOCKING_ISSUES = new Set(["voice_lane_already_active", "voice_tmp_source_session"]);
 
 function element(type, props = {}, children = []) {
   const node = createElement(type);
@@ -521,6 +522,8 @@ export async function tui(api) {
     let exitMorticMode;
     let previousFocus;
     let clientEventSeq = 0;
+    let managedStartPromptOpen = false;
+    let managedStartConfirmAction;
 
     const restorePromptFocus = () => {
       if (exitMorticMode) {
@@ -531,6 +534,9 @@ export async function tui(api) {
       previousFocus = undefined;
       setFocused(false);
     };
+    const voiceWorkspaceDir = () => api.state.path.worktree || api.state.path.directory;
+    const devOpencodeUrl = () => globalThis.process?.env?.OPENCODE_VOICE_OPENCODE_URL;
+    const managedConsentKey = () => `mortic.managedVoice.confirmed:${voiceWorkspaceDir() ?? "unknown"}`;
 
     const focusMortic = () => {
       // sidebar_content only mounts on the session route (it requires a
@@ -563,6 +569,48 @@ export async function tui(api) {
       logSmoke(api, event, details);
     };
 
+    const cancelManagedStart = () =>
+      mutate(() => {
+        if (!managedStartPromptOpen) {
+          return;
+        }
+        managedStartPromptOpen = false;
+        managedStartConfirmAction = undefined;
+        recordSmoke("managed.confirm.cancelled");
+        api.ui.dialog.clear();
+        setLaneStatus("idle");
+        restorePromptFocus();
+      });
+
+    const acceptManagedStart = () => {
+      if (!managedStartPromptOpen) {
+        return;
+      }
+      const onConfirm = managedStartConfirmAction;
+      managedStartPromptOpen = false;
+      managedStartConfirmAction = undefined;
+      api.ui.dialog.clear();
+      api.kv.set(managedConsentKey(), true);
+      recordSmoke("managed.confirm.accepted");
+      onConfirm?.();
+    };
+
+    const confirmManagedStart = (onConfirm) => {
+      managedStartPromptOpen = true;
+      managedStartConfirmAction = onConfirm;
+      recordSmoke("managed.confirm.open");
+      api.ui.dialog.replace(
+        () =>
+          api.ui.DialogConfirm({
+            title: "Start Mortic Voice?",
+            message: "Mortic needs an isolated voice server for this workspace. Start it now?",
+            onConfirm: acceptManagedStart,
+            onCancel: cancelManagedStart
+          }),
+        cancelManagedStart
+      );
+    };
+
     // Modals render as centered host dialogs over the whole TUI (never inside
     // the sidepod). Owner spec 2026-07-03: Esc is never destructive; ending a
     // session is an explicit confirm action inside the End Session dialog.
@@ -590,7 +638,7 @@ export async function tui(api) {
       if (kind === "exit") {
         return [
           "This voice lane is ephemeral.",
-          "Ending clears the transcript and returns focus to the prompt.",
+          "Ending clears the transcript, stops the helper, and returns focus to the prompt.",
           "Open Handoff first if you want a copy."
         ].flatMap((item) => wrap(item, MODAL_INNER));
       }
@@ -674,9 +722,10 @@ export async function tui(api) {
         setModal(null);
         api.ui.dialog.clear();
         // Tell the engine to tear the lane down (stop -> stopped ack closes
-        // the socket; a 2s timeout closes it regardless). UI flush is local
-        // and immediate either way.
-        stopVoiceLane("user.end_session");
+        // the socket; a 2s timeout closes it regardless). The helper is
+        // stopped only after that ack/timeout so fork cleanup has a chance to
+        // run before the managed server exits.
+        stopVoiceLane("user.end_session", { releaseHelper: true });
         setMicLive(false);
         setUserText("Mortic session ended.");
         setAssistantText("Start Mortic again for a fresh voice lane.");
@@ -733,6 +782,7 @@ export async function tui(api) {
     // --- voice lane ---------------------------------------------------------
     let laneState = createLaneState();
     let stopAckTimer;
+    let releaseHelperAfterStop = false;
     let offlineToastShown = false;
 
     const applyLaneUi = (ui) => {
@@ -773,8 +823,23 @@ export async function tui(api) {
           clearTimeout(stopAckTimer);
           stopAckTimer = undefined;
           laneClient.close();
+          if (releaseHelperAfterStop) {
+            releaseHelperAfterStop = false;
+            stopHelper();
+            recordSmoke("helper.stop.after_ack");
+          }
         }
         applyLaneUi(result.ui);
+        if (event.type === "voice_bridge_issue" && START_BLOCKING_ISSUES.has(String(event.diagnosticCode || ""))) {
+          laneClient.close();
+          laneState = createLaneState();
+          mutate(() => {
+            setMicLive(false);
+            setLaneStatus("offline");
+            restorePromptFocus();
+            recordSmoke("lane.start.blocked", { diagnosticCode: event.diagnosticCode });
+          });
+        }
       },
       onOpen: () => sendStart(),
       onDown: () => {
@@ -784,9 +849,10 @@ export async function tui(api) {
       }
     });
 
-    // The sidepod converses over the thread it was focused from: start carries
-    // that thread's session id, and opencodeUrl pins the engine to the server
-    // that owns it (recorded by the hook entry, env fallback for dev).
+    // The sidepod is invoked from the visible TUI, but v1 no longer depends on
+    // that TUI exposing a reachable TCP server. start carries the focused
+    // session id; the helper normally routes it through its Mortic-owned
+    // managed voice server. An explicit env override still supports dev attach.
     const sourceSessionId = () => {
       const params = api.route.current?.params ?? {};
       return params.sessionID ?? params.sessionId ?? params.session_id ?? params.id;
@@ -802,7 +868,7 @@ export async function tui(api) {
         sourceSessionId: String(sessionId),
         keepFork: false
       };
-      const opencodeUrl = opencodeServerUrl();
+      const opencodeUrl = devOpencodeUrl();
       if (opencodeUrl) {
         start.opencodeUrl = String(opencodeUrl);
       }
@@ -812,19 +878,24 @@ export async function tui(api) {
     // Non-blocking: focus proceeds immediately while the helper is discovered
     // or launched; the caption shows CONNECTING/OFFLINE instead of a silent
     // wait, and M retries from the offline state.
-    const startVoiceLane = () => {
-      if (getLaneStatus() === "connecting") {
-        return;
-      }
+    const failVoiceStartup = (reason, { restoreFocus = false } = {}) =>
+      mutate(() => {
+        setLaneStatus("offline");
+        if (!offlineToastShown) {
+          offlineToastShown = true;
+          api.ui.toast({ variant: "error", message: reason || "Voice engine offline. Tap M to retry." });
+        }
+        if (restoreFocus) {
+          restorePromptFocus();
+        }
+      });
+
+    const continueVoiceLaneStart = ({ opencodeUrl, managed, workspaceDir }) => {
       mutate(() => setLaneStatus("connecting"));
-      ensureHelper({ opencodeUrl: opencodeServerUrl(), log: recordSmoke })
+      ensureHelper({ opencodeUrl, managed, workspaceDir, log: recordSmoke })
         .then((result) => {
           if (!result.ready) {
-            mutate(() => setLaneStatus("offline"));
-            if (!offlineToastShown) {
-              offlineToastShown = true;
-              api.ui.toast({ variant: "error", message: "Voice engine offline. Tap M to retry." });
-            }
+            failVoiceStartup(result.reason);
             return;
           }
           offlineToastShown = false;
@@ -833,19 +904,86 @@ export async function tui(api) {
             sendStart();
           }
         })
-        .catch(() => mutate(() => setLaneStatus("offline")));
+        .catch(() => failVoiceStartup());
     };
 
-    const stopVoiceLane = (reason) => {
+    const startVoiceLane = ({ confirmed = false } = {}) => {
+      const laneStatus = getLaneStatus();
+      if (laneStatus === "connecting") {
+        return;
+      }
+      if (laneStatus === "offline") {
+        offlineToastShown = false;
+      }
+      const opencodeUrl = devOpencodeUrl();
+      const managed = !opencodeUrl;
+      const workspaceDir = managed ? voiceWorkspaceDir() : undefined;
+      if (managed && !workspaceDir) {
+        mutate(() => {
+          setLaneStatus("offline");
+          api.ui.toast({ variant: "error", message: "Mortic could not identify this workspace." });
+          restorePromptFocus();
+        });
+        return;
+      }
+      if (managed && !confirmed && !api.kv.get(managedConsentKey(), false)) {
+        mutate(() => setLaneStatus("connecting"));
+        probeExistingHelper({ managed, workspaceDir, log: recordSmoke })
+          .then((result) => {
+            if (result.ready) {
+              offlineToastShown = false;
+              laneClient.connect();
+              if (laneClient.isConnected()) {
+                sendStart();
+              }
+              return;
+            }
+            if (result.blocked) {
+              failVoiceStartup(result.reason, { restoreFocus: true });
+              return;
+            }
+            mutate(() => setLaneStatus("idle"));
+            confirmManagedStart(() => startVoiceLane({ confirmed: true }));
+          })
+          .catch(() => {
+            mutate(() => setLaneStatus("idle"));
+            confirmManagedStart(() => startVoiceLane({ confirmed: true }));
+          });
+        return;
+      }
+      continueVoiceLaneStart({ opencodeUrl, managed, workspaceDir });
+    };
+
+    const stopVoiceLane = (reason, { releaseHelper = false, immediateHelperStop = false } = {}) => {
       laneState = createLaneState();
+      releaseHelperAfterStop = releaseHelperAfterStop || (releaseHelper && !immediateHelperStop);
       if (laneClient.isConnected()) {
         laneClient.send({ ...protocolBase("stop"), reason });
-        stopAckTimer = setTimeout(() => {
-          stopAckTimer = undefined;
+        if (immediateHelperStop) {
           laneClient.close();
-        }, STOP_ACK_TIMEOUT_MS);
+        } else {
+          stopAckTimer = setTimeout(() => {
+            stopAckTimer = undefined;
+            laneClient.close();
+            if (releaseHelperAfterStop) {
+              releaseHelperAfterStop = false;
+              stopHelper();
+              recordSmoke("helper.stop.after_timeout");
+            }
+          }, STOP_ACK_TIMEOUT_MS);
+        }
       } else {
         laneClient.close();
+        if (releaseHelperAfterStop) {
+          releaseHelperAfterStop = false;
+          stopHelper();
+          recordSmoke("helper.stop.without_lane");
+        }
+      }
+      if (releaseHelper && immediateHelperStop) {
+        releaseHelperAfterStop = false;
+        stopHelper();
+        recordSmoke("helper.stop.immediate");
       }
       setLaneStatus("idle");
     };
@@ -901,6 +1039,18 @@ export async function tui(api) {
       if (event?.ctrl || event?.meta || event?.super) return;
       const name = typeof event?.name === "string" ? event.name.toLowerCase() : "";
       const modal = getModal();
+      if (managedStartPromptOpen) {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        if (name === "enter" || name === "return") {
+          acceptManagedStart();
+        } else if (name === "escape") {
+          cancelManagedStart();
+        } else {
+          recordSmoke("typing.swallow", { key: name || "unknown", modal: "managed-start" });
+        }
+        return;
+      }
       if (modal) {
         // Modal-scoped keys. Esc passes through so the host dialog and the
         // mortic.escape binding can close the modal (closeModal is idempotent).
@@ -982,8 +1132,7 @@ export async function tui(api) {
     });
     api.lifecycle.onDispose(() => exitMorticMode?.());
     api.lifecycle.onDispose(() => {
-      stopVoiceLane("client.shutdown");
-      stopHelper();
+      stopVoiceLane("client.shutdown", { releaseHelper: true, immediateHelperStop: true });
     });
 
     // Memoized so sidebar_content and session_prompt_right (both re-rendered

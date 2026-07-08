@@ -100,6 +100,7 @@ class OpenCodeCheckTests(unittest.IsolatedAsyncioTestCase):
         by = {r.name: r for r in results}
         self.assertEqual(by["Voice agent present"].status, doctor.FAIL)
         self.assertIn("MISSING", by["Voice agent present"].detail)
+        self.assertIn("managed mode", by["Voice agent present"].detail)
         self.assertEqual(by["Model round-trip"].status, doctor.WARN)
         self.assertEqual(fake.deleted, [])  # never created a session
 
@@ -125,6 +126,12 @@ class OpenCodeCheckTests(unittest.IsolatedAsyncioTestCase):
             results = await doctor.check_opencode(config(), ModelRef(), "voice-build", round_trip=False)
         self.assertFalse(any(r.name == "Model round-trip" for r in results))
         self.assertEqual(fake.deleted, [])
+
+
+class GlobalConfigGuardTests(unittest.TestCase):
+    def test_doctor_has_no_global_config_repair_path(self) -> None:
+        self.assertFalse(hasattr(doctor, "apply_agent_fix"))
+        self.assertFalse(hasattr(doctor, "OPENCODE_CONFIG_PATHS"))
 
 
 if __name__ == "__main__":

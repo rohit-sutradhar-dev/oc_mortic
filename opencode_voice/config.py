@@ -130,6 +130,7 @@ class VoiceConfig:
     opencode_url: str
     bridge_host: str = "127.0.0.1"
     bridge_port: int = 8765
+    workspace_dir: str | None = None
     model: ModelRef = ModelRef()
     context_threshold_tokens: int = 70_000
     compaction_wait_sec: float = 10.0

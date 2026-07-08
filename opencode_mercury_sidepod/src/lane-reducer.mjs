@@ -118,7 +118,7 @@ export function reduceLaneEvent(state, event) {
     // silent drop that can freeze the viewer mid-turn.
     return {
       state: { ...state, activeTurnId: null, assistantBuffer: "", deltaSeq: 0, transcriptSeq: 0 },
-      ui: { status: "ready", userText: "Interrupted." },
+      ui: { status: "ready", userText: "Interrupted.", assistantText: "Speech interrupted before playback finished." },
     };
   }
   if (type === "voice_bridge_issue") {

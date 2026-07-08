@@ -6,8 +6,9 @@ Every startup failure this class of bug produced was silent: a turn sent with
 an agent the OpenCode server does not have is accepted (HTTP 204) and then
 never runs, so the helper hangs with no error. The doctor turns that — and the
 neighbouring credential/reachability failures — into a loud, specific report
-BEFORE a turn is attempted. It is safe to run read-only-ish: the one mutating
-check (the model round-trip) creates a throwaway session and deletes it.
+BEFORE a turn is attempted. It does not repair or mutate OpenCode global
+config; managed `/mortic` supplies its voice agent through
+OPENCODE_CONFIG_CONTENT.
 """
 
 import os
@@ -27,7 +28,6 @@ FAIL = "fail"
 # The dotenv files the helper loads, most-specific last (matches the launch
 # chain: ~/.mortic/.env is the BYOK home, a checkout .env may add to it).
 DOTENV_PATHS = ("~/.mortic/.env", ".env")
-
 
 @dataclass
 class DoctorResult:
@@ -135,7 +135,7 @@ async def check_opencode(
                     FAIL,
                     f"'{agent}' MISSING (server has: {', '.join(agents) or 'none'}). "
                     "This server was not started with the voice config overlay; "
-                    "turns will hang. Use managed mode or add the agent to the server config.",
+                    "turns will hang. Start Mortic in managed mode so the overlay is supplied.",
                 )
             )
             if round_trip:

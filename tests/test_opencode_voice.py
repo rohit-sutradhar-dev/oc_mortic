@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from opencode_voice.config import (
@@ -204,6 +205,124 @@ class HelperReadinessTests(unittest.TestCase):
         self.assertEqual(record["text"]["kind"], "text")
         self.assertEqual(record["text"]["chars"], len("do not persist this prompt"))
         self.assertEqual(record["raw"]["kind"], "dict")
+
+
+class HealthEndpointTests(unittest.TestCase):
+    def test_health_never_500s_when_opencode_is_unreachable(self) -> None:
+        class UnreachableClient:
+            async def health(self) -> dict[str, Any]:
+                raise httpx.ConnectError("All connection attempts failed")
+
+            async def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "opencode_voice.server.helper_readiness_issues",
+            return_value=(),
+        ):
+            app = create_app(
+                VoiceConfig(opencode_url="http://127.0.0.1:4096", run_root=tmp, workspace_dir="/tmp/worktree"),
+                client_factory=lambda _url, _timeout: UnreachableClient(),
+            )
+            with TestClient(app) as client:
+                response = client.get("/api/health")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["ready"])
+        self.assertEqual(payload["workspace_dir"], "/tmp/worktree")
+        self.assertEqual(payload["opencode"]["reachable"], False)
+        self.assertEqual(payload["issues"][0]["diagnosticCode"], "opencode_unreachable")
+        self.assertEqual(payload["issues"][0]["safeDetail"], "Mortic could not reach its OpenCode voice server.")
+
+    def test_health_reports_missing_voice_agent_before_mic_start(self) -> None:
+        class MissingAgentClient(FakeOpenCodeClient):
+            async def agents(self) -> list[str]:
+                return ["build"]
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "opencode_voice.server.helper_readiness_issues",
+            return_value=(),
+        ):
+            app = create_app(
+                VoiceConfig(opencode_url="http://127.0.0.1:4096", run_root=tmp, opencode_agent="voice-build"),
+                client_factory=lambda _url, _timeout: MissingAgentClient(),
+            )
+            with TestClient(app) as client:
+                response = client.get("/api/health")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["ready"])
+        self.assertFalse(payload["opencode"]["agent_present"])
+        self.assertEqual(payload["issues"][0]["diagnosticCode"], "opencode_agent_missing")
+        self.assertEqual(payload["issues"][0]["safeDetail"], "Mortic voice agent is missing from the OpenCode voice server.")
+
+    def test_lane_start_reaps_stale_voice_tmp_forks_after_source_validation(self) -> None:
+        class StaleForkClient(FakeOpenCodeClient):
+            async def list_sessions(self) -> list[dict[str, Any]]:
+                return [
+                    {"id": "fork_stale", "title": "[voice tmp] Source Thread"},
+                    {"id": "source_keep", "title": "Source Thread"},
+                ]
+
+        fake = StaleForkClient()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "opencode_voice.server.helper_readiness_issues",
+            return_value=(),
+        ):
+            app = create_app(
+                VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
+                client_factory=lambda _url, _timeout: fake,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/sidepod") as websocket:
+                    websocket.send_json(
+                        {
+                            "type": "start",
+                            "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
+                            "clientEventId": "evt_reap_1",
+                            "sentAt": "2026-07-03T00:00:00.000Z",
+                            "sourceSessionId": "source_keep",
+                            "keepFork": False,
+                        }
+                    )
+                    ready = websocket.receive_json()
+                    self.assertEqual(ready["type"], "ready")
+                    self.assertEqual(fake.deleted, ["fork_stale"])
+
+        self.assertEqual(fake.deleted, ["fork_stale", "fork_1"])
+
+    def test_lane_start_preserves_voice_tmp_forks_when_keep_fork_is_default(self) -> None:
+        class StaleForkClient(FakeOpenCodeClient):
+            async def list_sessions(self) -> list[dict[str, Any]]:
+                return [{"id": "fork_debug", "title": "[voice tmp] Debug Thread"}]
+
+        fake = StaleForkClient()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "opencode_voice.server.helper_readiness_issues",
+            return_value=(),
+        ):
+            app = create_app(
+                VoiceConfig(opencode_url="http://opencode.test", run_root=tmp, keep_fork_default=True),
+                client_factory=lambda _url, _timeout: fake,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/sidepod") as websocket:
+                    websocket.send_json(
+                        {
+                            "type": "start",
+                            "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
+                            "clientEventId": "evt_reap_2",
+                            "sentAt": "2026-07-03T00:00:00.000Z",
+                            "sourceSessionId": "source_keep",
+                            "keepFork": True,
+                        }
+                    )
+                    ready = websocket.receive_json()
+                    self.assertEqual(ready["type"], "ready")
+
+        self.assertEqual(fake.deleted, [])
 
 
 class SidepodTransportTests(unittest.TestCase):

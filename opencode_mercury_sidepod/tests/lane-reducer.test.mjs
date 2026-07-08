@@ -87,6 +87,7 @@ test("interrupt clears the transcript sequence like complete does", () => {
 
   assert.equal(state.transcriptSeq, 0, "a stale high-water mark would silently drop the next turn's transcript");
   assert.equal(intents[2].userText, "Interrupted.");
+  assert.equal(intents[2].assistantText, "Speech interrupted before playback finished.");
 });
 
 test("stale and duplicate sequences never regress state", () => {
