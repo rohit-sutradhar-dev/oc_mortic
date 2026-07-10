@@ -135,7 +135,7 @@ An invisible local bridge/native helper owns:
 - speech filtering;
 - event-stream and polling fallback behavior.
 
-The existing browser voice bridge UI is a technical backend reference and performance baseline. The packaged product should avoid visible browser UI in the main path and should not regress latency or speech behavior compared with the current browser-backed implementation.
+Recorded browser-era benchmarks remain historical comparison data. The packaged native helper and sidepod are now the only product path and must preserve or improve the measured latency and speech behavior.
 
 ## 7. Information Architecture
 
@@ -648,7 +648,7 @@ The sidepod remains focused on spoken interaction: PTT, Live, Refresh, COMMS, Tr
 
 ### 15.1 Existing Bridge Reuse
 
-Use the existing Python bridge behavior as the backend foundation, with an invisible local bridge/native helper owning audio capture and playback. The current browser-backed implementation is the performance reference: keep the same streaming/event architecture and avoid changing the backend path in ways that would regress first text, first audio, barge-in, or total turn latency.
+Use the existing Python helper behavior as the backend foundation, with the invisible local helper owning audio capture and playback. Preserve the streaming/event architecture and avoid regressions in first text, first device audio, barge-in, or total turn latency.
 
 Current bridge/helper responsibilities that should remain:
 
@@ -763,46 +763,10 @@ Normal UI should only use this to decide `Ready`, `Refreshing`, or `Voice Bridge
 Endpoint:
 
 ```text
-WS /ws/voice
+WS /ws/sidepod
 ```
 
-Control messages from sidepod:
-
-```json
-{ "type": "start", "session_id": "ACTIVE_OPENCODE_SESSION", "keep_fork": false }
-{ "type": "stop" }
-{ "type": "ptt.start" }
-{ "type": "ptt.stop" }
-{ "type": "live.set", "value": true }
-{ "type": "live.set", "value": false }
-{ "type": "refresh" }
-{ "type": "barge_in" }
-{ "type": "keep_fork", "value": false }
-```
-
-Implementation note for later: the existing bridge may internally map `ptt.start` / `ptt.stop` to its current audio start/stop machinery, but that mapping should stay hidden behind the helper. The product contract is voice-control intent, not browser audio plumbing.
-
-Expected bridge events:
-
-```json
-{ "type": "ready" }
-{ "type": "fork.ready" }
-{ "type": "speech.start" }
-{ "type": "speech.transcript" }
-{ "type": "speech.end" }
-{ "type": "turn.start" }
-{ "type": "assistant.first_text" }
-{ "type": "assistant.delta" }
-{ "type": "tts.first_audio" }
-{ "type": "turn.complete" }
-{ "type": "turn.error" }
-{ "type": "barge_in" }
-{ "type": "tokens" }
-{ "type": "compaction.start" }
-{ "type": "compaction.complete" }
-{ "type": "stopped" }
-{ "type": "error" }
-```
+Commands and events use protocol v0 exactly as defined in `docs/MORTIC_PROTOCOL_V0.md` and generated from `protocol/schema.ts`. The sidepod sends control intent only; browser PCM and browser-era control vocabulary are not supported product paths.
 
 The TUI should translate these into product states, not display event names directly.
 

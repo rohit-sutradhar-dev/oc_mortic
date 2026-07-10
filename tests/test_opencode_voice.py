@@ -211,6 +211,28 @@ class HelperReadinessTests(unittest.TestCase):
 
 
 class HealthEndpointTests(unittest.TestCase):
+    def test_helper_exposes_no_browser_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "opencode_voice.server.helper_readiness_issues",
+            return_value=(),
+        ):
+            app = create_app(
+                VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
+                client_factory=lambda _url, _timeout: FakeOpenCodeClient(),
+            )
+            with TestClient(app) as client:
+                for path in (
+                    "/",
+                    "/app.js",
+                    "/styles.css",
+                    "/api/sessions",
+                    "/docs",
+                    "/redoc",
+                    "/openapi.json",
+                ):
+                    with self.subTest(path=path):
+                        self.assertEqual(client.get(path).status_code, 404)
+
     def test_health_never_500s_when_opencode_is_unreachable(self) -> None:
         class UnreachableClient:
             async def health(self) -> dict[str, Any]:
@@ -924,49 +946,6 @@ class DeepgramProtocolTests(unittest.TestCase):
         )
         self.assertEqual(end["type"], "speech.end")
         self.assertTrue(end["is_final"])
-
-
-class SpokenSequenceRatioTests(unittest.TestCase):
-    SPOKEN = (
-        "We just explored the repository, looking at its overall architecture, "
-        "key directories, the eight agents and their services, configuration files, "
-        "and the current development status. That should give you a solid picture "
-        "of where things stand right now."
-    )
-
-    def test_in_order_mangled_echo_scores_above_the_gate(self) -> None:
-        from opencode_voice.server import spoken_sequence_ratio
-
-        # STT substitutions that defeat bag-of-words membership but keep order
-        # (the 2026-07-05 incident shape) must stay above ECHO_SEQUENCE_RATIO.
-        mangled = [
-            "the eight agents in their servaces configuration file and the currents development status",
-            "that should give you a solid pitcher of where things stands right now",
-            "looking at its overhaul architecture key director ease the eight agents",
-            # heavy mangling, ~45% substituted
-            "the ate agents an there servaces configure ration piles and the parents develop mint status",
-        ]
-        for transcript in mangled:
-            self.assertGreaterEqual(spoken_sequence_ratio(transcript, self.SPOKEN), 0.75, transcript)
-
-    def test_novel_and_quoting_interrupts_score_below_the_gate(self) -> None:
-        from opencode_voice.server import spoken_sequence_ratio
-
-        novel = [
-            "actually stop for a second I want you to focus on the tests instead",
-            "wait can you explain the configuration part again more slowly please",
-            "hold on what about the services you mentioned do they share state",
-            # partially quoting the assistant is still a legitimate interrupt
-            "you said the eight agents share services is that actually true",
-        ]
-        for transcript in novel:
-            self.assertLess(spoken_sequence_ratio(transcript, self.SPOKEN), 0.70, transcript)
-
-    def test_empty_inputs_score_zero(self) -> None:
-        from opencode_voice.server import spoken_sequence_ratio
-
-        self.assertEqual(spoken_sequence_ratio("", self.SPOKEN), 0.0)
-        self.assertEqual(spoken_sequence_ratio("hello there", ""), 0.0)
 
 
 class EchoProbeTests(unittest.TestCase):

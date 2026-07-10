@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
 import importlib.util
 import json
 import os
-import re
 import time
 from array import array
 from collections import deque
@@ -15,7 +13,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 from opencode_voice.echo_probe import PcmRingBuffer, echo_correlation
 from opencode_voice.config import (
@@ -58,16 +56,13 @@ from opencode_voice.telemetry import RunMetadata, snapshot_voice_config
 from opencode_voice.state import (
     AssistantTextTracker,
     HybridOpenCodeTurnTracker,
-    OpenCodeEventTurnTracker,
     active_context_estimate,
     elapsed_ms,
     event_session_id,
-    session_context_tokens,
     session_title,
     session_usage_tokens,
 )
 
-STATIC_DIR = Path(__file__).with_name("static")
 EPHEMERAL_PREFIX = "[voice tmp]"
 AUDIO_DEPENDENCY_MODULE = "sounddevice"
 # Live capture that produces zero frames within this window is treated as a
@@ -79,6 +74,19 @@ CONTEXT_OVERFLOW_MARKERS = (
     "context window",
     "reduce the length of the messages",
     "too many tokens",
+)
+INTERNAL_EVENT_HANDLED = object()
+INTERNAL_ONLY_ENGINE_EVENTS = frozenset(
+    {
+        "tokens",
+        "opencode.requested",
+        "turn.context_overflow",
+        "compaction.wait",
+        "compaction.wait.timeout",
+        "compaction.start",
+        "compaction.complete",
+        "compaction.error",
+    }
 )
 
 
@@ -121,43 +129,6 @@ def helper_readiness_issues(
     credentials = load_voice_credentials(dotenv_path=dotenv_path, tts_provider=tts_provider)
     issues.extend(issue.to_voice_bridge_issue(debug_ref=debug_ref) for issue in credentials.issues)
     return tuple(issues)
-
-
-def transcript_words(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9']+", text.lower())
-
-
-def spoken_sequence_ratio(transcript: str, spoken_text: str, tail_chars: int = 400) -> float:
-    """Best character-level similarity between the transcript and any
-    transcript-sized window of the recently spoken text.
-
-    The bag-of-words overlap check misses echo that STT mangled: substitute a
-    third of the words and membership drops below the echo threshold even
-    though the transcript is still the assistant's sentence *in order*
-    (live incident 2026-07-05: 72-char echo scored 0.64 overlap and was
-    confirmed as a real interrupt). SequenceMatcher on sliding windows keeps
-    the word order and survives substitutions like "directories"->"directors".
-    """
-    words = transcript_words(transcript)
-    if not words:
-        return 0.0
-    target = " ".join(words)
-    spoken_words = transcript_words(spoken_text[-tail_chars:])
-    if not spoken_words:
-        return 0.0
-    matcher = difflib.SequenceMatcher(autojunk=False)
-    matcher.set_seq2(target)  # seq2 is cached; slide seq1 across it
-    best = 0.0
-    # Windows from 70% to 130% of the transcript length, stepped one word.
-    low = max(1, int(len(words) * 0.7))
-    high = min(len(spoken_words), max(1, int(len(words) * 1.3)))
-    for size in range(low, high + 1):
-        for start in range(0, len(spoken_words) - size + 1):
-            matcher.set_seq1(" ".join(spoken_words[start : start + size]))
-            if matcher.real_quick_ratio() <= best or matcher.quick_ratio() <= best:
-                continue
-            best = max(best, matcher.ratio())
-    return best
 
 
 # Maps a turn-failure reason to the lane's (diagnostic_code, safe_detail,
@@ -808,7 +779,12 @@ def create_app(
     *,
     client_factory: Callable[[str, float], OpenCodeClient] = OpenCodeClient,
 ) -> FastAPI:
-    app = FastAPI(title="OpenCode Mercury Voice Bridge")
+    app = FastAPI(
+        title="Mortic Voice Helper",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     load_voice_credentials(tts_provider=config.tts_provider)
     logger = RunLogger(config.run_root)
     run_metadata = RunMetadata.create(
@@ -854,18 +830,6 @@ def create_app(
     async def _shutdown() -> None:
         logger.close()
     app.router.add_event_handler("shutdown", _shutdown)
-
-    @app.get("/")
-    async def index() -> HTMLResponse:
-        return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
-
-    @app.get("/app.js")
-    async def app_js() -> FileResponse:
-        return FileResponse(STATIC_DIR / "app.js", media_type="text/javascript")
-
-    @app.get("/styles.css")
-    async def styles() -> FileResponse:
-        return FileResponse(STATIC_DIR / "styles.css", media_type="text/css")
 
     @app.get("/api/health")
     async def health() -> JSONResponse:
@@ -933,8 +897,6 @@ def create_app(
                     "enabled": config.has_deepgram_key,
                     "stt_model": config.deepgram_stt_model,
                     "tts_model": config.deepgram_tts_model,
-                    # Compatibility: the browser capture path reads
-                    # `sample_rate` as the Flux/STT rate.
                     "sample_rate": config.deepgram_sample_rate,
                     "tts_sample_rate": config.tts_sample_rate,
                 },
@@ -945,43 +907,6 @@ def create_app(
                 },
             }
         )
-
-    @app.get("/api/sessions")
-    async def sessions() -> JSONResponse:
-        client = client_factory(config.opencode_url, 20)
-        try:
-            rows = await client.list_sessions()
-        finally:
-            await client.close()
-        rows.sort(key=lambda item: (item.get("time") or {}).get("updated") or 0, reverse=True)
-        return JSONResponse(
-            {
-                "sessions": [
-                    {
-                        "id": row.get("id"),
-                        "title": session_title(row),
-                        "tokens": row.get("tokens") or {},
-                        "context_tokens": session_context_tokens(row),
-                        "usage_tokens": session_usage_tokens(row),
-                        "model": row.get("model"),
-                        "time": row.get("time") or {},
-                        "is_voice_tmp": str(row.get("title") or "").startswith(EPHEMERAL_PREFIX),
-                    }
-                    for row in rows
-                ]
-            }
-        )
-
-    @app.websocket("/ws/voice")
-    async def voice_socket(websocket: WebSocket) -> None:
-        await websocket.accept()
-        client = client_factory(config.opencode_url, 60)
-        connection = VoiceConnection(config=config, client=client, logger=logger, websocket=websocket)
-        try:
-            await connection.run()
-        finally:
-            await connection.close()
-            await client.close()
 
     @app.websocket("/ws/sidepod")
     async def sidepod_socket(websocket: WebSocket) -> None:
@@ -1060,18 +985,6 @@ class VoiceConnection:
         self.tts_unavailable_chunks = 0
         self.speaker_prewarm_task: asyncio.Task[None] | None = None
         self.final_transcript = ""
-        self.eager_turn_text: str | None = None
-        self.spoken_text_recent = ""
-        self.dismissed_transcript: str | None = None
-        self.dismissed_at = 0.0
-        self.barge_pending = False
-        self.barge_pending_since = 0.0
-        # Wall-clock of the last evidence the speaker is still talking (speech
-        # start / interim transcript / resume); the confirm deadline is
-        # measured from here so a long utterance holds the pause.
-        self.last_speech_at = 0.0
-        self.pending_barge_task: asyncio.Task[None] | None = None
-        self.pending_probe_task: asyncio.Task[None] | None = None
         self.aec_delay_error_logged = False
         self.tts_first_audio_seen = False
         self.turn_spoken_any = False
@@ -1096,41 +1009,6 @@ class VoiceConnection:
         self.interruption_decision_task: asyncio.Task[None] | None = None
         self.interruption_expiry_task: asyncio.Task[None] | None = None
 
-    async def run(self) -> None:
-        readiness_issues = helper_readiness_issues(
-            transport_ready=True,
-            debug_ref=str(self.logger.run_dir),
-            tts_provider=self.config.tts_provider,
-        )
-        if readiness_issues:
-            self.logger.state_transition(
-                "transport.connected",
-                "voice_bridge_issue",
-                diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
-            )
-            for issue in readiness_issues:
-                await self.send_json(issue)
-        else:
-            self.logger.state_transition("transport.connected", "ready")
-            await self.send_json({"type": "ready", "run_dir": str(self.logger.run_dir)})
-        while True:
-            message = await self.websocket.receive()
-            if message.get("type") == "websocket.disconnect":
-                break
-            if message.get("bytes") is not None:
-                if self.flux:
-                    await self.flux.send_audio(message["bytes"])
-                continue
-            text = message.get("text")
-            if text is None:
-                continue
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                await self.send_json({"type": "error", "message": "Invalid JSON control message."})
-                continue
-            await self.handle_control(payload)
-
     async def close(self) -> None:
         self.closed = True
         now_ms = self.interruption_elapsed_ms()
@@ -1141,8 +1019,6 @@ class VoiceConnection:
             self.speaker_prewarm_task,
             self.turn_task,
             self.compaction_task,
-            self.pending_barge_task,
-            self.pending_probe_task,
             self.interruption_decision_task,
             self.interruption_expiry_task,
             self.flux_watchdog_task,
@@ -1181,41 +1057,6 @@ class VoiceConnection:
 
     def interruption_elapsed_ms(self) -> int:
         return int((time.perf_counter() - self.interruption_clock_started) * 1000)
-
-    async def handle_control(self, payload: dict[str, Any]) -> None:
-        kind = payload.get("type")
-        if kind == "start":
-            session_id = str(payload.get("session_id") or "")
-            if not session_id:
-                await self.send_json({"type": "error", "message": "Pick an OpenCode session first."})
-                return
-            try:
-                await self.start(session_id=session_id, keep_fork=bool(payload.get("keep_fork")))
-            except httpx.HTTPStatusError as exc:
-                self.logger.write(
-                    "fork.start.error",
-                    source_session_id=session_id,
-                    status_code=exc.response.status_code,
-                    error=repr(exc),
-                )
-                await self.send_json({"type": "error", "message": "Could not fork that session. Refresh threads."})
-        elif kind == "stop":
-            await self.stop()
-        elif kind == "text":
-            text = str(payload.get("text") or "").strip()
-            if text:
-                await self.enqueue_text_turn(text, source="typed")
-        elif kind == "audio.start":
-            await self.start_audio()
-        elif kind == "audio.stop":
-            if self.flux:
-                await self.flux.close()
-                self.flux = None
-        elif kind == "barge_in":
-            await self.barge_in(reason="manual")
-        elif kind == "keep_fork":
-            self.keep_fork = bool(payload.get("value"))
-            await self.send_json({"type": "fork.keep", "keep_fork": self.keep_fork})
 
     async def create_voice_fork(
         self, session_id: str, keep_fork: bool, original: dict[str, Any] | None = None
@@ -1279,19 +1120,13 @@ class VoiceConnection:
             "keep_fork": keep_fork,
         }
 
-    async def start(self, session_id: str, keep_fork: bool) -> None:
-        fork = await self.create_voice_fork(session_id, keep_fork)
-        await self.send_json({"type": "fork.ready", **fork})
-        await self.maybe_start_compaction(reason="session_start", run_in_background=True)
-
-    async def stop(self) -> None:
+    async def delete_voice_fork(self) -> None:
         if self.fork_session_id and not self.keep_fork:
             fork_id = self.fork_session_id
             await self.client.delete_session(fork_id)
             self.logger.write("fork.delete", session_id=fork_id)
         self.fork_session_id = None
         self.voice_lane_id = None
-        await self.send_json({"type": "stopped"})
 
     async def start_audio(self) -> None:
         issue = self.config.credential_issue_for("voice_audio")
@@ -1311,8 +1146,6 @@ class VoiceConnection:
         self.logger.write("flux.connection.ready", flux_connection_epoch=self.flux_connection_epoch)
         if self.flux_watchdog_task is None or self.flux_watchdog_task.done():
             self.flux_watchdog_task = asyncio.create_task(self.watch_flux_transport())
-        # Legacy browser clients render this; the sidepod seam drops it.
-        await self.send_json({"type": "audio.ready"})
 
     async def start_native_audio(self) -> bool:
         await self.start_audio()
@@ -1625,7 +1458,6 @@ class VoiceConnection:
             self.audio_input_started = now
             self.audio_input_last_log = now
             self.logger.write("audio.input.first_chunk", bytes=len(data), flux_active=bool(self.flux))
-            await self.send_json({"type": "audio.input", "status": "receiving"})
         self.audio_input_chunks += 1
         self.audio_input_bytes += len(data)
         if now - self.audio_input_last_log >= 5:
@@ -1651,11 +1483,6 @@ class VoiceConnection:
             flux_active=bool(self.flux),
         )
 
-    async def forward_flux_event(self, event: dict[str, Any]) -> None:
-        # The browser lane forwards raw STT events; the sidepod lane overrides
-        # this seam to translate them into protocol v0 `transcript` events.
-        await self.send_json(event)
-
     def adopt_flux_connection_epoch(self, epoch: int) -> None:
         """Fence all episode identities created by the replaced socket."""
 
@@ -1679,12 +1506,6 @@ class VoiceConnection:
         while len(self.expired_interruption_episode_order) > 256:
             expired = self.expired_interruption_episode_order.popleft()
             self.expired_interruption_episodes.discard(expired)
-
-    async def on_transcript_admitted(self, transcript: str, confidence: float | None) -> None:
-        # Sidepod hook: only admitted transcripts may become durable
-        # transcript entries in the UI (rejected echo must not be recorded
-        # as the user's words). The browser lane shows raw events already.
-        return None
 
     def interruption_episode_for(self, event: dict[str, Any], *, started: bool = False) -> EpisodeIdentity:
         epoch_value = event.get("flux_connection_epoch")
@@ -1807,16 +1628,6 @@ class VoiceConnection:
             transcript = str(action.text or "").strip()
             if not transcript:
                 return
-            # Existing overlap/fuzzy/confidence logic remains shadow-only for
-            # cohort comparison and cannot change the authoritative outcome.
-            shadow_verdict, shadow_detail = self.transcript_verdict(transcript, eager=False)
-            self.logger.write(
-                "interruption.shadow.legacy",
-                verdict=shadow_verdict,
-                transcript_chars=len(transcript),
-                **shadow_detail,
-                **detail,
-            )
             await self.on_transcript_admitted(transcript, None)
             await self.enqueue_text_turn(transcript, source="voice", eager=False)
         elif kind is InterruptionActionKind.CANCEL_SPECULATION:
@@ -2064,314 +1875,6 @@ class VoiceConnection:
                 )
             )
 
-    async def handle_transcript(self, transcript: str, eager: bool, confidence: float | None = None) -> None:
-        """The single admission path for every voice transcript. The verdict
-        both decides whether a turn starts and resolves any paused playback,
-        so eager/final duplicates and echo cannot slip in through one code
-        path while another filters them."""
-        verdict, detail = self.transcript_verdict(transcript, eager, confidence)
-        if verdict == "admit":
-            if self.barge_pending:
-                self.capture_pending_pcm("confirmed", transcript_chars=len(transcript), **detail)
-                self.clear_pending_barge_in()
-                self.logger.write("barge_in.confirmed", transcript_chars=len(transcript), **detail)
-                await self.barge_in(reason="speech_confirmed")
-                await self.maybe_start_compaction(reason="speech_confirmed", run_in_background=True)
-            elif self.native_speaker and self.native_speaker.is_audible():
-                # No pause in flight but stale audio is still playing (e.g. a
-                # timeout resumed it): the new turn supersedes that playback.
-                await self.interrupt_playback("new_turn")
-            await self.on_transcript_admitted(transcript, confidence)
-            await self.enqueue_text_turn(transcript, source="voice", eager=eager)
-            return
-        self.logger.write("transcript.rejected", verdict=verdict, transcript_chars=len(transcript), **detail)
-        if verdict in ("tiny", "echo", "low_confidence", "cut_short"):
-            # The confirming final speech.end repeats the same words moments
-            # later; remember the dismissal so it cannot re-enter as a turn.
-            self.dismissed_transcript = transcript
-            self.dismissed_at = time.perf_counter()
-        if verdict == "confirmed_eager":
-            self.eager_turn_text = None
-        if self.barge_pending:
-            self.dismiss_pending_barge_in(verdict)
-
-    # Below this mean word confidence, speech heard while the assistant is
-    # audible is treated as mangled echo rather than the user. Clean speech
-    # scores well above this; echo the canceller distorted transcribes as
-    # low-confidence garbage that the word-overlap check cannot match.
-    ECHO_CONFIDENCE_FLOOR = 0.5
-    # Echo of the assistant's closing words is transcribed after playback has
-    # already ended, so the content checks stay armed this long past the last
-    # audible moment. (Length/one-word rules do not: a quick "Yes." right
-    # after the assistant finishes is a legitimate reply.)
-    ECHO_TAIL_SEC = 1.5
-    # Speech that ENDS this soon after the pause began is a fragment our own
-    # pause cut off: pausing silences the echo source mid-word, so Flux
-    # end-of-turns it almost immediately (live run: echo fragments ended
-    # 243-251ms after the pause; real interrupts ran 889-1273ms because a
-    # human keeps talking whether or not the assistant went quiet). LiveKit
-    # ships the same rule as min_interruption_duration.
-    PENDING_MIN_SPEECH_SEC = 0.4
-    # Character-level similarity (ordered window match) at or above this is
-    # echo even when word membership fails: STT transcribes AEC-mangled echo
-    # with substituted words, but in the assistant's word order (live
-    # incident: overlap 0.64 slipped the 0.75 gate; its sequence ratio was
-    # far higher). Calibrated by test against mangled vs novel transcripts.
-    ECHO_SEQUENCE_RATIO = 0.72
-    # The audio probe only breaks ties: below this text score the transcript
-    # is clearly novel and no audio evidence may dismiss it (protects real
-    # barge-ins, including the user talking over playback), above the echo
-    # thresholds the text rules already decided.
-    ECHO_PROBE_TEXT_FLOOR = 0.45
-    # Peak mic-vs-render energy-envelope correlation at or above this means
-    # the mic heard what the speaker played. Echo replays the render's
-    # loudness contour (live fixture: shifted+attenuated copies score ~0.9);
-    # independent speech stays well under 0.4.
-    ECHO_CORRELATION_FLOOR = 0.6
-    # The early probe resolves the PAUSE before any transcript exists, so it
-    # has no text corroboration and demands a stronger match than the
-    # corroborated tie-band floor. It sits above where real interrupts land
-    # (live runs: confirmed interrupts peaked at corr ~0.34) with margin.
-    # 0.6 was tried and reverted: run 193837Z dismissed a real interrupt at
-    # corr 0.61 as echo_audio, and the backtest showed 0.6 caught almost
-    # nothing 0.75 did not — pure downside. A wrong early dismissal only
-    # self-corrects via the transcript path at the cost of a restarted-playback
-    # stutter, so keep this conservative.
-    ECHO_EARLY_CORRELATION_FLOOR = 0.75
-    # The correlator needs ~min_overlap_sec (0.4s) of mic audio before it can
-    # judge, so the first audio check waits this long; then it rechecks every
-    # poll interval (mic frames arrive ~80ms apart) so a clear echo resolves
-    # the instant correlation crosses the floor, not at the next fixed tick.
-    ECHO_PROBE_MIN_SEC = 0.5
-    ECHO_PROBE_POLL_SEC = 0.05
-
-    def transcript_verdict(
-        self, transcript: str, eager: bool, confidence: float | None = None
-    ) -> tuple[str, dict[str, Any]]:
-        """Classify a transcript: "admit" starts a turn, anything else drops it.
-
-        empty            nothing was said
-        duplicate        repeats a transcript rejected moments ago (Flux sends
-                         eager + final copies of the same utterance)
-        confirmed_eager  the final EOT matching the in-flight eager turn —
-                         the turn is already running, restarting adds latency
-        tiny             below the length floor while the assistant is audible
-        echo             mostly the assistant's own recent words while audible
-                         (a length gate cannot tell echo from a user: live run
-                         had 9-13 char echo fragments confirm 5 interrupts)
-        low_confidence   Flux itself doubts the words, while audible — echo
-                         that leaked distorted transcribes as novel garbage
-                         and defeats the overlap check
-        cut_short        speech that ended almost immediately after our pause
-                         began — the pause silenced the echo source mid-word,
-                         so mangled echo (novel words, high confidence, which
-                         no content rule can catch) EOTs in ~250ms; a human
-                         keeps talking well past PENDING_MIN_SPEECH_SEC
-
-        The content rules stay armed for ECHO_TAIL_SEC past the last audible
-        moment (echo of closing words transcribes after playback ends); the
-        length-based rules (tiny, single-word echo) apply only while sound is
-        actually on the air, so a quick short answer right after the
-        assistant finishes is still admitted. In full silence none of them
-        apply.
-        """
-        if not transcript:
-            return "empty", {}
-        if (
-            self.dismissed_transcript == transcript
-            and time.perf_counter() - self.dismissed_at < 3.0
-        ):
-            return "duplicate", {}
-        if not eager and self.eager_turn_text == transcript:
-            return "confirmed_eager", {"turn_id": self.active_turn_id}
-        if self.barge_pending:
-            pending_sec = time.perf_counter() - self.barge_pending_since
-            if pending_sec < self.PENDING_MIN_SPEECH_SEC:
-                return "cut_short", {"pending_ms": int(pending_sec * 1000)}
-        speaker = self.native_speaker
-        detail: dict[str, Any] = {}
-        if speaker and speaker.is_audible(tail_sec=self.ECHO_TAIL_SEC):
-            audible_now = speaker.is_audible()
-            if audible_now and len(transcript) < self.config.barge_in_min_chars:
-                return "tiny", {}
-            words = transcript_words(transcript)
-            spoken = set(transcript_words(self.spoken_text_recent))
-            overlap = sum(word in spoken for word in words) / len(words) if words else 0.0
-            seq_ratio = spoken_sequence_ratio(transcript, self.spoken_text_recent)
-            # Kept on admits too: transcripts are redacted from logs, so the
-            # overlap and sequence scores are what let a log reader judge
-            # echo-likeness.
-            detail["overlap"] = round(overlap, 2)
-            detail["seq_ratio"] = round(seq_ratio, 2)
-            # A single word the assistant just used ("Great." echoing back)
-            # counts as echo only while sound is actually on the air; once
-            # playback ends, a one-word "Yes." is a legitimate answer even
-            # though the assistant's question contained the word.
-            multiword_echo = len(words) >= 2 and overlap >= 0.75
-            single_word_echo = audible_now and len(words) == 1 and overlap >= 1.0
-            # STT-mangled echo defeats word membership but keeps word order:
-            # the character-level window match catches it (>=3 words so short
-            # legitimate replies never ride the fuzzy path).
-            sequence_echo = len(words) >= 3 and seq_ratio >= self.ECHO_SEQUENCE_RATIO
-            if multiword_echo or single_word_echo or sequence_echo:
-                return "echo", detail
-            if (
-                self.config.echo_probe_enabled
-                and self.barge_pending
-                and len(words) >= 3
-                and max(overlap, seq_ratio) >= self.ECHO_PROBE_TEXT_FLOOR
-            ):
-                # Text score is in the ambiguous band: ask the audio whether
-                # the mic heard what the speaker played during this window.
-                correlation = self.pending_barge_echo_correlation()
-                detail["echo_corr"] = round(correlation, 2)
-                if correlation >= self.ECHO_CORRELATION_FLOOR:
-                    return "echo", detail
-            if confidence is not None and confidence < self.ECHO_CONFIDENCE_FLOOR:
-                detail["confidence"] = round(confidence, 3)
-                return "low_confidence", detail
-        return "admit", detail
-
-    def pending_barge_echo_correlation(self) -> float:
-        """Correlate the pending window's mic audio with the render audio
-        played around it (padded for AEC/device delay error)."""
-        now = time.perf_counter()
-        start = self.barge_pending_since
-        mic_pcm = self.mic_audio_ring.extract(start, now)
-        render_pcm = self.render_audio_ring.extract(start - 0.6, now + 0.6)
-        return echo_correlation(mic_pcm, render_pcm, self.config.deepgram_sample_rate)
-
-    def begin_pending_barge_in(self) -> None:
-        self.barge_pending = True
-        self.barge_pending_since = time.perf_counter()
-        self.last_speech_at = self.barge_pending_since
-        if self.native_speaker:
-            self.native_speaker.pause()
-        self.logger.write("barge_in.pending")
-        self.arm_pending_barge_in_deadline()
-        if self.config.echo_probe_enabled:
-            self.pending_probe_task = asyncio.create_task(self.early_echo_probe())
-
-    def arm_pending_barge_in_deadline(self) -> None:
-        task = self.pending_barge_task
-        if task and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-        self.pending_barge_task = asyncio.create_task(self.expire_pending_barge_in())
-
-    async def expire_pending_barge_in(self) -> None:
-        # Dismiss only once the speaker has gone quiet for barge_in_confirm_sec,
-        # not a fixed window after speech.start — otherwise a >2s utterance
-        # releases playback over the speaker mid-sentence, then the late
-        # transcript re-interrupts (the "talked over then jerky cut" glitch).
-        # last_speech_at advances on every interim transcript / resume; a hard
-        # ceiling (barge_in_max_sec from the start) stops re-transcribed echo
-        # from freezing playback forever.
-        while self.barge_pending:
-            now = time.perf_counter()
-            quiet_deadline = self.last_speech_at + self.config.barge_in_confirm_sec
-            hard_deadline = self.barge_pending_since + self.config.barge_in_max_sec
-            wait = min(quiet_deadline, hard_deadline) - now
-            if wait <= 0:
-                break
-            await asyncio.sleep(wait)
-        if self.barge_pending:
-            quiet_for = time.perf_counter() - self.last_speech_at
-            reason = "timeout" if quiet_for >= self.config.barge_in_confirm_sec else "timeout_max"
-            self.dismiss_pending_barge_in(reason)
-
-    async def early_echo_probe(self) -> None:
-        """Resolve the pending pause by AUDIO, before any transcript exists.
-
-        Waiting for the transcript costs the full STT round-trip while
-        playback sits paused — live run 20260705T192451Z: text-resolved echo
-        pauses ran 1.1-1.7s and eight more hit the whole 2s confirm deadline
-        because Flux transcribed the echo only after the window. The mic and
-        render rings already hold the answer; the first check waits
-        ECHO_PROBE_MIN_SEC for enough mic audio, then rechecks every
-        ECHO_PROBE_POLL_SEC (mic-frame cadence) so a clear echo resolves the
-        instant the correlation crosses the floor instead of at a fixed tick.
-        The confirm deadline (expire_pending_barge_in) still bounds the loop:
-        it flips barge_pending false and the loop exits. A wrong dismissal
-        self-corrects: the transcript still gets its verdict, so a real
-        interrupt still barges in via the text path.
-        """
-        first = self.barge_pending_since + self.ECHO_PROBE_MIN_SEC - time.perf_counter()
-        if first > 0:
-            await asyncio.sleep(first)
-        while self.barge_pending:
-            if self.try_early_echo_dismiss():
-                return
-            await asyncio.sleep(self.ECHO_PROBE_POLL_SEC)
-
-    def try_early_echo_dismiss(self) -> bool:
-        """One audio check of the pending window; dismisses on a clear match.
-        Always logs the correlation so live runs calibrate the floor."""
-        correlation = self.pending_barge_echo_correlation()
-        self.logger.write(
-            "barge_in.echo_probe",
-            corr=round(correlation, 2),
-            at_ms=int((time.perf_counter() - self.barge_pending_since) * 1000),
-        )
-        if correlation >= self.ECHO_EARLY_CORRELATION_FLOOR:
-            self.dismiss_pending_barge_in("echo_audio")
-            return True
-        return False
-
-    def clear_pending_barge_in(self) -> None:
-        self.barge_pending = False
-        task = self.pending_barge_task
-        if task and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-        self.pending_barge_task = None
-        probe = self.pending_probe_task
-        if probe and probe is not asyncio.current_task() and not probe.done():
-            probe.cancel()
-        self.pending_probe_task = None
-
-    def dismiss_pending_barge_in(self, verdict: str) -> None:
-        self.capture_pending_pcm(verdict)
-        self.clear_pending_barge_in()
-        self.logger.write("barge_in.false_alarm", verdict=verdict)
-        if self.native_speaker:
-            self.native_speaker.resume()
-
-    def capture_pending_pcm(self, verdict: str, **meta: Any) -> None:
-        """Persist the pending window's mic + render PCM for offline replay.
-        Gated by echo_capture_enabled — it writes raw microphone audio. The
-        windows are exactly what pending_barge_echo_correlation reads, so a
-        saved incident reproduces the live decision and can be re-scored
-        against a different floor or algorithm; the rings are in-memory only,
-        so without this a bad decision is unrecoverable after the turn."""
-        if not self.config.echo_capture_enabled:
-            return
-        start = self.barge_pending_since
-        now = time.perf_counter()
-        mic = self.mic_audio_ring.extract(start, now)
-        render = self.render_audio_ring.extract(start - 0.6, now + 0.6)
-        if not mic and not render:
-            return
-        out_dir = self.logger.run_dir / "barge_pcm"
-        out_dir.mkdir(exist_ok=True)
-        stamp = f"{iso_utc_now().replace(':', '').replace('-', '')}_{verdict}"
-        (out_dir / f"{stamp}.mic.pcm").write_bytes(mic)
-        (out_dir / f"{stamp}.render.pcm").write_bytes(render)
-        (out_dir / f"{stamp}.json").write_text(
-            json.dumps(
-                {
-                    "verdict": verdict,
-                    "sample_rate": self.config.deepgram_sample_rate,
-                    "mic_bytes": len(mic),
-                    "render_bytes": len(render),
-                    "window_sec": round(now - start, 3),
-                    **meta,
-                }
-            ),
-            encoding="utf-8",
-        )
-        self.logger.write(
-            "barge_in.pcm_capture", verdict=verdict, mic_bytes=len(mic), render_bytes=len(render)
-        )
-
     async def enqueue_text_turn(self, text: str, source: str, eager: bool = False) -> None:
         issue = self.config.credential_issue_for("voice_turns")
         if issue:
@@ -2382,9 +1885,6 @@ class VoiceConnection:
             return
         if self.turn_task and not self.turn_task.done():
             await self.barge_in(reason="new_turn")
-        # Remember the eager prompt so the confirming final speech.end can be
-        # recognized (and skipped) instead of restarting the turn.
-        self.eager_turn_text = text if eager else None
         self.turn_task = asyncio.create_task(self.run_text_turn(text=text, source=source, eager=eager))
 
     def turn_is_active(self, turn_id: int) -> bool:
@@ -3380,9 +2880,6 @@ class VoiceConnection:
             return
         if self.active_turn_id is not None and self.active_turn_id != turn_id:
             return
-        # Rolling record of what the assistant said recently; the pending
-        # barge-in resolver matches transcripts against it to spot echo.
-        self.spoken_text_recent = (self.spoken_text_recent + " " + text)[-1000:]
         if turn_id in self.tts_failed_turns:
             return
         if self.speaker is None:
@@ -3463,17 +2960,6 @@ class VoiceConnection:
         if response_text.strip() and not self.turn_spoken_any:
             self.logger.write("tts.no_speakable_text", turn_id=turn_id, response_chars=len(response_text))
 
-    async def send_tts_audio(self, data: bytes, turn_id: int | PlaybackToken | None) -> None:
-        legacy_turn_id = turn_id.turn_id if isinstance(turn_id, PlaybackToken) else turn_id
-        if isinstance(turn_id, PlaybackToken):
-            self.tts_last_audio_at[turn_id] = time.monotonic()
-        if not self.tts_first_audio_seen:
-            self.tts_first_audio_seen = True
-            await self.send_json({"type": "tts.first_audio", "turn_id": legacy_turn_id})
-            self.logger.write("tts.first_audio", turn_id=legacy_turn_id)
-        async with self.send_lock:
-            await self.websocket.send_bytes(data)
-
     async def interrupt_playback(self, reason: str) -> bool:
         """Stop the active turn and any speakers; the single owner of the
         speak-generation bump that keeps stale TTS audio off the wire.
@@ -3503,8 +2989,6 @@ class VoiceConnection:
                 invalidate(self.speak_generation, reason)
             else:  # compatibility for injected device fakes
                 self.native_speaker.flush(reason=reason)
-        self.eager_turn_text = None
-        self.clear_pending_barge_in()
         if self.active_turn_id is not None:
             self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
         self.active_turn_id = None
@@ -3557,11 +3041,6 @@ class VoiceConnection:
                 await self.client.abort(self.fork_session_id)
             except Exception as exc:  # noqa: BLE001 - abort is best-effort during barge-in.
                 self.logger.write("turn.abort.error", session_id=self.fork_session_id, error=repr(exc))
-
-    async def barge_in(self, reason: str) -> None:
-        await self.interrupt_playback(reason)
-        await self.abort_fork_turn()
-        await self.send_json({"type": "barge_in", "reason": reason})
 
     async def maybe_wait_for_compaction(self, turn_id: int) -> None:
         if not self.compaction_task or self.compaction_task.done():
@@ -4125,9 +3604,7 @@ class SidepodConnection(VoiceConnection):
         if self.native_audio_engine:
             await self.native_audio_engine.close()
             self.native_audio_engine = None
-        # The parent's legacy `stopped` message dies at the translation seam;
-        # the v0 ack is handle_stop's job.
-        await super().stop()
+        await self.delete_voice_fork()
         self.protocol_turn_id = ""
         self.pending_turn_id = None
         self.last_interim_transcript = ""
@@ -4407,9 +3884,12 @@ class SidepodConnection(VoiceConnection):
             # reply must never be reported as successfully complete.
             await self.flush_pending_completions(reason="new_turn", ready_only=True)
         outbound = self.translate_to_v0(payload)
-        if outbound is None:
-            self.logger.write("sidepod.lane.internal", message_type=payload.get("type"))
+        if outbound is INTERNAL_EVENT_HANDLED:
             return
+        if outbound is None:
+            self.logger.write("sidepod.lane.unknown", message_type=payload.get("type"))
+            return
+        assert isinstance(outbound, dict)
         check = check_sidepod_event(outbound)
         if not check.ok:
             self.logger.write(
@@ -4420,7 +3900,7 @@ class SidepodConnection(VoiceConnection):
             return
         await super().send_json(outbound)
 
-    def translate_to_v0(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+    def translate_to_v0(self, payload: dict[str, Any]) -> dict[str, Any] | object | None:
         message_type = str(payload.get("type") or "")
         # v0-native payloads (lane handlers and base-class issue plumbing both
         # emit them) pass through; the discriminator against same-named legacy
@@ -4436,18 +3916,18 @@ class SidepodConnection(VoiceConnection):
             latency_ms = payload.get("latency_ms")
             if seam and isinstance(latency_ms, (int, float)):
                 seam.latency["firstAssistantTextMs"] = latency_ms
-            return None
+            return INTERNAL_EVENT_HANDLED
         if message_type == "tts.first_audio":
             return self.translate_tts_first_audio(payload)
         if message_type == "turn.complete":
-            return self.translate_turn_complete(payload)
+            return self.translate_turn_complete(payload) or INTERNAL_EVENT_HANDLED
         if message_type in ("turn.error", "turn.timeout"):
             return self.translate_turn_failure(payload)
         if message_type == "opencode.stream.fallback":
             seam = self.turn_seams.get(int(payload.get("turn_id") or 0))
             if seam:
                 seam.stream_source = "poll_after_event" if payload.get("prompt_sent") else "poll"
-            return None
+            return INTERNAL_EVENT_HANDLED
         if message_type == "error":
             return voice_bridge_issue_payload(
                 capability="sidepod_transport",
@@ -4456,6 +3936,8 @@ class SidepodConnection(VoiceConnection):
                 debug_ref=str(self.logger.run_dir),
                 voice_lane_id=self.voice_lane_id,
             )
+        if message_type in INTERNAL_ONLY_ENGINE_EVENTS:
+            return INTERNAL_EVENT_HANDLED
         return None
 
     def lane_turn_id(self, legacy_id: int) -> str:
@@ -4703,12 +4185,6 @@ class DeepgramFluxSession:
             await self.transport.close()
             self.transport = None
             raise
-
-    async def send_audio(self, data: bytes) -> None:
-        # Compatibility coroutine for browser callers; submit itself is
-        # synchronous and never awaits network I/O.
-        if self.transport:
-            self.transport.submit(data)
 
     async def close(self) -> None:
         if self.transport:

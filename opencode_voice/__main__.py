@@ -15,6 +15,7 @@ from typing import Any
 import uvicorn
 
 from opencode_voice.config import (
+    ModelRef,
     VoiceConfig,
     load_local_dotenv,
     load_voice_agent_prompt,
@@ -99,9 +100,6 @@ def main(argv: list[str] | None = None) -> int:
         tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "deepgram",
         flux_eager_eot_threshold=None,
         voice_duplex=args.voice_duplex,
-        barge_in_confirm_sec=args.barge_in_confirm_sec,
-        barge_in_min_chars=args.barge_in_min_chars,
-        playback_mute_sec=args.playback_mute_sec,
         event_completion_grace_sec=args.event_completion_grace_sec,
         opencode_agent=args.agent,
         voice_agent_prompt_path=args.voice_agent_prompt,
@@ -207,24 +205,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--barge-in-confirm-sec",
-        type=float,
-        default=2.0,
-        help="How long a speech.start during playback pauses audio while waiting for a transcript.",
-    )
-    parser.add_argument(
-        "--barge-in-min-chars",
-        type=int,
-        default=4,
-        help="Transcripts shorter than this during playback resume audio instead of interrupting.",
-    )
-    parser.add_argument(
-        "--playback-mute-sec",
-        type=float,
-        default=0.0,
-        help="Deprecated startup STT gate (default disabled); timed AEC render/capture is used instead.",
-    )
-    parser.add_argument(
         "--event-completion-grace-sec",
         type=float,
         default=0.6,
@@ -241,7 +221,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def run_doctor_cli(args: argparse.Namespace, model: "ModelRef") -> int:
+def run_doctor_cli(args: argparse.Namespace, model: ModelRef) -> int:
     from opencode_voice import doctor as doctor_mod
 
     url = args.opencode_url or os.environ.get("OPENCODE_VOICE_OPENCODE_URL") or detect_opencode_url()
@@ -267,7 +247,7 @@ def install_signal_exit_handlers() -> None:
             pass
 
 
-def preflight_startup(config: "VoiceConfig", model: "ModelRef", agent: str) -> None:
+def preflight_startup(config: VoiceConfig, model: ModelRef, agent: str) -> None:
     """Warn-only boot check: the cheap half of the doctor (reachable + voice
     agent, no round-trip) so a misconfigured server screams at startup instead
     of hanging on the first turn. Never blocks — a slow/absent server here just

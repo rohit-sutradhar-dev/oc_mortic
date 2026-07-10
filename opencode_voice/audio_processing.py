@@ -1,8 +1,6 @@
 """Echo cancellation for the native audio lane.
 
-The browser lane never heard itself because getUserMedia applies WebRTC's
-echo canceller by default; the native lane captures raw PortAudio frames.
-This module gives the native lane the same processing: WebRTC's
+Native capture receives raw PortAudio frames, so this module applies WebRTC's
 AudioProcessingModule (shipped prebuilt inside the `livekit` wheel) fed with
 both the mic capture path and the TTS render path. APM frames are exactly
 10 ms, so both paths re-slice arbitrary chunk sizes.

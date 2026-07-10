@@ -93,10 +93,9 @@ Shared does not own:
 - Engine sends only v0 events to Platform; Platform must translate those events into product states and must not display protocol names directly unless in developer-only logs.
 - Unknown fields are tolerated by both tracks; unknown message types are logged and ignored.
 - Protocol changes require both-owner approval and an update to `docs/MORTIC_PROTOCOL_V0.md`. Since 2026-07-04 they also require editing `protocol/schema.ts` and regenerating the artifacts — both test suites fail on a schema edit without regeneration, and both runtimes validate at the WebSocket boundary (the Engine lane fails closed).
-- Browser-backed UI under `opencode_voice/static/` is reference-only for WP-1 and must not become the packaged product surface.
+- Historical browser benchmarks are reference data only; the repository ships no browser UI or browser capture lane.
 - Source OpenCode threads remain untouched; voice work belongs to ephemeral forks owned by Engine and rendered by Platform.
 
 ## Acceptance Note
 
 This boundary document is ready for Platform and Engine owner review. For WP-1, the user verification review is the owner acceptance gate.
-

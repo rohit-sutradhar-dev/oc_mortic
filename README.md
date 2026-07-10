@@ -86,10 +86,6 @@ a 500 ms restart guard, so a playback edge cannot re-arm the same echo.
 `TurnResumed` is compatibility-only and never flushes playback or aborts a
 turn. Eager EOT is disabled until Mortic has an isolated speculative lane.
 
-The former overlap, fuzzy-sequence, confidence, and text-length rules now run
-as shadow telemetry only. They no longer decide whether real user speech is
-discarded.
-
 Turns stream from OpenCode's `/event` feed scoped to the fork's directory. If
 the model produces no delta for three seconds, low-rate polling hedges the live
 event reader from an independently timed task; a stuck poll never blocks SSE,

@@ -10,8 +10,8 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 
 ## Repository Shape
 
-- `opencode_voice/` is the current Python/FastAPI browser-backed voice bridge. It owns OpenCode session/fork calls, Deepgram Flux STT, Deepgram Speak/Aura TTS, Mercury/OpenCode turn execution, speech filtering, compaction, and the browser mic/audio UI.
-- `opencode_mercury_sidepod/` is a native OpenCode TUI sidebar proof. It owns a terminal-rendered Mortic panel, sprite, command deck, focus-mode experiment, transcript popup, and handoff popup. It does not yet talk to the voice bridge.
+- `opencode_voice/` is the invisible Python/FastAPI helper. It owns native capture/playout, OpenCode session/fork calls, Flux STT, provider-neutral TTS, turn execution, speech filtering, compaction, and interruption handling.
+- `opencode_mercury_sidepod/` is the native OpenCode TUI sidepod and communicates with the helper over protocol v0.
 - `docs/` contains the current PRD and execution plan.
 - `MORTIC_PLUGIN_HANDOFF.md` records the earlier bridge-plus-sidepod integration proposal. Some recommendations there are now superseded by the PRD, especially visible browser UI and packaged typed fallback.
 - `tests/test_opencode_voice.py` covers the Python bridge helpers, protocol parsers, event trackers, context estimation, Deepgram URL/message parsing, TTS chunking, and speech filtering.
@@ -48,12 +48,7 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 
 ## Reference-Only Or Throwaway Pieces
 
-- `opencode_voice/static/index.html`, `app.js`, and `styles.css`
-  - Useful as a browser-backed technical reference for mic capture, PCM downsampling, TTS playback, status updates, and latency baseline capture.
-  - Not suitable for packaged v1 UI because it shows a browser shell, session picker, typed fallback prompt, iframe, model labels, TTS model labels, and thread management.
-- Current WebSocket control/event names in `opencode_voice/server.py` and `static/app.js`
-  - Current names include `audio.start`, `audio.stop`, `turn.start`, `fork.ready`, `tts.first_audio`, `barge_in`, and generic `error`.
-  - These need mapping or replacement with the PRD v0 protocol: `start`, `ptt.start`, `ptt.stop`, `live.set`, `refresh`, `barge_in`, `confirm.response`, plus `ready`, `listening`, `transcript`, `thinking`, `assistant.delta`, `speaking`, `complete`, `interrupted`, and `voice_bridge_issue`.
+- The old browser shell and `/ws/voice` transport were removed after the native helper and protocol-v0 sidepod became authoritative. Historical benchmark runs remain available without shipping a second UI or capture lane.
 - Current sidepod command deck in `opencode_mercury_sidepod/src/tui.js` (this block updated 2026-07-03; the original inventory notes are resolved)
   - `last`/`items` diagnostics rows: removed.
   - `Clear Lane` is `[X]`; confirmed `Refresh` lands with the engine integration (MOR-96).
@@ -117,9 +112,8 @@ Start from:
 
 Engine-owned next work:
 
-- Extract the browser-backed bridge into an invisible local helper or helper-compatible service.
-- Replace browser mic capture with OS-native capture or a documented native capture plan.
-- Adapt the current socket events to v0 protocol messages.
+- Harden the invisible local helper and native audio engine.
+- Continue simplifying internal engine events behind protocol v0.
 - Preserve fork creation/cleanup, event-first streaming, polling fallback, barge-in, compaction, and speech filtering.
 - Ensure helper health emits `ready` or `voice_bridge_issue` without raw provider/model/runtime details.
 - Add safe lifecycle logs and latency metrics without secrets.
@@ -141,8 +135,8 @@ Shared-owned next work:
 
 ## Latency-Sensitive Paths
 
-- Browser reference capture path
-  - `static/app.js` uses `getUserMedia`, `createScriptProcessor(4096, 1, 1)`, downsampling to 16 kHz, and PCM16 frames over WebSocket. This is the current latency reference, not the packaged path.
+- Native capture path
+  - `PersistentDeviceAudioEngine` owns synchronized device capture/playout; recorded live runs provide the latency baseline.
 - Deepgram STT turn-taking
   - `FluxTransport` packetizes capture into exact 80 ms Flux v2 packets without blocking the device callback, bounds audio freshness to 500 ms, reconnects with epoch fencing, and uses Happy Eyeballs for broken single-family routes. Uvicorn is pinned to standard asyncio because uvloop rejects those connection options before network I/O.
   - Eager EOT is disabled. `TurnResumed` is parsed for compatibility and has no playback/OpenCode side effect.
@@ -163,19 +157,19 @@ Shared-owned next work:
 
 ## Gaps And Risks To Track
 
-- Protocol mismatch: **resolved 2026-07-04** — `SidepodConnection` translates all legacy engine vocabulary to v0 at a single `send_json` seam, validated against the generated schema (fail closed). The browser lane keeps its legacy names by design.
-- Packaged UI mismatch: current browser UI exposes thread selection, typed fallback, model/provider details, and visible browser/iframe surface, all non-goals for packaged v1. Browser surface stays reference-only.
+- Protocol mismatch: **resolved 2026-07-04** — `SidepodConnection` translates internal engine events to v0 at a single `send_json` seam, validated against the generated schema (fail closed).
+- Packaged UI mismatch: **resolved** — the helper ships no browser UI, typed fallback, session picker, provider labels, or iframe surface.
 - Helper mismatch: **resolved for the sidepod lane 2026-07-04** — the plugin launcher discovers or spawns `mortic-helper` (`--no-managed`, pinned to the focused thread's OpenCode server) and the lane runs end to end over `/ws/sidepod`.
 - Native mic gap: **hardened 2026-07-10** — `PersistentDeviceAudioEngine` drives a synchronized 10 ms duplex clock with timed AEC reference, bounded jitter buffering, generation fencing, and explicit half-duplex fallback. Live spoken-turn/soak verification remains an owner gate.
 - Sidepod source gap: MOR-166 added `opencode_mercury_sidepod/src/`; the package now ships `src/` directly (no build step, no `dist/`).
 - Sidepod test gap: MOR-166 adds package fixture tests; deeper TUI snapshot tests are still needed before larger visual changes.
 - Source-thread safety gap: fork cleanup exists, but tests do not yet prove source OpenCode thread remains untouched after a voice turn.
-- Secret/logging audit gap: automated tests cover config metadata fingerprints, monotonic correlation fields, provider error shaping, and content/secret redaction; consented capture retention and live log review remain beta gates.
+- Secret/logging audit gap: automated tests cover safe config metadata, monotonic event timing, provider error categories, and content/secret redaction; live log review remains a beta gate.
 
 ## Ticket Linkage
 
 - `MOR-88`: use the native sidepod proof as the starting shell, remove diagnostics/provider labels, and align the command deck with the PRD.
 - `MOR-107`: reuse the Python bridge orchestration, OpenCode client, Deepgram sessions, fork handling, barge-in, compaction, and filtering as helper internals.
-- `MOR-129`: capture the current browser-backed path as the reference latency baseline using first transcript, first assistant text, first TTS audio, total turn, retry/fallback source, and test conditions.
+- `MOR-129`: use recorded native-helper runs as the latency baseline for first transcript, first assistant text, first device audio, total turn, retry/fallback source, and test conditions.
 - `MOR-135`: freeze the v0 protocol and explicitly map or replace current bridge event names.
 - `MOR-136`: build shared fixtures from the existing unit-tested event shapes plus new PRD v0 examples.

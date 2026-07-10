@@ -13,7 +13,6 @@ from opencode_voice.deepgram import build_flux_url, parse_flux_message
 
 WebSocketConnector = Callable[[str, dict[str, str]], Awaitable[Any]]
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
-TelemetryCallback = Callable[[dict[str, Any]], None]
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -98,7 +97,6 @@ class FluxTransport:
         on_event: EventCallback,
         *,
         connector: WebSocketConnector = connect_flux_websocket,
-        on_telemetry: TelemetryCallback | None = None,
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
@@ -112,7 +110,6 @@ class FluxTransport:
         self.options = options
         self._on_event = on_event
         self._connector = connector
-        self._on_telemetry = on_telemetry
         self._clock = clock
         self._sleep = sleep
         samples_per_packet = samples_numerator // 1000
@@ -201,7 +198,6 @@ class FluxTransport:
             while len(self._packets) >= self.max_packets:
                 self._packets.popleft()
                 self._dropped_overflow_packets += 1
-                self._telemetry("flux.audio.drop", reason="queue_overflow", packets=1)
             self._packets.append(_AudioPacket(packet_data, stamp))
             self._submitted_packets += 1
             produced = True
@@ -320,7 +316,6 @@ class FluxTransport:
                     self._send_failures += 1
                     self._dropped_uncertain_packets += 1
                     self._last_error = repr(exc)
-                    self._telemetry("flux.audio.drop", reason="send_uncertain", packets=1)
                     await self._emit(
                         "flux.transport.send_error",
                         epoch=self._epoch,
@@ -423,7 +418,6 @@ class FluxTransport:
             dropped += 1
         if dropped:
             self._dropped_stale_packets += dropped
-            self._telemetry("flux.audio.drop", reason="stale", packets=dropped)
 
     async def _emit(self, event_type: str, **detail: Any) -> None:
         await self._emit_event({"type": event_type, **detail})
@@ -433,20 +427,4 @@ class FluxTransport:
             await self._on_event(event)
         except Exception:
             # Application diagnostics must not terminate capture/reconnect.
-            pass
-
-    def _telemetry(self, event_type: str, **detail: Any) -> None:
-        if self._on_telemetry is None:
-            return
-        try:
-            self._on_telemetry(
-                {
-                    "type": event_type,
-                    "epoch": self._epoch,
-                    "queued_packets": len(self._packets),
-                    "queued_audio_ms": len(self._packets) * self.options.packet_ms,
-                    **detail,
-                }
-            )
-        except Exception:
             pass

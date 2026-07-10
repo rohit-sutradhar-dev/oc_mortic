@@ -174,44 +174,9 @@ class VoiceConfig:
     # gate the mic while TTS is audible. "full": raw passthrough (headphones).
     # "half": force the gate.
     voice_duplex: str = "auto"
-    # speech.start while TTS is audible pauses playback and waits this long
-    # AFTER the last speech signal (interim transcript / resume) before
-    # deciding interrupt vs false alarm; transcripts shorter than
-    # barge_in_min_chars resume playback instead of interrupting. Measuring
-    # from the last speech signal (not from speech.start) keeps the pause held
-    # through a long utterance instead of releasing playback over the speaker
-    # mid-sentence.
-    barge_in_confirm_sec: float = 2.0
-    # Hard ceiling on a held pause: even if speech signals keep arriving, a
-    # pending barge-in dismisses this long after it began, so leaked echo that
-    # STT keeps re-transcribing can never freeze playback indefinitely.
-    barge_in_max_sec: float = 6.0
-    barge_in_min_chars: int = 4
-    # STT hears silence for this long at the start of each playback burst:
-    # the echo canceller converges during roughly the first second of new
-    # audio, and that leak is what fired spurious barge-ins and phantom
-    # captions. The canceller still adapts (mic frames keep flowing through
-    # it); only STT is deaf during the window.
-    playback_mute_sec: float = 0.0
-    # Audio-domain echo backstop: on an ambiguous pending barge-in, compare
-    # the mic signal against the render reference we actually played and
-    # dismiss as echo when they correlate. Costs a few ms once per pending
-    # transcript; disable to fall back to the text-only gates.
-    echo_probe_enabled: bool = True
-    # Dump the mic + render PCM of each resolved pending barge-in to
-    # runs/.../barge_pcm/ so a bad decision can be replayed offline against a
-    # different floor or algorithm (the rings are otherwise in-memory only, so
-    # a live incident is unrecoverable). Off by default — it writes raw
-    # microphone audio; the owner enables it for a debugging session. runs/ is
-    # gitignored, so nothing leaves the machine.
-    echo_capture_enabled: bool = False
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False
-
-    @property
-    def browser_url(self) -> str:
-        return f"http://{self.bridge_host}:{self.bridge_port}"
 
     @property
     def has_deepgram_key(self) -> bool:

@@ -124,15 +124,12 @@ class FluxTransportTests(unittest.IsolatedAsyncioTestCase):
         await transport.close()
 
     async def test_queue_keeps_only_the_newest_four_hundred_eighty_ms(self) -> None:
-        telemetry: list[dict[str, Any]] = []
-
         async def no_event(_: dict[str, Any]) -> None:
             return None
 
         transport = FluxTransport(
             FluxTransportOptions(api_key="test", max_fresh_audio_ms=500),
             no_event,
-            on_telemetry=telemetry.append,
         )
         packet = b"\x00" * transport.packet_bytes
         for _ in range(10):
@@ -142,12 +139,10 @@ class FluxTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.queued_packets, 6)
         self.assertEqual(snapshot.queued_audio_ms, 480)
         self.assertEqual(snapshot.dropped_overflow_packets, 4)
-        self.assertTrue(any(item["reason"] == "queue_overflow" for item in telemetry))
         await transport.close()
 
-    async def test_stale_audio_is_dropped_with_telemetry(self) -> None:
+    async def test_stale_audio_is_counted_in_health_snapshot(self) -> None:
         clock = FakeClock()
-        telemetry: list[dict[str, Any]] = []
 
         async def no_event(_: dict[str, Any]) -> None:
             return None
@@ -155,7 +150,6 @@ class FluxTransportTests(unittest.IsolatedAsyncioTestCase):
         transport = FluxTransport(
             FluxTransportOptions(api_key="test"),
             no_event,
-            on_telemetry=telemetry.append,
             clock=clock,
         )
         packet = b"\x00" * transport.packet_bytes
@@ -167,7 +161,6 @@ class FluxTransportTests(unittest.IsolatedAsyncioTestCase):
         snapshot = transport.health_snapshot()
         self.assertEqual(snapshot.dropped_stale_packets, 2)
         self.assertEqual(snapshot.queued_packets, 1)
-        self.assertTrue(any(item["reason"] == "stale" and item["packets"] == 2 for item in telemetry))
         await transport.close()
 
     async def test_stalled_send_is_timed_out_dropped_and_reconnected(self) -> None:

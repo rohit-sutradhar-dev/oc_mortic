@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,7 +11,6 @@ from opencode_voice.telemetry import RunClock
 
 CONTENT_SUMMARY_FIELDS = {"audio", "delta", "prompt", "raw", "text", "transcript"}
 EVENT_LOG_ENV = "MORTIC_HELPER_EVENT_LOG"
-RAW_AUDIO_RETENTION_SEC = 7 * 24 * 60 * 60
 
 
 def helper_event_log_path() -> str | None:
@@ -21,31 +19,6 @@ def helper_event_log_path() -> str | None:
 
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def prune_expired_audio_captures(
-    root: str | Path,
-    *,
-    now: float | None = None,
-    retention_sec: int = RAW_AUDIO_RETENTION_SEC,
-) -> int:
-    """Delete only consented local capture artifacts older than retention."""
-
-    cutoff = (time.time() if now is None else now) - retention_sec
-    removed = 0
-    for capture_dir in Path(root).glob("*/barge_pcm"):
-        for path in capture_dir.iterdir():
-            try:
-                if path.is_file() and path.stat().st_mtime < cutoff:
-                    path.unlink()
-                    removed += 1
-            except OSError:
-                continue
-        try:
-            capture_dir.rmdir()
-        except OSError:
-            pass
-    return removed
 
 
 def safe_log_fields(value: Any, key: str | None = None) -> Any:
@@ -76,7 +49,6 @@ def summarize_content(value: Any) -> dict[str, int | str]:
 
 class RunLogger:
     def __init__(self, root: str | Path = "runs/voice", *, clock: RunClock | None = None) -> None:
-        prune_expired_audio_captures(root)
         self.run_dir = Path(root) / utc_timestamp()
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.run_dir / "events.jsonl"
