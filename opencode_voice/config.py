@@ -144,7 +144,7 @@ class VoiceConfig:
     run_root: str = "runs/voice"
     deepgram_stt_model: str = "flux-general-en"
     deepgram_tts_model: str = "aura-2-thalia-en"
-    deepgram_sample_rate: int = 48_000
+    deepgram_sample_rate: int = 16_000
     # STT stays on Deepgram Flux regardless of this setting; it only selects
     # which service synthesizes TTS audio.
     tts_provider: str = "deepgram"

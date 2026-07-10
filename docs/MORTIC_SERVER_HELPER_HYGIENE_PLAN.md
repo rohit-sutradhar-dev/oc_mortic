@@ -4,6 +4,8 @@ Status: revised after live debug review
 Date: 2026-07-08
 Scope: OpenCode server ownership, Mortic helper ownership, `voice-build` prompt isolation, crash cleanup, and minimal v1 onboarding hygiene.
 
+Implementation follow-up: [Mortic Managed Voice Architecture](MORTIC_MANAGED_VOICE_ARCHITECTURE.md) records the runtime that landed in `12af132`, its invariants, and the planning consequences. This plan remains the source for the original live evidence, mandatory Phase 0 smokes, and deferred scope.
+
 ## Plain-English Correction
 
 The first draft had one big hidden assumption: it treated the visible OpenCode TUI as something the helper could always reach over HTTP. Live debugging disproved that.

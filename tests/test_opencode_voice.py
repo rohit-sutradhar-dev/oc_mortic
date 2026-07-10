@@ -44,6 +44,7 @@ class MercuryConfigTests(unittest.TestCase):
 
         self.assertEqual(config.flux_eager_eot_threshold, 0.6)
         self.assertEqual(config.voice_duplex, "auto")
+        self.assertEqual(config.deepgram_sample_rate, 16_000)
 
     def test_mercury_is_used_for_all_opencode_slots(self) -> None:
         config = render_opencode_config(ModelRef(provider_id="inception", model_id="mercury-2"))
