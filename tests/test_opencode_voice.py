@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import tempfile
@@ -26,7 +25,7 @@ from opencode_voice.config import (
 from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import SSEParser
-from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, CartesiaSpeakSession, create_app, helper_readiness_issues
+from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, create_app, helper_readiness_issues
 from opencode_voice.state import (
     AssistantTextTracker,
     OpenCodeEventTurnTracker,
@@ -42,9 +41,12 @@ class MercuryConfigTests(unittest.TestCase):
     def test_latency_and_duplex_defaults(self) -> None:
         config = VoiceConfig(opencode_url="http://127.0.0.1:1")
 
-        self.assertEqual(config.flux_eager_eot_threshold, 0.6)
+        self.assertIsNone(config.flux_eager_eot_threshold)
         self.assertEqual(config.voice_duplex, "auto")
         self.assertEqual(config.deepgram_sample_rate, 16_000)
+        self.assertEqual(config.tts_sample_rate, 16_000)
+        self.assertEqual(config.device_sample_rate, 48_000)
+        self.assertEqual(config.first_text_timeout_sec, 20.0)
 
     def test_mercury_is_used_for_all_opencode_slots(self) -> None:
         config = render_opencode_config(ModelRef(provider_id="inception", model_id="mercury-2"))
@@ -233,6 +235,9 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertFalse(payload["ready"])
         self.assertEqual(payload["workspace_dir"], "/tmp/worktree")
         self.assertEqual(payload["opencode"]["reachable"], False)
+        self.assertEqual(payload["deepgram"]["sample_rate"], 16_000)
+        self.assertEqual(payload["deepgram"]["tts_sample_rate"], 16_000)
+        self.assertEqual(payload["cartesia"]["sample_rate"], 16_000)
         self.assertEqual(payload["issues"][0]["diagnosticCode"], "opencode_unreachable")
         self.assertEqual(payload["issues"][0]["safeDetail"], "Mortic could not reach its OpenCode voice server.")
 
@@ -921,97 +926,6 @@ class DeepgramProtocolTests(unittest.TestCase):
         self.assertTrue(end["is_final"])
 
 
-class FakeCartesiaWebSocket:
-    """Records sent requests and lets the test drive incoming messages on its
-    own schedule, so context timing is fully controlled without a real
-    socket or the network."""
-
-    def __init__(self) -> None:
-        self.sent: list[dict[str, Any]] = []
-        self._incoming: asyncio.Queue[str] = asyncio.Queue()
-
-    async def send(self, payload: str) -> None:
-        self.sent.append(json.loads(payload))
-
-    def __aiter__(self) -> "FakeCartesiaWebSocket":
-        return self
-
-    async def __anext__(self) -> str:
-        return await self._incoming.get()
-
-    async def push_chunk(self, context_id: str, data: bytes) -> None:
-        await self._incoming.put(
-            json.dumps({"type": "chunk", "context_id": context_id, "data": base64.b64encode(data).decode()})
-        )
-
-    async def push_done(self, context_id: str) -> None:
-        await self._incoming.put(json.dumps({"type": "done", "context_id": context_id, "done": True}))
-
-    async def close(self) -> None:
-        return None
-
-
-class CartesiaProtocolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_speak_does_not_open_a_second_context_before_the_first_is_done(self) -> None:
-        # Confirmed live against the real API: Cartesia synthesizes concurrent
-        # contexts on one socket and interleaves their audio. Two in flight at
-        # once is audible as two sentences garbled together, so speak() must
-        # hold its context open (sent, streamed, done) before the next call's
-        # request goes out at all.
-        #
-        # Three concurrent calls, not two: an asyncio.Event-based gate (the
-        # first, broken version of this fix) looks correct with only two
-        # callers, because there is never more than one waiter blocked on the
-        # event at once. With three, the second and third calls both queue up
-        # behind the first — Event.set() wakes every waiter at once, so both
-        # would slip through together the instant the first context finishes.
-        # Only a real mutex (asyncio.Lock, what speak() uses below) releases
-        # exactly one waiter at a time and catches that regression here.
-        websocket = FakeCartesiaWebSocket()
-        received: list[tuple[bytes, int | None]] = []
-
-        async def on_audio(data: bytes, turn_id: int | None) -> None:
-            received.append((data, turn_id))
-
-        async def on_event(_: dict[str, Any]) -> None:
-            return None
-
-        session = CartesiaSpeakSession(
-            config=VoiceConfig(opencode_url="http://opencode.test"), on_audio=on_audio, on_event=on_event
-        )
-        session.websocket = websocket
-        session.reader_task = asyncio.create_task(session._read_loop())
-
-        tasks = [
-            asyncio.create_task(session.speak(text, turn_id=turn_id))
-            for text, turn_id in [("First.", 1), ("Second.", 2), ("Third.", 3)]
-        ]
-        await asyncio.sleep(0.01)
-        self.assertEqual(len(websocket.sent), 1, "only the first context should be requested so far")
-
-        # Each push runs a chain of hops (queue wakeup -> done_event.set() ->
-        # lock release -> next speak()'s send), so give it a real tick rather
-        # than a bare sleep(0), which only advances one hop.
-        for expected_sent_count in (2, 3):
-            context_id = websocket.sent[-1]["context_id"]
-            await websocket.push_chunk(context_id, b"\x01\x02")
-            await websocket.push_done(context_id)
-            await asyncio.sleep(0.01)
-            self.assertEqual(
-                len(websocket.sent),
-                expected_sent_count,
-                "exactly one new context should open per completed one, never two at once",
-            )
-
-        final_context_id = websocket.sent[-1]["context_id"]
-        await websocket.push_chunk(final_context_id, b"\x01\x02")
-        await websocket.push_done(final_context_id)
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
-
-        self.assertEqual([turn_id for _, turn_id in received], [1, 2, 3])
-        await session.close()
-
-
 class SpokenSequenceRatioTests(unittest.TestCase):
     SPOKEN = (
         "We just explored the repository, looking at its overall architecture, "
@@ -1210,7 +1124,14 @@ class NativeSpeakerPlaybackTests(unittest.IsolatedAsyncioTestCase):
         from opencode_voice.server import NativeSpeakerSession
 
         speaker = NativeSpeakerSession(
-            config=VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
+            # These queue mechanics use one provider frame per device frame;
+            # 16 -> 48 kHz conversion is covered by test_native_speaker.py.
+            config=VoiceConfig(
+                opencode_url="http://opencode.test",
+                run_root=tmp,
+                tts_sample_rate=48_000,
+                device_sample_rate=48_000,
+            ),
             logger=RunLogger(root=tmp),
             on_issue=self._no_issue,
         )
@@ -1228,7 +1149,7 @@ class NativeSpeakerPlaybackTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             speaker = self.make_speaker(tmp, maxsize=2)
             for index in range(20):
-                self.assertTrue(await speaker.play(bytes([index]) * 320, turn_id=1))
+                self.assertTrue(await speaker.play(bytes([index]) * 960, turn_id=1))
             while speaker.played_chunks < 20:
                 await asyncio.sleep(0.001)
             await speaker.close()
@@ -1242,9 +1163,9 @@ class NativeSpeakerPlaybackTests(unittest.IsolatedAsyncioTestCase):
             # fills the queue, so the third put genuinely blocks.
             speaker = self.make_speaker(tmp, maxsize=1)
             speaker.pause()
-            await speaker.play(b"\x01" * 320, turn_id=1)
-            await speaker.play(b"\x02" * 320, turn_id=1)
-            blocked = asyncio.create_task(speaker.play(b"\x03" * 320, turn_id=1))
+            await speaker.play(b"\x01" * 960, turn_id=1)
+            await speaker.play(b"\x02" * 960, turn_id=1)
+            blocked = asyncio.create_task(speaker.play(b"\x03" * 960, turn_id=1))
             await asyncio.sleep(0.01)
             self.assertFalse(blocked.done())
 
@@ -1257,7 +1178,7 @@ class NativeSpeakerPlaybackTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             speaker = self.make_speaker(tmp, maxsize=8)
             speaker.pause()
-            await speaker.play(b"\x01" * 320, turn_id=1)
+            await speaker.play(b"\x01" * 960, turn_id=1)
             await asyncio.sleep(0.02)
             self.assertEqual(speaker.played_chunks, 0)
 

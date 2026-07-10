@@ -46,7 +46,7 @@ test), and the LLM/STT/TTS keys with their source. A server missing
 accepts turns then silently hangs — the doctor turns that into a loud FAIL. The
 same reachable + agent check runs warn-only at every helper start.
 
-`--managed-opencode` starts a clean `opencode serve` process with a runtime config overlay for the current voice model. If a running OpenCode server is detected, managed mode borrows that server's project directory so the clean server can still see the same threads.
+`--managed-opencode` starts a clean `opencode serve` process with a runtime config overlay for the current voice model. If a running OpenCode server is detected, managed mode borrows that server's project directory so the clean server can still see the same threads. The managed Bun process receives its IPv4 preference through Bun's standalone-executable `BUN_OPTIONS` channel (not OpenCode CLI arguments), so an advertised-but-broken IPv6 route cannot silently stall Mercury; Python provider sockets use Happy Eyeballs and still retain IPv6 fallback. The helper pins Uvicorn to standard asyncio because uvloop does not accept Python's Happy Eyeballs connection options. Managed-child output is forwarded to the helper log (`MORTIC_HELPER_LOG`, default `/tmp/mortic-helper-plugin.log`) for startup diagnosis.
 
 Useful options:
 
@@ -54,12 +54,10 @@ Useful options:
 mortic-helper --help
 mortic-helper --managed-opencode --opencode-dir "/path/to/project"
 mortic-helper --context-threshold 70000 --model-variant low
-mortic-helper --eager-eot-threshold 0.7   # default 0.6; pass 0 to disable
 mortic-helper --tts-provider cartesia     # switch TTS off Deepgram (STT stays on Flux)
-mortic-helper --voice-duplex full          # headphones: skip echo protection
-mortic-helper --barge-in-confirm-sec 2.0  # pause window while a mid-playback voice confirms
-mortic-helper --barge-in-min-chars 4      # shorter transcripts resume playback instead
-mortic-helper --playback-mute-sec 0.6     # STT deaf window at each playback start; 0 disables
+mortic-helper --voice-duplex half          # explicit safety fallback / push-to-interrupt
+mortic-helper --device-sample-rate 48000  # native device/AEC clock
+mortic-helper --tts-sample-rate 16000     # provider PCM clock (resampled to device rate)
 mortic-helper --event-completion-grace-sec 0.6  # wait for trailing text before polling; 0 disables
 ```
 
@@ -69,33 +67,33 @@ state; the two never report the same thing.
 
 ## Echo Protection
 
-The native lane echo-cancels the microphone the way a browser does: WebRTC's
-audio processing module (prebuilt in the `livekit` wheel) runs on the capture
-path with TTS playback fed in as the render reference, so the assistant never
-hears itself and voice barge-in stays usable on open speakers.
+The native lane uses one persistent, synchronized 48 kHz duplex device stream.
+Every 10 ms device tick feeds the exact rendered frame to WebRTC AEC before its
+paired capture frame, including timed silence during pause/underflow. Provider
+TTS is resampled independently; Flux remains fixed at 16 kHz in exact 80 ms
+network packets.
 `--voice-duplex` controls the behavior: `auto` (default) uses the echo
-canceller and degrades to a half-duplex silence gate if the native module is
-unavailable, `full` passes raw mic audio (headphone users), `half` forces the
-gate (mute key interrupts while the assistant speaks).
+canceller and explicitly degrades to a half-duplex silence gate if synchronized
+duplex cannot open, `full` passes raw mic audio (headphone users), and `half`
+forces the gate (manual interruption remains available).
 
-Two behaviors keep the loop stable on open speakers. A voice detected while
-the assistant is audible **pauses** playback rather than killing the turn;
-a real transcript within `--barge-in-confirm-sec` commits the interruption,
-anything shorter than `--barge-in-min-chars` (echo residue, stray noise)
-resumes playback where it left off. And when Flux fires an eager end-of-turn
-followed by the confirming final one for the same words, the final confirms
-the already-running turn instead of restarting it.
+An episode-owned interruption controller keeps the loop stable on open
+speakers. Candidate speech ducks output by 18 dB over 20 ms without stopping
+the device clock. At 500 ms, render correlation at or above 0.75 and the narrow
+backchannels `uh-huh`, `mm-hmm`, and `mhm` are suppressed; other speech commits
+the interruption. The suppressed episode remains owned through final EOT plus
+a 500 ms restart guard, so a playback edge cannot re-arm the same echo.
+`TurnResumed` is compatibility-only and never flushes playback or aborts a
+turn. Eager EOT is disabled until Mortic has an isolated speculative lane.
 
-Echo that leaks past the canceller is classified in layers: exact word
-overlap with what the assistant just said, ordered character-level sequence
-matching (STT transcribes mangled echo with substituted words but in the
-assistant's word order), and — for text scores too ambiguous to call — a
-comparison of the mic signal against the exact audio the speaker played
-(spectral band-envelope correlation; disable with `echo_probe_enabled` off).
+The former overlap, fuzzy-sequence, confidence, and text-length rules now run
+as shadow telemetry only. They no longer decide whether real user speech is
+discarded.
 
-Turns stream from OpenCode's `/event` feed scoped to the fork's directory
-(forks inherit the source thread's directory; an unscoped subscription never
-sees their events and every turn would pay the poll-fallback timeout).
+Turns stream from OpenCode's `/event` feed scoped to the fork's directory. If
+the model produces no delta for three seconds, low-rate polling hedges the live
+event reader from an independently timed task; a stuck poll never blocks SSE,
+and message-ID deduplication prevents repeated text or speech.
 
 ## Helper Distribution Contract
 

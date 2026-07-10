@@ -350,6 +350,91 @@ class OpenCodeEventTurnTracker:
         )
 
 
+class HybridOpenCodeTurnTracker:
+    """Merge SSE and polling observations without emitting text twice.
+
+    OpenCode's event and messages endpoints describe the same assistant
+    message with different timing.  The message id is the identity boundary;
+    each source may advance that message's text, but only the previously
+    unseen suffix is emitted.  This lets polling hedge a quiet SSE connection
+    without cancelling it or replaying assistant text/TTS.
+    """
+
+    def __init__(self, session_id: str, before_messages: list[dict[str, Any]]) -> None:
+        existing_ids = {
+            str((message.get("info") or {}).get("id") or "")
+            for message in before_messages
+            if isinstance(message, dict)
+        }
+        self.events = OpenCodeEventTurnTracker(session_id, existing_ids)
+        self.snapshots = AssistantTextTracker(before_messages)
+        self.text_by_message: dict[str, str] = {}
+        self.completed_by_message: set[str] = set()
+        self.error_by_message: dict[str, Any] = {}
+        self.active_message_id: str | None = None
+
+    def update_event(self, event: dict[str, Any]) -> AssistantUpdate:
+        return self._merge(self.events.update(event))
+
+    def update_messages(self, messages: list[dict[str, Any]]) -> AssistantUpdate:
+        return self._merge(self.snapshots.update(messages))
+
+    @property
+    def stale_idles(self) -> int:
+        return self.events.stale_idles
+
+    def _merge(self, update: AssistantUpdate) -> AssistantUpdate:
+        message_id = update.message_id
+        if not message_id:
+            return AssistantUpdate(
+                deltas=[],
+                completed=False,
+                full_text="",
+                message_id=None,
+                error=None,
+            )
+
+        self.active_message_id = message_id
+        old = self.text_by_message.get(message_id, "")
+        observed = update.full_text
+        if not observed and update.deltas:
+            observed = old + "".join(update.deltas)
+
+        delta = ""
+        if observed.startswith(old):
+            delta = observed[len(old) :]
+            self.text_by_message[message_id] = observed
+        elif old.startswith(observed):
+            # A lagging snapshot is harmless.
+            observed = old
+        else:
+            # Conflicting rewrites are possible when a provider edits an
+            # already-streamed part.  Never replay the common prefix; retain
+            # the longest observation and let the final fetch be canonical.
+            common = 0
+            for left, right in zip(old, observed):
+                if left != right:
+                    break
+                common += 1
+            if len(observed) > len(old):
+                delta = observed[max(common, len(old)) :]
+                self.text_by_message[message_id] = observed
+            else:
+                observed = old
+
+        if update.completed:
+            self.completed_by_message.add(message_id)
+        if update.error is not None:
+            self.error_by_message[message_id] = update.error
+        return AssistantUpdate(
+            deltas=[delta] if delta else [],
+            completed=message_id in self.completed_by_message,
+            full_text=self.text_by_message.get(message_id, observed),
+            message_id=message_id,
+            error=self.error_by_message.get(message_id),
+        )
+
+
 def event_properties(event: dict[str, Any]) -> dict[str, Any]:
     properties = event.get("properties")
     if isinstance(properties, dict):

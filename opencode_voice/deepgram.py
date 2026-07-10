@@ -56,6 +56,12 @@ def parse_flux_message(raw: str) -> dict[str, Any]:
         "is_final": bool(payload.get("is_final") or payload.get("speech_final") or kind == "EndOfTurn"),
         "raw": payload,
     }
+    # Flux supplies a stable index for all events belonging to one speech
+    # episode.  Keep it at the normalized layer so reconnect fencing and the
+    # interruption controller never have to inspect provider-shaped `raw`.
+    turn_index = payload.get("turn_index")
+    if isinstance(turn_index, int):
+        normalized["turn_index"] = turn_index
     words = payload.get("words")
     if isinstance(words, list) and words:
         confidences = [

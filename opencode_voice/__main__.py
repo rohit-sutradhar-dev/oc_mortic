@@ -72,7 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.tts_model is not None:
         model_overrides["deepgram_tts_model"] = args.tts_model
     if args.sample_rate is not None:
+        # Backwards-compatible alias: --sample-rate now controls Flux only.
+        # TTS and device clocks have explicit flags below.
         model_overrides["deepgram_sample_rate"] = args.sample_rate
+    if args.tts_sample_rate is not None:
+        model_overrides["tts_sample_rate"] = args.tts_sample_rate
+    if args.device_sample_rate is not None:
+        model_overrides["device_sample_rate"] = args.device_sample_rate
     if args.cartesia_tts_model is not None:
         model_overrides["cartesia_tts_model"] = args.cartesia_tts_model
     if args.cartesia_voice_id is not None:
@@ -91,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         # directly; the env var (settable in .env like the API keys) is the
         # only way to configure it there.
         tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "deepgram",
-        flux_eager_eot_threshold=args.eager_eot_threshold or None,
+        flux_eager_eot_threshold=None,
         voice_duplex=args.voice_duplex,
         barge_in_confirm_sec=args.barge_in_confirm_sec,
         barge_in_min_chars=args.barge_in_min_chars,
@@ -118,7 +124,18 @@ def main(argv: list[str] | None = None) -> int:
     preflight_startup(config, model, args.agent)
     app = create_app(config)
     try:
-        uvicorn.run(app, host=config.bridge_host, port=config.bridge_port, log_level=args.log_level)
+        # Provider WebSockets rely on asyncio's Happy Eyeballs support. Uvicorn
+        # otherwise auto-selects uvloop when installed, but uvloop 0.21 rejects
+        # `happy_eyeballs_delay` / `interleave` before any network attempt.
+        # Keep the helper on the standard loop so the connector used in the
+        # live sidepod process matches the verified standalone transport.
+        uvicorn.run(
+            app,
+            host=config.bridge_host,
+            port=config.bridge_port,
+            log_level=args.log_level,
+            loop="asyncio",
+        )
     finally:
         if opencode_process:
             terminate_managed_process(opencode_process)
@@ -158,7 +175,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sample-rate",
         type=int,
         default=None,
-        help="PCM sample rate for STT and TTS. Defaults to VoiceConfig.deepgram_sample_rate.",
+        help="Flux STT PCM sample rate. Defaults to 16000.",
+    )
+    parser.add_argument("--tts-sample-rate", type=int, default=None, help="Provider TTS PCM sample rate (default 16000).")
+    parser.add_argument(
+        "--device-sample-rate", type=int, default=None, help="Preferred native duplex device rate (default 48000)."
     )
     parser.add_argument(
         "--tts-provider",
@@ -174,12 +195,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--cartesia-voice-id", default=None, help="Cartesia voice id. Defaults to VoiceConfig.cartesia_voice_id."
-    )
-    parser.add_argument(
-        "--eager-eot-threshold",
-        type=float,
-        default=0.6,
-        help="Flux eager end-of-turn threshold (default 0.6; pass 0 to disable).",
     )
     parser.add_argument(
         "--voice-duplex",
@@ -206,8 +221,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--playback-mute-sec",
         type=float,
-        default=0.6,
-        help="STT hears silence this long at each playback start (echo-canceller convergence window); 0 disables.",
+        default=0.0,
+        help="Deprecated startup STT gate (default disabled); timed AEC render/capture is used instead.",
     )
     parser.add_argument(
         "--event-completion-grace-sec",
@@ -336,12 +351,37 @@ def start_managed_opencode(
         voice_agent_prompt=load_voice_agent_prompt(voice_agent_prompt_path),
         voice_agent_name=voice_agent_name,
     )
+    # OpenCode is distributed as a standalone Bun executable. Runtime flags
+    # passed in argv are parsed by OpenCode's own CLI, where this flag is not a
+    # valid `serve` option. BUN_OPTIONS is Bun's supported runtime-flag channel
+    # for standalone executables. Append so existing user runtime options are
+    # preserved; the managed process remains the only process affected.
+    env["BUN_OPTIONS"] = " ".join(
+        option
+        for option in (
+            env.get("BUN_OPTIONS", "").strip(),
+            "--dns-result-order=ipv4first",
+        )
+        if option
+    )
     cwd = str(Path(opencode_dir).expanduser()) if opencode_dir else None
     process = subprocess.Popen(
-        ["opencode", "serve", "--hostname", "127.0.0.1", "--port", str(port), "--cors", "*"],
+        [
+            "opencode",
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--cors",
+            "*",
+        ],
         env=env,
         cwd=cwd,
-        stdout=subprocess.PIPE,
+        # The plugin already redirects helper stderr to MORTIC_HELPER_LOG.
+        # Forward child output there too: an unread PIPE both swallowed useful
+        # startup errors and could eventually block a long-running server.
+        stdout=sys.stderr,
         stderr=subprocess.STDOUT,
         text=True,
         start_new_session=True,

@@ -25,7 +25,8 @@ This inventory gives Platform and Engine a shared factual map of the current rep
   - `SSEParser` already has focused unit coverage for multiline and malformed frames.
 - `opencode_voice/server.py`
   - `VoiceConnection` has reusable voice-lane orchestration: source session tracking, fork creation, fork cleanup, turn ids, barge-in, event-first turn execution, polling fallback, TTS streaming, context overflow retry, and compaction.
-  - `DeepgramFluxSession` and `DeepgramSpeakSession` are reusable wrappers for current STT/TTS sockets.
+  - `DeepgramFluxSession` wraps the bounded, epoch-aware Flux sender; provider-neutral TTS lives in `tts_providers.py` with persistent Deepgram and Cartesia implementations.
+  - `device_audio.py` owns the persistent device-clocked duplex stream, render reference, bounded jitter buffer, and generation-safe playout; `interruption.py` owns pure episode decisions.
   - `EPHEMERAL_PREFIX` and keep/delete behavior are useful starting points for source-thread safety.
 - `opencode_voice/deepgram.py`
   - `build_flux_url`, `parse_flux_message`, `build_tts_url`, `TTSChunker`, `FlushLimiter`, and `SpeechTextFilter` are reusable.
@@ -143,32 +144,33 @@ Shared-owned next work:
 - Browser reference capture path
   - `static/app.js` uses `getUserMedia`, `createScriptProcessor(4096, 1, 1)`, downsampling to 16 kHz, and PCM16 frames over WebSocket. This is the current latency reference, not the packaged path.
 - Deepgram STT turn-taking
-  - `build_flux_url` uses Flux v2 with `eot_threshold`, `eot_timeout_ms`, and optional `eager_eot_threshold`.
-  - `speech.start`, `speech.transcript`, `speech.end`, and `speech.resumed` currently drive turn start/end and barge-in.
+  - `FluxTransport` packetizes capture into exact 80 ms Flux v2 packets without blocking the device callback, bounds audio freshness to 500 ms, reconnects with epoch fencing, and uses Happy Eyeballs for broken single-family routes. Uvicorn is pinned to standard asyncio because uvloop rejects those connection options before network I/O.
+  - Eager EOT is disabled. `TurnResumed` is parsed for compatibility and has no playback/OpenCode side effect.
 - OpenCode first text
   - Fast path is `/event` plus `prompt_async`.
   - `assistant.first_text` is emitted when first assistant delta arrives.
-  - Failure reasons such as stream open timeout, no initial events, and stalled stream fall back to polling.
+  - Three seconds of model silence starts an independently bounded polling producer without cancelling or blocking SSE; a message-ID tracker deduplicates hybrid observations. Managed OpenCode sets Bun's standalone-executable `BUN_OPTIONS` to prefer IPv4 without adding unsupported OpenCode CLI arguments; child output is inherited by the helper log for startup diagnosis.
 - TTS first audio
   - `TTSChunker` emits sentence-sized chunks.
-  - `DeepgramSpeakSession` sends `Speak` and rate-limited `Flush`.
-  - `tts.first_audio` is emitted when first PCM bytes arrive.
+  - `DeepgramTTSProvider` keeps a prewarmed conversation socket and uses one final `Flush/Flushed` plus `Clear/Cleared`; `CartesiaTTSProvider` keeps one continued context per turn and fences late context audio.
+  - Both provider readers feed bounded ordered delivery actors, so device-clock backpressure cannot starve WebSocket control frames. Provider `done`/failure and device drain jointly own turn completion.
+  - `tts.first_audio` is emitted on the first non-silent device frame, not provider arrival.
 - Compaction and context overflow
   - Proactive compaction can run in the background but may delay a turn via `maybe_wait_for_compaction`.
   - Context overflow triggers compact-and-retry.
 - Poll fallback
-  - Poll interval is currently 100 ms. This is a resilience path and should be marked in metrics as slower than the event path.
+  - Polling is a low-rate hedge and stream source is recorded as `event`, `poll`, or `hybrid`.
 
 ## Gaps And Risks To Track
 
 - Protocol mismatch: **resolved 2026-07-04** — `SidepodConnection` translates all legacy engine vocabulary to v0 at a single `send_json` seam, validated against the generated schema (fail closed). The browser lane keeps its legacy names by design.
 - Packaged UI mismatch: current browser UI exposes thread selection, typed fallback, model/provider details, and visible browser/iframe surface, all non-goals for packaged v1. Browser surface stays reference-only.
 - Helper mismatch: **resolved for the sidepod lane 2026-07-04** — the plugin launcher discovers or spawns `mortic-helper` (`--no-managed`, pinned to the focused thread's OpenCode server) and the lane runs end to end over `/ws/sidepod`.
-- Native mic gap: **resolved 2026-07-04** — `NativeMicSession`/`NativeSpeakerSession` (sounddevice, cherry-picked from feature-voice) drive capture/playback; a capture watchdog turns silent capture into `mic_permission_needed`. Live spoken-turn verification remains an owner test.
+- Native mic gap: **hardened 2026-07-10** — `PersistentDeviceAudioEngine` drives a synchronized 10 ms duplex clock with timed AEC reference, bounded jitter buffering, generation fencing, and explicit half-duplex fallback. Live spoken-turn/soak verification remains an owner gate.
 - Sidepod source gap: MOR-166 added `opencode_mercury_sidepod/src/`; the package now ships `src/` directly (no build step, no `dist/`).
 - Sidepod test gap: MOR-166 adds package fixture tests; deeper TUI snapshot tests are still needed before larger visual changes.
 - Source-thread safety gap: fork cleanup exists, but tests do not yet prove source OpenCode thread remains untouched after a voice turn.
-- Secret/logging audit gap: tests cover config env placeholders, but logs and raw provider/OpenCode payload fields still need a broader redaction review before beta.
+- Secret/logging audit gap: automated tests cover config metadata fingerprints, monotonic correlation fields, provider error shaping, and content/secret redaction; consented capture retention and live log review remain beta gates.
 
 ## Ticket Linkage
 

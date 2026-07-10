@@ -140,11 +140,24 @@ class VoiceConfig:
     # to polling (which loses incremental streaming). 0 restores immediate
     # fallback.
     event_completion_grace_sec: float = 0.6
+    # Bound silent model/provider connection stalls independently from the
+    # much longer total-turn budget used by legitimate long responses.
+    first_text_timeout_sec: float = 20.0
     max_turn_sec: float = 300.0
     run_root: str = "runs/voice"
     deepgram_stt_model: str = "flux-general-en"
     deepgram_tts_model: str = "aura-2-thalia-en"
+    # Flux is fixed to a narrow-band transport clock.  TTS and the physical
+    # device deliberately have separate clocks; conflating all three was the
+    # reason provider-sized chunks were being written directly to a 16 kHz
+    # PortAudio stream and then supplied to AEC ahead of playout.
     deepgram_sample_rate: int = 16_000
+    # Request narrow-band provider PCM to keep the TTS downlink usable on
+    # constrained networks. Playback is resampled locally to the independent
+    # device/AEC clock below, so the echo reference still exactly matches the
+    # 48 kHz frame handed to PortAudio.
+    tts_sample_rate: int = 16_000
+    device_sample_rate: int = 48_000
     # STT stays on Deepgram Flux regardless of this setting; it only selects
     # which service synthesizes TTS audio.
     tts_provider: str = "deepgram"
@@ -152,7 +165,10 @@ class VoiceConfig:
     cartesia_voice_id: str = "25d7abcb-4d6d-4aca-adce-8a1c85620c8b"
     cartesia_version: str = "2026-03-01"
     flux_eot_threshold: float = 0.7
-    flux_eager_eot_threshold: float | None = 0.6
+    # Eager EOT is intentionally disabled.  Flux TurnResumed is only safe as
+    # a speculative-turn rollback signal; Mortic currently has no isolated,
+    # side-effect-free speculative lane.
+    flux_eager_eot_threshold: float | None = None
     flux_eot_timeout_ms: int = 5_000
     # "auto": echo-cancel the mic when the canceller is available, otherwise
     # gate the mic while TTS is audible. "full": raw passthrough (headphones).
@@ -176,7 +192,7 @@ class VoiceConfig:
     # audio, and that leak is what fired spurious barge-ins and phantom
     # captions. The canceller still adapts (mic frames keep flowing through
     # it); only STT is deaf during the window.
-    playback_mute_sec: float = 0.6
+    playback_mute_sec: float = 0.0
     # Audio-domain echo backstop: on an ambiguous pending barge-in, compare
     # the mic signal against the render reference we actually played and
     # dismiss as echo when they correlate. Costs a few ms once per pending

@@ -1,24 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import difflib
 import importlib.util
 import json
 import os
 import re
 import time
-import uuid
+from array import array
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-import websockets
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from opencode_voice.cartesia import build_tts_url as build_cartesia_tts_url
 from opencode_voice.echo_probe import PcmRingBuffer, echo_correlation
 from opencode_voice.config import (
     VoiceConfig,
@@ -27,23 +25,39 @@ from opencode_voice.config import (
     redact_secrets,
     voice_bridge_issue_payload,
 )
-from opencode_voice.deepgram import (
-    FlushLimiter,
-    SpeechTextFilter,
-    TTSChunker,
-    build_flux_url,
-    build_tts_url,
-    parse_flux_message,
-)
+from opencode_voice.deepgram import SpeechTextFilter, TTSChunker
 from opencode_voice.logging import RunLogger
+from opencode_voice.interruption import (
+    EpisodeIdentity,
+    InterruptionActionKind,
+    InterruptionEvent,
+    InterruptionEventKind,
+    InterruptionPhase,
+    InterruptionSnapshot,
+    reduce_interruption,
+)
 from opencode_voice.opencode_client import OpenCodeClient
 from opencode_voice.protocol import PROTOCOL_VERSION as SIDEPOD_PROTOCOL_VERSION
 from opencode_voice.protocol import check_command as check_sidepod_command
 from opencode_voice.protocol import check_event as check_sidepod_event
 from opencode_voice.protocol import schema_document as sidepod_schema_document
-from opencode_voice.audio_processing import EchoCanceller
+from opencode_voice.audio_processing import EchoCanceller, FrameSlicer, Pcm16Resampler
+from opencode_voice.playback import PlaybackToken
+from opencode_voice.device_audio import DeviceAudioOptions, PersistentDeviceAudioEngine
+from opencode_voice.flux_transport import FluxTransport, FluxTransportOptions
+from opencode_voice.tts_providers import (
+    CartesiaTTSOptions,
+    CartesiaTTSProvider,
+    DeepgramTTSOptions,
+    DeepgramTTSProvider,
+    StalePlaybackToken,
+    TTSProvider,
+    TTSProviderError,
+)
+from opencode_voice.telemetry import RunMetadata, snapshot_voice_config
 from opencode_voice.state import (
     AssistantTextTracker,
+    HybridOpenCodeTurnTracker,
     OpenCodeEventTurnTracker,
     active_context_estimate,
     elapsed_ms,
@@ -226,6 +240,7 @@ class NativeMicSession:
         self.closed = False
         self.dropped_chunks = 0
         self.input_delay_sec = 0.0
+        self.last_callback_at = 0.0
 
     async def start(self) -> bool:
         try:
@@ -244,7 +259,9 @@ class NativeMicSession:
 
         self.loop = asyncio.get_running_loop()
         self.queue = asyncio.Queue(maxsize=64)
-        blocksize = max(1, int(self.config.deepgram_sample_rate * 0.08))
+        # Device/AEC clock: exact 10 ms capture frames.  Flux packetization is
+        # owned by its sender actor and must never dictate PortAudio cadence.
+        blocksize = max(1, int(self.config.device_sample_rate * 0.01))
 
         def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             # PortAudio realtime thread: no blocking calls here — logging does
@@ -252,6 +269,7 @@ class NativeMicSession:
             # already stressed, so defer everything to the loop.
             if self.closed or not self.loop:
                 return
+            self.last_callback_at = time.perf_counter()
             try:
                 # Capture-side delay for the echo canceller, from PortAudio
                 # timing the way livekit's media_devices measures it. Plain
@@ -270,7 +288,7 @@ class NativeMicSession:
 
         try:
             self.stream = sd.RawInputStream(
-                samplerate=self.config.deepgram_sample_rate,
+                samplerate=self.config.device_sample_rate,
                 channels=1,
                 dtype="int16",
                 blocksize=blocksize,
@@ -292,7 +310,7 @@ class NativeMicSession:
         self.pump_task = asyncio.create_task(self.pump())
         self.logger.write(
             "native_audio.start",
-            sample_rate=self.config.deepgram_sample_rate,
+            sample_rate=self.config.device_sample_rate,
             channels=1,
             dtype="int16",
             blocksize=blocksize,
@@ -342,13 +360,15 @@ class NativeSpeakerSession:
         on_issue: Callable[[dict[str, Any]], Awaitable[None]],
         on_render: Callable[[bytes], None] | None = None,
         on_drain: Callable[[], Awaitable[None]] | None = None,
+        on_first_frame: Callable[[PlaybackToken], Awaitable[None]] | None = None,
     ) -> None:
         self.config = config
         self.logger = logger
         self.on_issue = on_issue
         self.on_render = on_render
         self.on_drain = on_drain
-        self.queue: asyncio.Queue[bytes] | None = None
+        self.on_first_frame = on_first_frame
+        self.queue: asyncio.Queue[tuple[PlaybackToken, int, bytes]] | None = None
         self.stream: Any | None = None
         self.pump_task: asyncio.Task[None] | None = None
         self.closed = False
@@ -364,6 +384,23 @@ class NativeSpeakerSession:
         self.paused_at = 0.0
         self.burst_started_at = 0.0
         self.burst_active = False
+        self.playback_generation = 0
+        self.sequence = 0
+        self.play_lock = asyncio.Lock()
+        self.resampler_token: PlaybackToken | None = None
+        self.frame_slicer = FrameSlicer(config.device_sample_rate)
+        self.resampler = Pcm16Resampler(config.tts_sample_rate, config.device_sample_rate)
+        # Queue exhaustion is an underflow, not provider EOF.  A turn owns its
+        # acoustic burst until the provider explicitly reports a terminal
+        # marker, matching the persistent duplex engine's semantics.
+        self.terminal_tokens: dict[PlaybackToken, str] = {}
+        self.jitter_target_frames = 8
+        self.max_starvation_sec = 0.25
+        self.duck_gain = 10 ** (-18 / 20)
+        self.current_gain = 1.0
+        self.target_gain = 1.0
+        self.gain_ramp_frames = 0
+        self.first_frame_tokens: set[PlaybackToken] = set()
 
     async def start(self) -> bool:
         try:
@@ -380,14 +417,15 @@ class NativeSpeakerSession:
             )
             return False
 
-        # Memory bound only; play() blocks when full so chunks are never
-        # dropped mid-turn (256 chunks ≈ 10s of 16kHz mono int16 audio).
-        self.queue = asyncio.Queue(maxsize=256)
+        # Exactly one second of 10 ms device frames.  Provider timing cannot
+        # grow memory without bound or become the device clock.
+        self.queue = asyncio.Queue(maxsize=100)
         try:
             self.stream = sd.RawOutputStream(
-                samplerate=self.config.deepgram_sample_rate,
+                samplerate=self.config.device_sample_rate,
                 channels=1,
                 dtype="int16",
+                blocksize=max(1, self.config.device_sample_rate // 100),
             )
             self.stream.start()
         except Exception as exc:  # noqa: BLE001 - device/permission failures become safe UI issues.
@@ -405,38 +443,114 @@ class NativeSpeakerSession:
         self.pump_task = asyncio.create_task(self.pump())
         self.logger.write(
             "native_tts.start",
-            sample_rate=self.config.deepgram_sample_rate,
+            sample_rate=self.config.device_sample_rate,
+            provider_sample_rate=self.config.tts_sample_rate,
             channels=1,
             dtype="int16",
         )
         return True
 
-    async def play(self, data: bytes, turn_id: int | None) -> bool:
+    async def play(self, data: bytes, turn_id: int | PlaybackToken | None) -> bool:
         if not self.queue or self.closed:
             return False
-        # Backpressure instead of drops: TTS delivers faster than realtime,
-        # and put() blocking here stalls the Deepgram receive loop until the
-        # device catches up. close() drains the queue so this never deadlocks.
-        await self.queue.put(data)
-        if self.closed:
+        token = (
+            turn_id
+            if isinstance(turn_id, PlaybackToken)
+            else PlaybackToken(self.playback_generation, int(turn_id or 0))
+        )
+        if not self.token_is_current(token):
             return False
-        now = time.perf_counter()
-        if not self.is_audible(tail_sec=0.0):
-            # Silence -> audio transition: a new playback burst begins. Reset
-            # the rate counters here — the speaker now persists across turns,
-            # so a session-cumulative native_tts.summary would fold the idle
-            # gaps between replies into the byte/duration rate and read as
-            # choppy when playback is actually realtime. Per-burst counters
-            # measure this reply's playback honestly.
-            self.burst_started_at = now
-            self.started_at = now
-            self.last_summary_log = now
-            self.played_chunks = 0
-            self.played_bytes = 0
-            self.logger.write("native_tts.first_chunk", bytes=len(data), turn_id=turn_id)
-        chunk_sec = len(data) / (self.config.deepgram_sample_rate * 2)
-        self.speaking_until = max(now, self.speaking_until) + chunk_sec
+        async with self.play_lock:
+            if not self.token_is_current(token):
+                return False
+            if self.resampler_token != token:
+                self._reset_pcm_pipeline(token)
+            converted = self.resampler.push(data)
+            frames = self.frame_slicer.push(converted)
+            for frame in frames:
+                if not self.token_is_current(token):
+                    return False
+                self.sequence += 1
+                await self.queue.put((token, self.sequence, bytes(frame)))
+                # Cancellation may have advanced while capacity was awaited.
+                if not self.token_is_current(token):
+                    return False
+            return True
+
+    def begin_turn(self, token: PlaybackToken) -> bool:
+        """Register provider ownership before its first PCM frame arrives."""
+
+        if not self.token_is_current(token):
+            return False
+        self.terminal_tokens.pop(token, None)
+        if self.resampler_token != token:
+            self._reset_pcm_pipeline(token)
         return True
+
+    def mark_turn_terminal(self, token: PlaybackToken, outcome: str = "done") -> bool:
+        if not self.token_is_current(token):
+            return False
+        self.terminal_tokens[token] = str(outcome or "done")
+        return True
+
+    async def finish_turn(self, token: PlaybackToken, outcome: str = "done") -> bool:
+        """Admit every resampler/slicer tail before making EOF visible."""
+
+        if not self.queue or self.closed:
+            return False
+        async with self.play_lock:
+            if not self.token_is_current(token):
+                return False
+            if self.resampler_token == token:
+                converted_tail = self.resampler.flush()
+                frames = self.frame_slicer.push(converted_tail)
+                if self.frame_slicer.buffer:
+                    tail = bytes(self.frame_slicer.buffer)
+                    self.frame_slicer.buffer.clear()
+                    frames.append(bytearray(tail + bytes(self.frame_slicer.frame_bytes - len(tail))))
+                for frame in frames:
+                    if not self.token_is_current(token):
+                        return False
+                    self.sequence += 1
+                    await self.queue.put((token, self.sequence, bytes(frame)))
+                    if not self.token_is_current(token):
+                        return False
+            return self.mark_turn_terminal(token, outcome)
+
+    def turn_is_terminal(self, token: PlaybackToken) -> bool:
+        return token in self.terminal_tokens
+
+    def _reset_pcm_pipeline(self, token: PlaybackToken | None = None) -> None:
+        # Native resamplers carry delay and FrameSlicer carries a sub-frame
+        # tail. Neither may cross a turn/generation fence.
+        self.resampler_token = token
+        self.resampler = Pcm16Resampler(self.config.tts_sample_rate, self.config.device_sample_rate)
+        self.frame_slicer = FrameSlicer(self.config.device_sample_rate)
+
+    def token_is_current(self, token: PlaybackToken) -> bool:
+        return not self.closed and token.generation == self.playback_generation
+
+    def invalidate_generation(self, generation: int, reason: str) -> None:
+        """Fence producer/dequeue/device stages before external cancellation."""
+        self.playback_generation = generation
+        self.flush(reason=reason)
+        self._reset_pcm_pipeline()
+        self.terminal_tokens = {
+            token: outcome
+            for token, outcome in self.terminal_tokens.items()
+            if token.generation == generation
+        }
+        self.first_frame_tokens = {
+            token for token in self.first_frame_tokens if token.generation == generation
+        }
+
+    def set_ducked(self, ducked: bool) -> None:
+        target = self.duck_gain if ducked else 1.0
+        if target == self.target_gain:
+            return
+        self.target_gain = target
+        self.gain_ramp_frames = 2  # 20 ms at the device clock
+        self.logger.write("native_tts.duck", ducked=ducked, gain_db=-18 if ducked else 0)
 
     def is_audible(self, tail_sec: float = 0.3) -> bool:
         return not self.closed and time.perf_counter() < self.speaking_until + tail_sec
@@ -489,35 +603,50 @@ class NativeSpeakerSession:
         if not self.queue:
             return
         while not self.closed:
-            if self.burst_active and not self.paused:
-                # Nothing queued and the played audio should be finished:
-                # the burst has drained, so signal a return to listening.
-                remaining = max(0.0, self.speaking_until - time.perf_counter())
-                try:
-                    data = await asyncio.wait_for(self.queue.get(), timeout=remaining + 0.15)
-                except asyncio.TimeoutError:
-                    self.burst_active = False
-                    if self.started_at is not None:
-                        # Final rate for the burst that just finished playing;
-                        # bytes/duration_ms == sample_rate*2 means realtime.
-                        self.logger.write(
-                            "native_tts.summary",
-                            chunks=self.played_chunks,
-                            bytes=self.played_bytes,
-                            dropped_chunks=self.dropped_chunks,
-                            duration_ms=elapsed_ms(self.started_at),
-                            reason="drained",
-                        )
-                    if self.on_drain:
-                        await self.on_drain()
-                    continue
-            else:
-                data = await self.queue.get()
+            token, sequence, data = await self.queue.get()
+            # A queued item can outlive cancellation even if flush raced its
+            # dequeue.  This is the first post-dequeue fence.
+            if not self.token_is_current(token):
+                self.dropped_chunks += 1
+                continue
+
+            if not self.burst_active:
+                # Build the 80 ms target before exposing a new acoustic edge.
+                deadline = time.perf_counter() + self.max_starvation_sec
+                while (
+                    self.queue.qsize() + 1 < self.jitter_target_frames
+                    and time.perf_counter() < deadline
+                    and self.token_is_current(token)
+                ):
+                    await asyncio.sleep(0.005)
+                now = time.perf_counter()
+                self.burst_started_at = now
+                self.started_at = now
+                self.last_summary_log = now
+                self.played_chunks = 0
+                self.played_bytes = 0
+                self.burst_active = True
+                self.logger.write(
+                    "native_tts.burst.start",
+                    buffered_frames=self.queue.qsize() + 1,
+                    playback_generation=token.generation,
+                    turn_id=token.turn_id,
+                    sequence=sequence,
+                )
+
             await self.resume_event.wait()
-            if self.closed:
-                break
+            # Pause/capacity/cancellation can all interleave; fence again
+            # immediately before acquiring the device frame.
+            if not self.token_is_current(token):
+                self.dropped_chunks += 1
+                continue
+            frame = self.apply_gain(data)
+            if frame.strip(b"\x00") and token not in self.first_frame_tokens:
+                self.first_frame_tokens.add(token)
+                if self.on_first_frame:
+                    await self.on_first_frame(token)
             try:
-                await asyncio.to_thread(self.write_output, data)
+                await asyncio.to_thread(self.write_output, frame)
             except Exception as exc:  # noqa: BLE001 - surface playback failures but keep transport alive.
                 self.logger.write("native_tts.write.error", error=repr(exc))
                 await self.on_issue(
@@ -531,9 +660,9 @@ class NativeSpeakerSession:
                 self.closed = True
                 break
             self.played_chunks += 1
-            self.played_bytes += len(data)
-            self.burst_active = True
+            self.played_bytes += len(frame)
             now = time.perf_counter()
+            self.speaking_until = now + 0.01
             if self.started_at is not None and now - self.last_summary_log >= 5:
                 self.last_summary_log = now
                 self.logger.write(
@@ -544,10 +673,90 @@ class NativeSpeakerSession:
                     duration_ms=elapsed_ms(self.started_at),
                 )
 
+            if self.queue.empty() and self.token_is_current(token):
+                await self.hold_starvation(token)
+
+    async def hold_starvation(self, token: PlaybackToken) -> None:
+        """Keep one device/AEC clock until provider EOF or a full refill.
+
+        Provider/network gaps can be arbitrarily longer than the 250 ms
+        grace.  They remain the same acoustic burst and emit timed silence;
+        only explicit provider terminal ownership may drain the burst.
+        """
+        if not self.queue:
+            return
+        started = time.perf_counter()
+        silence = b"\x00" * (self.config.device_sample_rate // 100 * 2)
+        if not self.turn_is_terminal(token):
+            self.logger.write(
+                "native_tts.starved",
+                playback_generation=token.generation,
+                turn_id=token.turn_id,
+            )
+        target_frames = min(
+            self.jitter_target_frames,
+            self.queue.maxsize if self.queue.maxsize > 0 else self.jitter_target_frames,
+        )
+        while self.token_is_current(token):
+            elapsed = time.perf_counter() - started
+            buffered = self.queue.qsize()
+            terminal = self.turn_is_terminal(token)
+            refill_ready = buffered >= target_frames
+            terminal_tail_ready = terminal and buffered > 0 and elapsed >= self.max_starvation_sec
+            terminal_drain_ready = terminal and buffered == 0 and elapsed >= self.max_starvation_sec
+            if refill_ready or terminal_tail_ready:
+                self.logger.write(
+                    "native_tts.starved.recovered",
+                    duration_ms=int(elapsed * 1000),
+                    buffered_frames=buffered,
+                    playback_generation=token.generation,
+                    turn_id=token.turn_id,
+                    terminal_tail=terminal_tail_ready,
+                )
+                return
+            if terminal_drain_ready:
+                break
+            await asyncio.to_thread(self.write_output, silence)
+            if self.stream is None:
+                await asyncio.sleep(0.01)
+        if not self.token_is_current(token):
+            return
+
+        self.burst_active = False
+        self.speaking_until = 0.0
+        if self.started_at is not None:
+            self.logger.write(
+                "native_tts.summary",
+                chunks=self.played_chunks,
+                bytes=self.played_bytes,
+                dropped_chunks=self.dropped_chunks,
+                duration_ms=elapsed_ms(self.started_at),
+                reason="drained",
+            )
+        if self.on_drain:
+            await self.on_drain()
+
+    def apply_gain(self, data: bytes) -> bytes:
+        if self.current_gain == 1.0 and self.target_gain == 1.0:
+            return data
+        samples = array("h")
+        samples.frombytes(data)
+        start_gain = self.current_gain
+        if self.gain_ramp_frames:
+            end_gain = start_gain + (self.target_gain - start_gain) / self.gain_ramp_frames
+            self.gain_ramp_frames -= 1
+        else:
+            end_gain = self.target_gain
+        count = max(1, len(samples) - 1)
+        for index, sample in enumerate(samples):
+            gain = start_gain + (end_gain - start_gain) * (index / count)
+            samples[index] = max(-32768, min(32767, int(sample * gain)))
+        self.current_gain = end_gain
+        return samples.tobytes()
+
     def write_output(self, data: bytes) -> None:
-        # Runs on a worker thread, so the echo-canceller reference feed (~one
-        # FFI round-trip per 10ms frame) stays off the event loop that is
-        # simultaneously servicing mic frames and lane sends.
+        # One actual 10 ms device frame at a time.  Timed silence during
+        # starvation follows this same path, preserving the AEC render clock.
         if self.on_render:
             try:
                 self.on_render(data)
@@ -577,6 +786,8 @@ class NativeSpeakerSession:
             if discarded:
                 self.dropped_chunks += discarded
                 self.logger.write("native_tts.drop", dropped_chunks=discarded, reason="teardown")
+        self._reset_pcm_pipeline()
+        self.terminal_tokens.clear()
         if self.stream:
             try:
                 self.stream.stop()
@@ -600,6 +811,18 @@ def create_app(
     app = FastAPI(title="OpenCode Mercury Voice Bridge")
     load_voice_credentials(tts_provider=config.tts_provider)
     logger = RunLogger(config.run_root)
+    run_metadata = RunMetadata.create(
+        snapshot_voice_config(
+            config,
+            mic_queue_blocks=64,
+            playback_queue_chunks=100,
+            jitter_buffer_target_ms=80,
+        ),
+        # Build identity belongs to the helper artifact, not the user's active
+        # OpenCode workspace (which may be outside a Git checkout entirely).
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    logger.write("run.metadata", **run_metadata.as_fields())
     sidepod_lane_registry = ActiveSidepodLaneRegistry()
 
     @app.on_event("startup")
@@ -627,6 +850,11 @@ def create_app(
             "ready" if not readiness_issues else "voice_bridge_issue",
             diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
         )
+
+    async def _shutdown() -> None:
+        logger.close()
+    app.router.add_event_handler("shutdown", _shutdown)
+
     @app.get("/")
     async def index() -> HTMLResponse:
         return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
@@ -705,12 +933,15 @@ def create_app(
                     "enabled": config.has_deepgram_key,
                     "stt_model": config.deepgram_stt_model,
                     "tts_model": config.deepgram_tts_model,
+                    # Compatibility: the browser capture path reads
+                    # `sample_rate` as the Flux/STT rate.
                     "sample_rate": config.deepgram_sample_rate,
+                    "tts_sample_rate": config.tts_sample_rate,
                 },
                 "cartesia": {
                     "enabled": config.has_cartesia_key,
                     "tts_model": config.cartesia_tts_model,
-                    "sample_rate": config.deepgram_sample_rate,
+                    "sample_rate": config.tts_sample_rate,
                 },
             }
         )
@@ -800,15 +1031,30 @@ class VoiceConnection:
         self.turn_task: asyncio.Task[None] | None = None
         self.turn_seq = 0
         self.active_turn_id: int | None = None
+        self.turn_playback_tokens: dict[int, PlaybackToken] = {}
         self.voice_lane_id: str | None = None
         self.protocol_turn_id = ""
         self.sidepod_readiness_issues: tuple[dict[str, Any], ...] = ()
         self.flux: DeepgramFluxSession | None = None
-        self.speaker: DeepgramSpeakSession | CartesiaSpeakSession | None = None
+        self.flux_connection_epoch: int | None = None
+        self.stt_transport_healthy = True
+        self.stt_unhealthy_reported = False
+        self.flux_watchdog_task: asyncio.Task[None] | None = None
+        self.speaker: TTSProvider | None = None
+        self.tts_turn_token: PlaybackToken | None = None
+        self.tts_failed_turns: set[int] = set()
+        self.tts_terminal_tokens: dict[PlaybackToken, str] = {}
+        self.tts_last_audio_at: dict[PlaybackToken, float] = {}
+        self.tts_terminal_watchdogs: dict[PlaybackToken, asyncio.Task[None]] = {}
+        self.tts_failure_reported: set[PlaybackToken] = set()
         self.native_mic: NativeMicSession | None = None
         self.native_speaker: NativeSpeakerSession | None = None
+        self.native_audio_engine: PersistentDeviceAudioEngine | None = None
+        self.force_half_duplex = False
         self.native_speaker_unavailable = False
         self.echo_canceller: EchoCanceller | None = None
+        self.capture_to_flux_resampler: Pcm16Resampler | None = None
+        self.render_to_probe_resampler: Pcm16Resampler | None = None
         self.speak_generation = 0
         self.stale_tts_chunks = 0
         self.tts_unavailable_chunks = 0
@@ -833,10 +1079,22 @@ class VoiceConnection:
         self.audio_input_bytes = 0
         self.audio_input_started: float | None = None
         self.audio_input_last_log = 0.0
+        self.audio_input_last_at = 0.0
+        self.device_capture_drops_seen = 0
         # Rolling audio windows for the echo probe: what the mic heard
         # (post-AEC, i.e. what STT hears) and what the speaker played.
         self.mic_audio_ring = PcmRingBuffer(config.deepgram_sample_rate, direction="ending")
         self.render_audio_ring = PcmRingBuffer(config.deepgram_sample_rate, direction="starting")
+        self.interruption_state = InterruptionSnapshot()
+        self.interruption_lock = asyncio.Lock()
+        self.interruption_clock_started = time.perf_counter()
+        self.interruption_group_seq = 0
+        self.interruption_episode: EpisodeIdentity | None = None
+        self.interruption_episodes: dict[tuple[int, int], EpisodeIdentity] = {}
+        self.expired_interruption_episodes: set[tuple[int, int]] = set()
+        self.expired_interruption_episode_order: deque[tuple[int, int]] = deque()
+        self.interruption_decision_task: asyncio.Task[None] | None = None
+        self.interruption_expiry_task: asyncio.Task[None] | None = None
 
     async def run(self) -> None:
         readiness_issues = helper_readiness_issues(
@@ -875,6 +1133,34 @@ class VoiceConnection:
 
     async def close(self) -> None:
         self.closed = True
+        now_ms = self.interruption_elapsed_ms()
+        self.interruption_state = reduce_interruption(
+            self.interruption_state, InterruptionEvent.close(now_ms)
+        ).state
+        owned_tasks = [
+            self.speaker_prewarm_task,
+            self.turn_task,
+            self.compaction_task,
+            self.pending_barge_task,
+            self.pending_probe_task,
+            self.interruption_decision_task,
+            self.interruption_expiry_task,
+            self.flux_watchdog_task,
+            getattr(self, "mic_watchdog_task", None),
+            *self.tts_terminal_watchdogs.values(),
+            *self.background_tasks,
+        ]
+        current = asyncio.current_task()
+        pending_tasks = list({task for task in owned_tasks if task and task is not current and not task.done()})
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        self.background_tasks.clear()
+        self.tts_terminal_watchdogs.clear()
+        if self.native_audio_engine:
+            await self.native_audio_engine.close()
+            self.native_audio_engine = None
         if self.native_mic:
             await self.native_mic.close()
             self.native_mic = None
@@ -885,10 +1171,6 @@ class VoiceConnection:
         if self.native_speaker:
             await self.native_speaker.close()
             self.native_speaker = None
-        if self.turn_task and not self.turn_task.done():
-            self.turn_task.cancel()
-        if self.compaction_task and not self.compaction_task.done():
-            self.compaction_task.cancel()
         if self.fork_session_id and not self.keep_fork:
             fork_id = self.fork_session_id
             try:
@@ -896,6 +1178,9 @@ class VoiceConnection:
                 self.logger.write("fork.delete", session_id=fork_id)
             except Exception as exc:  # noqa: BLE001 - surfaced to UI/log for cleanup visibility.
                 self.logger.write("fork.delete.error", session_id=fork_id, error=repr(exc))
+
+    def interruption_elapsed_ms(self) -> int:
+        return int((time.perf_counter() - self.interruption_clock_started) * 1000)
 
     async def handle_control(self, payload: dict[str, Any]) -> None:
         kind = payload.get("type")
@@ -1018,14 +1303,66 @@ class VoiceConnection:
         self.reset_audio_input_counters()
         self.flux = DeepgramFluxSession(self.config, on_event=self.handle_flux_event)
         await self.flux.start()
+        epoch = getattr(self.flux, "connection_epoch", None)
+        if isinstance(epoch, int):
+            self.adopt_flux_connection_epoch(epoch)
+        else:
+            self.flux_connection_epoch = None
+        self.logger.write("flux.connection.ready", flux_connection_epoch=self.flux_connection_epoch)
+        if self.flux_watchdog_task is None or self.flux_watchdog_task.done():
+            self.flux_watchdog_task = asyncio.create_task(self.watch_flux_transport())
         # Legacy browser clients render this; the sidepod seam drops it.
         await self.send_json({"type": "audio.ready"})
 
     async def start_native_audio(self) -> bool:
         await self.start_audio()
-        if self.closed or self.flux is None or self.native_mic:
-            return bool(self.native_mic)
+        if self.closed or self.flux is None or self.native_mic or self.native_audio_engine:
+            return bool(self.native_mic or self.native_audio_engine)
         self.ensure_echo_canceller()
+        self.capture_to_flux_resampler = Pcm16Resampler(
+            self.config.device_sample_rate, self.config.deepgram_sample_rate
+        )
+        self.render_to_probe_resampler = Pcm16Resampler(
+            self.config.device_sample_rate, self.config.deepgram_sample_rate
+        )
+        async def on_engine_drain(_token: PlaybackToken) -> None:
+            callback = getattr(self, "on_playback_drained", None)
+            if callback:
+                await callback(_token)
+
+        engine = PersistentDeviceAudioEngine(
+            DeviceAudioOptions(
+                device_sample_rate=self.config.device_sample_rate,
+                provider_sample_rate=self.config.tts_sample_rate,
+            ),
+            on_render=self.feed_render_reference,
+            on_capture=self.handle_processed_native_audio,
+            on_first_frame=getattr(self, "on_first_playback_frame", None),
+            on_drain=on_engine_drain,
+            capture_processor=self.filter_mic_frame,
+            on_event=self.on_playback_event,
+        )
+        if await engine.start():
+            engine.invalidate_generation(self.speak_generation)
+            self.native_audio_engine = engine
+            self.force_half_duplex = False
+            self.logger.write(
+                "native_audio.duplex.start",
+                sample_rate=self.config.device_sample_rate,
+                frame_ms=10,
+                jitter_target_ms=80,
+            )
+            return True
+
+        # A synchronized stream is the only supported automatic full-duplex
+        # mode.  Separate device streams are retained solely as the explicit
+        # half-duplex safety fallback.
+        self.force_half_duplex = True
+        self.logger.write(
+            "native_audio.duplex.fallback",
+            mode="half",
+            error_code="duplex_stream_unavailable",
+        )
         native_mic = NativeMicSession(
             config=self.config,
             logger=self.logger,
@@ -1044,13 +1381,15 @@ class VoiceConnection:
         if self.config.voice_duplex != "auto" or self.echo_canceller is not None:
             return
         try:
-            self.echo_canceller = EchoCanceller(self.config.deepgram_sample_rate)
-            self.logger.write("audio.aec.start", sample_rate=self.config.deepgram_sample_rate)
+            self.echo_canceller = EchoCanceller(self.config.device_sample_rate)
+            self.logger.write("audio.aec.start", sample_rate=self.config.device_sample_rate)
         except Exception as exc:  # noqa: BLE001 - degrade to the half-duplex gate.
             self.echo_canceller = None
             self.logger.write("audio.aec.unavailable", error=repr(exc))
 
     def duplex_mode(self) -> str:
+        if self.force_half_duplex or not self.stt_transport_healthy:
+            return "half"
         mode = self.config.voice_duplex
         if mode == "auto":
             return "aec" if self.echo_canceller else "half"
@@ -1072,17 +1411,45 @@ class VoiceConnection:
                 if self.echo_canceller.delay_error and not self.aec_delay_error_logged:
                     self.aec_delay_error_logged = True
                     self.logger.write("audio.aec.delay.error", error=self.echo_canceller.delay_error)
-                if self.native_speaker and self.native_speaker.in_startup_window(self.config.playback_mute_sec):
-                    # The canceller above still adapted on the real frames;
-                    # STT just doesn't get to hear its convergence leak.
-                    return b"\x00" * len(processed)
                 return processed
             except Exception as exc:  # noqa: BLE001 - fall back to the gate for the rest of the lane.
                 self.logger.write("audio.aec.error", error=repr(exc))
                 self.echo_canceller = None
-        if mode != "full" and self.native_speaker and self.native_speaker.is_audible():
+        if mode != "full" and self.playback_is_audible():
             return b"\x00" * len(data)
         return data
+
+    def playback_is_audible(self, tail_sec: float = 0.3) -> bool:
+        if self.native_audio_engine and self.native_audio_engine.is_audible(tail_sec=tail_sec):
+            return True
+        return bool(self.native_speaker and self.native_speaker.is_audible(tail_sec=tail_sec))
+
+    def playback_has_pending_audio(self) -> bool:
+        if self.native_audio_engine and (
+            self.native_audio_engine.buffered_frames > 0
+            or self.native_audio_engine.state not in {"idle", "closed"}
+        ):
+            return True
+        if self.native_speaker:
+            queue = getattr(self.native_speaker, "queue", None)
+            return bool(getattr(self.native_speaker, "burst_active", False)) or bool(
+                queue and not queue.empty()
+            ) or self.native_speaker.is_audible(tail_sec=0.0)
+        return self.playback_is_audible(tail_sec=0.0)
+
+    def playback_is_exposed(self) -> bool:
+        """True while an assistant generation can still reach the device."""
+
+        return bool(
+            self.active_turn_id is not None
+            # Provider ownership starts before the first PCM frame.  Treat
+            # that interval as exposed too: a user utterance must cancel the
+            # pending synthesis generation instead of being admitted beside
+            # it as an unrelated turn.
+            or self.tts_turn_token is not None
+            or self.playback_is_audible()
+            or self.playback_has_pending_audio()
+        )
 
     def update_aec_delay(self) -> None:
         # Called per mic chunk: the canceller applies the stored value right
@@ -1090,6 +1457,9 @@ class VoiceConnection:
         # expects (a one-shot set at speaker start never landed — livekit's
         # media_devices re-asserts it per capture frame).
         if not self.echo_canceller:
+            return
+        if self.native_audio_engine:
+            self.echo_canceller.set_stream_delay_ms(self.native_audio_engine.stream_delay_ms)
             return
         delay_sec = self.native_mic.input_delay_sec if self.native_mic else 0.0
         speaker_latency = getattr(getattr(self.native_speaker, "stream", None), "latency", None)
@@ -1100,11 +1470,20 @@ class VoiceConnection:
     def mic_gate_active(self) -> bool:
         return (
             self.duplex_mode() == "half"
-            and self.native_speaker is not None
-            and self.native_speaker.is_audible()
+            and self.playback_is_audible()
         )
 
     async def stop_audio(self, reason: str) -> None:
+        if self.flux_watchdog_task and not self.flux_watchdog_task.done():
+            self.flux_watchdog_task.cancel()
+            try:
+                await self.flux_watchdog_task
+            except asyncio.CancelledError:
+                pass
+        self.flux_watchdog_task = None
+        if self.native_audio_engine:
+            await self.native_audio_engine.close()
+            self.native_audio_engine = None
         if self.native_mic:
             await self.native_mic.close()
             self.native_mic = None
@@ -1112,26 +1491,136 @@ class VoiceConnection:
         if self.flux:
             await self.flux.close()
             self.flux = None
+        self.flux_connection_epoch = None
+        self.stt_transport_healthy = True
+        self.stt_unhealthy_reported = False
+        self.force_half_duplex = False
+        self.interruption_state = InterruptionSnapshot(updated_at_ms=self.interruption_elapsed_ms())
+        self.interruption_episode = None
+        self.interruption_episodes.clear()
+        self.expired_interruption_episodes.clear()
+        self.expired_interruption_episode_order.clear()
+        self.arm_interruption_timers()
+
+    async def set_stt_transport_health(self, healthy: bool, reason: str) -> None:
+        if self.stt_transport_healthy == healthy:
+            return
+        self.stt_transport_healthy = healthy
+        self.logger.write("flux.transport.health", healthy=healthy, reason=reason)
+        if healthy:
+            self.stt_unhealthy_reported = False
+            return
+        if self.interruption_state.phase is InterruptionPhase.CANDIDATE:
+            if self.native_audio_engine:
+                self.native_audio_engine.set_ducked(False)
+            if self.native_speaker:
+                set_ducked = getattr(self.native_speaker, "set_ducked", None)
+                if set_ducked:
+                    set_ducked(False)
+            self.interruption_state = InterruptionSnapshot(updated_at_ms=self.interruption_elapsed_ms())
+            self.arm_interruption_timers()
+            self.logger.write("interruption.candidate.cancelled", reason="stt_transport_unhealthy")
+        if not self.stt_unhealthy_reported:
+            self.stt_unhealthy_reported = True
+            await self.send_json(
+                voice_bridge_issue_payload(
+                    capability="voice_audio",
+                    diagnostic_code="stt_transport_unhealthy",
+                    safe_detail="Voice recognition reconnecting",
+                    retryable=True,
+                    debug_ref=str(self.logger.run_dir),
+                    voice_lane_id=self.voice_lane_id,
+                )
+            )
+
+    async def watch_flux_transport(self) -> None:
+        try:
+            while not self.closed and self.flux is not None:
+                await asyncio.sleep(0.25)
+                snapshot_fn = getattr(self.flux, "health_snapshot", None)
+                snapshot = snapshot_fn() if snapshot_fn else None
+                if snapshot is None:
+                    continue
+                now = time.monotonic()
+                if self.native_audio_engine:
+                    drops = self.native_audio_engine.capture_dropped_frames
+                    if drops > self.device_capture_drops_seen:
+                        self.logger.write(
+                            "native_audio.capture.drop",
+                            dropped_frames=drops - self.device_capture_drops_seen,
+                            total_dropped_frames=drops,
+                        )
+                        self.device_capture_drops_seen = drops
+                    cadence_stalled = (
+                        self.audio_input_started is not None and now - self.audio_input_last_at > 0.5
+                    )
+                    if cadence_stalled:
+                        await self.set_stt_transport_health(False, "capture_cadence_stalled")
+                else:
+                    cadence_stalled = bool(
+                        self.native_mic
+                        and self.native_mic.last_callback_at
+                        and now - self.native_mic.last_callback_at > 0.5
+                    )
+                    if cadence_stalled:
+                        await self.set_stt_transport_health(False, "capture_cadence_stalled")
+                capture_recent = (
+                    snapshot.last_capture_at is not None and now - snapshot.last_capture_at <= 1.0
+                )
+                stalled = capture_recent and (
+                    snapshot.oldest_queue_age_ms >= 500
+                    or (
+                        snapshot.queued_packets > 0
+                        and snapshot.state in {"disconnected", "reconnecting"}
+                    )
+                )
+                if stalled:
+                    await self.set_stt_transport_health(False, "sender_stalled")
+                elif (
+                    not cadence_stalled
+                    and snapshot.state == "connected"
+                    and snapshot.last_send_at is not None
+                    and now - snapshot.last_send_at <= 1.0
+                ):
+                    await self.set_stt_transport_health(True, "watchdog_recovered")
+        except asyncio.CancelledError:
+            raise
 
     async def handle_native_audio(self, data: bytes) -> None:
         await self.record_audio_input(data)
         if not self.flux:
             return
         data = self.filter_mic_frame(data)
+        await self.handle_processed_native_audio(data, recorded=True)
+
+    async def handle_processed_native_audio(self, data: bytes, *, recorded: bool = False) -> None:
+        if not recorded:
+            await self.record_audio_input(data)
+        if not self.flux:
+            return
+        if self.capture_to_flux_resampler:
+            data = self.capture_to_flux_resampler.push(data)
         if data:
             # The probe compares what STT hears against what we played, so
             # the ring gets the post-AEC frame, not the raw capture.
             self.mic_audio_ring.append(data)
-            await self.flux.send_audio(data)
+            submit = getattr(self.flux, "submit_audio", None)
+            if submit:
+                submit(data)
+            else:  # compatibility for injected transports
+                await self.flux.send_audio(data)
 
     def reset_audio_input_counters(self) -> None:
         self.audio_input_chunks = 0
         self.audio_input_bytes = 0
         self.audio_input_started = None
         self.audio_input_last_log = 0.0
+        self.audio_input_last_at = 0.0
+        self.device_capture_drops_seen = 0
 
     async def record_audio_input(self, data: bytes) -> None:
         now = time.perf_counter()
+        self.audio_input_last_at = now
         if self.audio_input_started is None:
             self.audio_input_started = now
             self.audio_input_last_log = now
@@ -1167,57 +1656,413 @@ class VoiceConnection:
         # this seam to translate them into protocol v0 `transcript` events.
         await self.send_json(event)
 
+    def adopt_flux_connection_epoch(self, epoch: int) -> None:
+        """Fence all episode identities created by the replaced socket."""
+
+        if self.flux_connection_epoch == epoch:
+            return
+        self.flux_connection_epoch = epoch
+        self.interruption_episode = None
+        self.interruption_episodes.clear()
+        self.expired_interruption_episodes.clear()
+        self.expired_interruption_episode_order.clear()
+
+    def expire_interruption_episode(self, episode: EpisodeIdentity) -> None:
+        """Suppress one provider episode with bounded same-epoch tombstones."""
+
+        key = (episode.flux_epoch, episode.turn_index)
+        if key in self.expired_interruption_episodes:
+            return
+        self.expired_interruption_episodes.add(key)
+        self.expired_interruption_episode_order.append(key)
+        self.interruption_episodes.pop(key, None)
+        while len(self.expired_interruption_episode_order) > 256:
+            expired = self.expired_interruption_episode_order.popleft()
+            self.expired_interruption_episodes.discard(expired)
+
     async def on_transcript_admitted(self, transcript: str, confidence: float | None) -> None:
         # Sidepod hook: only admitted transcripts may become durable
         # transcript entries in the UI (rejected echo must not be recorded
         # as the user's words). The browser lane shows raw events already.
         return None
 
+    def interruption_episode_for(self, event: dict[str, Any], *, started: bool = False) -> EpisodeIdentity:
+        epoch_value = event.get("flux_connection_epoch")
+        epoch = int(epoch_value) if isinstance(epoch_value, int) else int(self.flux_connection_epoch or 0)
+        turn_value = event.get("turn_index")
+        if isinstance(turn_value, int):
+            turn_index = turn_value
+        elif not started and self.interruption_episode is not None:
+            return self.interruption_episode
+        else:
+            self.interruption_group_seq += 1
+            turn_index = self.interruption_group_seq
+
+        key = (epoch, turn_index)
+        episode = self.interruption_episodes.get(key)
+        if episode is None:
+            if not started:
+                # A provider transcript with no observed Start is intentionally
+                # unknown to the reducer and cannot resurrect an expired turn.
+                self.interruption_group_seq += 1
+            else:
+                self.interruption_group_seq += 1
+            episode = EpisodeIdentity(
+                flux_epoch=epoch,
+                turn_index=turn_index,
+                acoustic_group_id=f"acoustic-{epoch}-{turn_index}-{self.interruption_group_seq}",
+                playback_generation=self.speak_generation,
+            )
+            self.interruption_episodes[key] = episode
+        if started:
+            self.interruption_episode = episode
+        return episode
+
+    def interruption_echo_correlation(self) -> float:
+        started_at_ms = self.interruption_state.started_at_ms
+        if started_at_ms is None:
+            return 0.0
+        start = self.interruption_clock_started + (started_at_ms / 1000)
+        now = time.perf_counter()
+        mic_pcm = self.mic_audio_ring.extract(start, now)
+        render_pcm = self.render_audio_ring.extract(start - 0.6, now + 0.6)
+        return echo_correlation(mic_pcm, render_pcm, self.config.deepgram_sample_rate)
+
+    async def reduce_interruption_event(self, event: InterruptionEvent) -> None:
+        async with self.interruption_lock:
+            await self._reduce_interruption_event_locked(event)
+
+    async def _reduce_interruption_event_locked(self, event: InterruptionEvent) -> None:
+        previous = self.interruption_state
+        reduction = reduce_interruption(previous, event)
+        self.interruption_state = reduction.state
+        episode = reduction.state.episode or event.episode
+        if previous.phase is not reduction.state.phase or reduction.actions or event.kind in {
+            InterruptionEventKind.EPISODE_STARTED,
+            InterruptionEventKind.FINAL_EOT,
+            InterruptionEventKind.CANDIDATE_EVALUATION,
+            InterruptionEventKind.TURN_RESUMED,
+            InterruptionEventKind.MANUAL_INTERRUPT,
+            InterruptionEventKind.CLOSE,
+        }:
+            self.logger.write(
+                "interruption.transition",
+                from_state=previous.phase.value,
+                to_state=reduction.state.phase.value,
+                event_kind=event.kind.value,
+                flux_connection_epoch=episode.flux_epoch if episode else None,
+                turn_index=episode.turn_index if episode else None,
+                interruption_episode_id=episode.acoustic_group_id if episode else None,
+                playback_generation=episode.playback_generation if episode else self.speak_generation,
+            )
+        for action in reduction.actions:
+            await self.execute_interruption_action(action)
+        self.arm_interruption_timers()
+
+    async def execute_interruption_action(self, action: Any) -> None:
+        kind = action.kind
+        episode = action.episode
+        detail = {
+            "reason": action.reason,
+            "flux_connection_epoch": episode.flux_epoch if episode else None,
+            "turn_index": episode.turn_index if episode else None,
+            "interruption_episode_id": episode.acoustic_group_id if episode else None,
+            "playback_generation": episode.playback_generation if episode else self.speak_generation,
+            "echo_correlation": (
+                round(self.interruption_state.latest_correlation, 3)
+                if self.interruption_state.latest_correlation is not None
+                else None
+            ),
+            "decision_latency_ms": (
+                max(0, self.interruption_state.updated_at_ms - self.interruption_state.started_at_ms)
+                if self.interruption_state.started_at_ms is not None
+                else None
+            ),
+        }
+        if kind is InterruptionActionKind.HOLD_PLAYBACK:
+            # "Hold" is logical ownership: acoustically we duck by 18 dB and
+            # keep the device/AEC clock continuous.
+            if self.native_audio_engine:
+                self.native_audio_engine.set_ducked(True)
+            if self.native_speaker:
+                set_ducked = getattr(self.native_speaker, "set_ducked", None)
+                if set_ducked:
+                    set_ducked(True)
+            self.logger.write("barge_in.candidate", **detail)
+        elif kind is InterruptionActionKind.RESUME_PLAYBACK:
+            if self.native_audio_engine:
+                self.native_audio_engine.set_ducked(False)
+            if self.native_speaker:
+                set_ducked = getattr(self.native_speaker, "set_ducked", None)
+                if set_ducked:
+                    set_ducked(False)
+            self.logger.write("barge_in.gain_restored", **detail)
+        elif kind is InterruptionActionKind.SUPPRESS_EPISODE:
+            self.logger.write("barge_in.suppressed", **detail)
+        elif kind is InterruptionActionKind.COMMIT_INTERRUPT:
+            self.logger.write("barge_in.committed", transcript_chars=len(action.text), **detail)
+            await self.barge_in(reason=action.reason)
+            await self.maybe_start_compaction(reason="speech_confirmed", run_in_background=True)
+        elif kind is InterruptionActionKind.ADMIT_TRANSCRIPT:
+            transcript = str(action.text or "").strip()
+            if not transcript:
+                return
+            # Existing overlap/fuzzy/confidence logic remains shadow-only for
+            # cohort comparison and cannot change the authoritative outcome.
+            shadow_verdict, shadow_detail = self.transcript_verdict(transcript, eager=False)
+            self.logger.write(
+                "interruption.shadow.legacy",
+                verdict=shadow_verdict,
+                transcript_chars=len(transcript),
+                **shadow_detail,
+                **detail,
+            )
+            await self.on_transcript_admitted(transcript, None)
+            await self.enqueue_text_turn(transcript, source="voice", eager=False)
+        elif kind is InterruptionActionKind.CANCEL_SPECULATION:
+            self.logger.write("speech.turn_resumed.compat", action="no_side_effect", **detail)
+        elif kind is InterruptionActionKind.EPISODE_EXPIRED:
+            if episode is not None:
+                self.expire_interruption_episode(episode)
+            self.logger.write("interruption.episode.expired", **detail)
+
+    def arm_interruption_timers(self) -> None:
+        current = asyncio.current_task()
+        for task in (self.interruption_decision_task, self.interruption_expiry_task):
+            if task and task is not current and not task.done():
+                task.cancel()
+        self.interruption_decision_task = None
+        self.interruption_expiry_task = None
+        state = self.interruption_state
+        now_ms = self.interruption_elapsed_ms()
+        if state.phase is InterruptionPhase.CANDIDATE and state.started_at_ms is not None:
+            self.interruption_decision_task = asyncio.create_task(
+                self.interruption_tick_after(max(0, state.started_at_ms + 500 - now_ms))
+            )
+        deadline: int | None = None
+        if state.phase is InterruptionPhase.SUPPRESSED and state.suppression_guard_until_ms is not None:
+            deadline = state.suppression_guard_until_ms
+        elif state.last_provider_activity_ms is not None and state.final_eot_at_ms is None:
+            deadline = state.last_provider_activity_ms + 2_000
+        if deadline is not None:
+            self.interruption_expiry_task = asyncio.create_task(
+                self.interruption_tick_after(max(0, deadline - now_ms))
+            )
+
+    async def interruption_tick_after(self, delay_ms: int) -> None:
+        try:
+            if delay_ms:
+                await asyncio.sleep(delay_ms / 1000)
+            # At the decision boundary capture fresh acoustic evidence before
+            # evaluating the candidate.
+            state = self.interruption_state
+            now_ms = max(self.interruption_elapsed_ms(), state.updated_at_ms)
+            if state.phase is InterruptionPhase.CANDIDATE and state.episode is not None:
+                evidence = InterruptionEvent.evaluate(
+                    state.episode,
+                    now_ms,
+                    correlation=self.interruption_echo_correlation(),
+                )
+                await self.reduce_interruption_event(evidence)
+                return
+            await self.reduce_interruption_event(InterruptionEvent.tick(now_ms))
+        except asyncio.CancelledError:
+            raise
+
     async def handle_flux_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "")
+        if event_type.startswith("flux.transport."):
+            epoch = event.get("flux_connection_epoch") or event.get("epoch")
+            if isinstance(epoch, int) and event_type in {
+                "flux.transport.connected",
+                "flux.transport.send_ok",
+            }:
+                self.adopt_flux_connection_epoch(epoch)
+            self.logger.write(
+                "flux.transport.event",
+                transport_event=event_type,
+                flux_connection_epoch=epoch,
+                stage=event_type.rsplit(".", 1)[-1],
+                error_code=(
+                    event.get("error_code")
+                    or (
+                        "stt_transport_failure"
+                        if event_type.endswith(("error", "timeout"))
+                        else None
+                    )
+                ),
+                status_code=event.get("status_code"),
+            )
+            if event_type in {
+                "flux.transport.send_error",
+                "flux.transport.read_error",
+                "flux.transport.connect_error",
+            }:
+                await self.set_stt_transport_health(False, event_type.rsplit(".", 1)[-1])
+            elif event_type == "flux.transport.send_ok":
+                await self.set_stt_transport_health(True, "send_ok")
+            return
+        event_epoch = event.get("flux_connection_epoch")
+        if (
+            isinstance(event_epoch, int)
+            and self.flux_connection_epoch is not None
+            and event_epoch != self.flux_connection_epoch
+        ):
+            self.logger.write(
+                "speech.stale_epoch.drop",
+                event_type=str(event.get("type") or ""),
+                flux_connection_epoch=event_epoch,
+                active_flux_connection_epoch=self.flux_connection_epoch,
+                turn_index=event.get("turn_index"),
+            )
+            return
         await self.forward_flux_event(event)
         if event["type"] == "speech.start":
-            self.logger.write("speech.start")
+            episode = self.interruption_episode_for(event, started=True)
+            if (episode.flux_epoch, episode.turn_index) in self.expired_interruption_episodes:
+                self.logger.write(
+                    "speech.expired_episode.drop",
+                    flux_connection_epoch=episode.flux_epoch,
+                    turn_index=episode.turn_index,
+                )
+                return
+            self.logger.write(
+                "speech.start",
+                flux_connection_epoch=episode.flux_epoch,
+                turn_index=episode.turn_index,
+                stt_episode_id=episode.acoustic_group_id,
+            )
             if self.mic_gate_active():
                 # Gated mic feeds STT silence; anything STT still reports
                 # while TTS is audible can only be residue, never a user.
-                self.logger.write("speech.gated", event_type="speech.start")
+                # Own the entire Flux episode through final EOT; merely
+                # ignoring Start lets its delayed final transcript re-enter
+                # through QUIET recovery once playback becomes inaudible.
+                self.expire_interruption_episode(episode)
+                self.logger.write(
+                    "speech.gated",
+                    event_type="speech.start",
+                    flux_connection_epoch=episode.flux_epoch,
+                    turn_index=episode.turn_index,
+                )
                 return
-            if self.barge_pending:
-                return
-            if self.native_speaker and self.native_speaker.is_audible():
-                # Mid-playback speech could be the user or echo residue the
-                # canceller missed. Pause instead of killing the turn and let
-                # the transcript decide (resolve_pending_barge_in).
-                self.begin_pending_barge_in()
-                return
-            await self.barge_in(reason="speech_start")
-            await self.maybe_start_compaction(reason="speech_start", run_in_background=True)
+            playback_exposed = self.playback_is_exposed()
+            await self.reduce_interruption_event(
+                InterruptionEvent.start(
+                    episode,
+                    self.interruption_elapsed_ms(),
+                    playback_exposed=playback_exposed,
+                )
+            )
         elif event["type"] == "speech.resumed":
-            self.logger.write("speech.resumed")
-            if self.mic_gate_active():
-                self.logger.write("speech.gated", event_type="speech.resumed")
-                return
-            if self.barge_pending:
-                # Speech is still going; keep the pause held.
-                self.last_speech_at = time.perf_counter()
-                return
-            await self.barge_in(reason="speech_resumed")
+            # Flux TurnResumed means an *eager* EOT prediction was revoked.
+            # It is not fresh acoustic evidence and must never flush real
+            # playback or abort OpenCode.  We keep it for correlation only.
+            self.logger.write(
+                "speech.resumed",
+                action="ignored",
+                flux_connection_epoch=event_epoch,
+                turn_index=event.get("turn_index"),
+            )
+            episode = self.interruption_episode_for(event)
+            await self.reduce_interruption_event(
+                InterruptionEvent.turn_resumed(episode, self.interruption_elapsed_ms())
+            )
         elif event["type"] == "speech.transcript":
-            if self.barge_pending:
-                # Interim words prove the speaker is still talking; hold the
-                # pause so the confirm deadline doesn't fire mid-utterance.
-                self.last_speech_at = time.perf_counter()
-            if event.get("is_final") and event.get("transcript"):
-                self.final_transcript = str(event["transcript"]).strip()
+            transcript = str(event.get("transcript") or "").strip()
+            if event.get("is_final") and transcript:
+                self.final_transcript = transcript
                 self.logger.write("speech.transcript.final", transcript_chars=len(self.final_transcript))
+            if transcript:
+                episode = self.interruption_episode_for(event)
+                if (episode.flux_epoch, episode.turn_index) in self.expired_interruption_episodes:
+                    self.logger.write(
+                        "speech.expired_episode.drop",
+                        flux_connection_epoch=episode.flux_epoch,
+                        turn_index=episode.turn_index,
+                    )
+                    return
+                correlation = (
+                    self.interruption_echo_correlation()
+                    if self.interruption_state.phase
+                    in {InterruptionPhase.CANDIDATE, InterruptionPhase.SUPPRESSED}
+                    else None
+                )
+                await self.reduce_interruption_event(
+                    InterruptionEvent.interim(
+                        episode,
+                        self.interruption_elapsed_ms(),
+                        transcript,
+                        correlation=correlation,
+                        playback_exposed=self.playback_is_exposed(),
+                    )
+                )
         elif event["type"] == "speech.end":
             transcript = str(event.get("transcript") or self.final_transcript).strip()
             self.final_transcript = ""
             eager = bool(event.get("eager"))
             confidence = event.get("confidence")
             confidence = float(confidence) if isinstance(confidence, (int, float)) else None
-            self.logger.write("speech.end", transcript_chars=len(transcript), eager=eager, confidence=confidence)
-            await self.handle_transcript(transcript, eager=eager, confidence=confidence)
+            episode = self.interruption_episode_for(event)
+            expired_episode = (episode.flux_epoch, episode.turn_index) in self.expired_interruption_episodes
+            if expired_episode:
+                self.logger.write(
+                    "speech.expired_episode.drop",
+                    flux_connection_epoch=episode.flux_epoch,
+                    turn_index=episode.turn_index,
+                )
+                return
+            if self.interruption_state.phase is InterruptionPhase.QUIET:
+                # Defensive recovery for an EndOfTurn whose StartOfTurn was
+                # lost during a connection boundary.  It still enters the
+                # same controller and uses current playback exposure.
+                self.interruption_episode = episode
+                await self.reduce_interruption_event(
+                    InterruptionEvent.start(
+                        episode,
+                        self.interruption_elapsed_ms(),
+                        playback_exposed=self.playback_is_exposed(),
+                    )
+                )
+            correlation = (
+                self.interruption_echo_correlation()
+                if self.interruption_state.phase in {InterruptionPhase.CANDIDATE, InterruptionPhase.SUPPRESSED}
+                else None
+            )
+            self.logger.write(
+                "speech.end",
+                transcript_chars=len(transcript),
+                eager=eager,
+                confidence=confidence,
+                flux_connection_epoch=episode.flux_epoch,
+                turn_index=episode.turn_index,
+                stt_episode_id=episode.acoustic_group_id,
+            )
+            if eager:
+                self.logger.write(
+                    "speech.eager_eot.ignored",
+                    transcript_chars=len(transcript),
+                    flux_connection_epoch=event_epoch,
+                    turn_index=event.get("turn_index"),
+                )
+                await self.reduce_interruption_event(
+                    InterruptionEvent.eager_eot(
+                        episode,
+                        self.interruption_elapsed_ms(),
+                        transcript,
+                        correlation=correlation,
+                    )
+                )
+                return
+            await self.reduce_interruption_event(
+                InterruptionEvent.final_eot(
+                    episode,
+                    self.interruption_elapsed_ms(),
+                    transcript,
+                    correlation=correlation,
+                    playback_exposed=self.playback_is_exposed(),
+                )
+            )
 
     async def handle_transcript(self, transcript: str, eager: bool, confidence: float | None = None) -> None:
         """The single admission path for every voice transcript. The verdict
@@ -1542,12 +2387,44 @@ class VoiceConnection:
         self.eager_turn_text = text if eager else None
         self.turn_task = asyncio.create_task(self.run_text_turn(text=text, source=source, eager=eager))
 
+    def turn_is_active(self, turn_id: int) -> bool:
+        # Model ownership and playback ownership are independent. A provider
+        # failure advances the playback generation to fence PCM, but the model
+        # turn must keep streaming its remaining screen text. Real turn
+        # cancellation clears active_turn_id synchronously before any await.
+        return self.active_turn_id == turn_id
+
+    async def timeout_silent_turn(self, turn_id: int, started: float, stream_source: str) -> None:
+        """Fail a provider connection stall without shortening long responses."""
+
+        if not self.turn_is_active(turn_id):
+            return
+        self.active_turn_id = None
+        latency_ms = elapsed_ms(started)
+        self.logger.write(
+            "turn.timeout",
+            turn_id=turn_id,
+            latency_ms=latency_ms,
+            stream_source=stream_source,
+            reason="first_text_timeout",
+        )
+        self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
+        await self.send_json(
+            {
+                "type": "turn.timeout",
+                "turn_id": turn_id,
+                "reason": "first_text_timeout",
+            }
+        )
+        self.spawn_background(self.abort_fork_turn())
+
     async def run_text_turn(self, text: str, source: str, eager: bool) -> None:
         if not self.fork_session_id:
             return
         self.turn_seq += 1
         turn_id = self.turn_seq
         self.active_turn_id = turn_id
+        self.turn_playback_tokens[turn_id] = PlaybackToken(self.speak_generation, turn_id)
         self.tts_first_audio_seen = False
         self.turn_spoken_any = False
         started = time.perf_counter()
@@ -1577,7 +2454,7 @@ class VoiceConnection:
             )
             return
         except OpenCodeEventFallback as exc:
-            if self.active_turn_id != turn_id:
+            if not self.turn_is_active(turn_id):
                 return
             self.logger.write(
                 "opencode.stream.fallback",
@@ -1632,21 +2509,57 @@ class VoiceConnection:
         speech_filter = SpeechTextFilter()
         first_text_ms: int | None = None
         full_text = ""
-        while self.active_turn_id == turn_id and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
-            messages = await self.client.messages(session_id)
+        while self.turn_is_active(turn_id) and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
+            if first_text_ms is None and elapsed_ms(started) >= int(self.config.first_text_timeout_sec * 1000):
+                await self.timeout_silent_turn(turn_id, started, stream_source)
+                return
+            try:
+                messages = await asyncio.wait_for(
+                    self.client.messages(session_id),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                self.logger.write(
+                    "opencode.poll.timeout",
+                    turn_id=turn_id,
+                    timeout_ms=1_000,
+                    stream_source=stream_source,
+                )
+                await asyncio.sleep(self.config.poll_interval_sec)
+                continue
+            except Exception as exc:  # noqa: BLE001 - keep polling until the turn deadline.
+                self.logger.write(
+                    "opencode.poll.error",
+                    turn_id=turn_id,
+                    error=repr(exc),
+                    stream_source=stream_source,
+                )
+                await asyncio.sleep(self.config.poll_interval_sec)
+                continue
+            if not self.turn_is_active(turn_id):
+                return
             update = tracker.update(messages)
             if update.deltas and first_text_ms is None:
                 first_text_ms = elapsed_ms(started)
                 await self.send_json({"type": "assistant.first_text", "turn_id": turn_id, "latency_ms": first_text_ms})
                 self.logger.write("assistant.first_text", turn_id=turn_id, latency_ms=first_text_ms)
             for delta in update.deltas:
+                if not self.turn_is_active(turn_id):
+                    return
                 full_text += delta
                 await self.send_json({"type": "assistant.delta", "turn_id": turn_id, "delta": delta})
                 for chunk in chunker.push(speech_filter.push(delta)):
                     await self.speak(chunk, turn_id=turn_id)
+                    if not self.turn_is_active(turn_id):
+                        return
             if update.completed:
+                if not self.turn_is_active(turn_id):
+                    return
                 for chunk in chunker.push(speech_filter.flush()) + chunker.flush():
                     await self.speak(chunk, turn_id=turn_id)
+                    if not self.turn_is_active(turn_id):
+                        return
+                await self.finish_speaking_turn(turn_id)
                 self.log_if_silent_completion(turn_id, update.full_text or full_text)
                 if update.error:
                     await self.send_json(
@@ -1664,6 +2577,7 @@ class VoiceConnection:
                         "turn_id": turn_id,
                         "latency_ms": elapsed_ms(started),
                         "text": update.full_text or full_text,
+                        "stream_source": stream_source,
                     }
                 )
                 self.logger.write(
@@ -1673,13 +2587,17 @@ class VoiceConnection:
                     response_chars=len(update.full_text or full_text),
                     stream_source=stream_source,
                 )
-                self.logger.state_transition("thinking", "ready", turn_id=turn_id)
+                self.logger.state_transition(
+                    "thinking",
+                    "awaiting_playback" if self.turn_spoken_any else "ready",
+                    turn_id=turn_id,
+                )
                 self.active_turn_id = None
                 await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
                 return
             await asyncio.sleep(self.config.poll_interval_sec)
 
-        if self.active_turn_id == turn_id:
+        if self.turn_is_active(turn_id):
             await self.send_json({"type": "turn.timeout", "turn_id": turn_id})
             self.logger.write("turn.timeout", turn_id=turn_id, latency_ms=elapsed_ms(started))
             self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
@@ -1693,6 +2611,7 @@ class VoiceConnection:
         turn_id: int,
         started: float,
     ) -> None:
+        self.turn_playback_tokens.setdefault(turn_id, PlaybackToken(self.speak_generation, turn_id))
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         ready = asyncio.Event()
         reader_task = asyncio.create_task(self.read_opencode_events(session_id, queue, ready))
@@ -1710,68 +2629,194 @@ class VoiceConnection:
             prompt_sent = True
             await self.send_json({"type": "opencode.requested", "turn_id": turn_id})
 
-            tracker = OpenCodeEventTurnTracker(
-                session_id=session_id,
-                existing_message_ids={
-                    str((message.get("info") or {}).get("id") or "")
-                    for message in before_messages
-                    if isinstance(message, dict)
-                },
-            )
+            tracker = HybridOpenCodeTurnTracker(session_id=session_id, before_messages=before_messages)
             chunker = TTSChunker()
             speech_filter = SpeechTextFilter()
             first_text_ms: int | None = None
             full_text = ""
             stale_idle_logged = False
-            # Set once completion is signalled before any text: a short window
-            # to let text parts that trail the idle/completed event on the
-            # subscription still land, instead of bailing straight to polling.
             completion_grace_deadline: float | None = None
+            completion_observed = False
             last_event_ms = elapsed_ms(started)
-            while self.active_turn_id == turn_id and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
-                if completion_grace_deadline is not None:
-                    remaining = completion_grace_deadline - time.perf_counter()
-                    if remaining <= 0:
-                        raise OpenCodeEventFallback("event_stream_completed_without_text", prompt_sent=prompt_sent)
-                    get_timeout: float = min(remaining, 0.2)
-                else:
-                    # Before the first delta, fail over to polling quickly; a
-                    # stream that produced text already earns a longer stall
-                    # budget (tool calls can pause deltas mid-turn).
-                    get_timeout = 3 if first_text_ms is None else 8
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=get_timeout)
-                except asyncio.TimeoutError as exc:
-                    if completion_grace_deadline is not None:
-                        continue  # keep draining for trailing text until the grace expires
+            hedge_active = False
+            event_healthy = True
+            hedge_deadline = time.perf_counter() + 3.0
+            poll_interval = max(0.5, self.config.poll_interval_sec * 5)
+            poll_task: asyncio.Task[None] | None = None
+            no_first_text_logged = False
+            text_sources: set[str] = set()
+
+            def ensure_polling() -> None:
+                nonlocal poll_task
+                if poll_task is None or poll_task.done():
+                    poll_task = asyncio.create_task(
+                        self.poll_opencode_messages(
+                            session_id=session_id,
+                            queue=queue,
+                            turn_id=turn_id,
+                            interval_sec=poll_interval,
+                        ),
+                        name=f"opencode-poll-{turn_id}",
+                    )
+
+            async def consume_update(update: Any, source: str) -> bool:
+                nonlocal first_text_ms, full_text, completion_grace_deadline
+                nonlocal completion_observed, hedge_deadline
+                if not self.turn_is_active(turn_id):
+                    return False
+                if update.deltas:
+                    text_sources.add(source)
                     if first_text_ms is None:
-                        raise OpenCodeEventFallback("event_stream_no_initial_events", prompt_sent=prompt_sent) from exc
-                    raise OpenCodeEventFallback("event_stream_stalled", prompt_sent=prompt_sent) from exc
-                if event.get("type") == "_stream_error":
-                    raise OpenCodeEventFallback(str(event.get("reason") or "event_stream_error"), prompt_sent=prompt_sent)
-                last_event_ms = elapsed_ms(started)
-                update = tracker.update(event)
-                if tracker.stale_idles and not stale_idle_logged:
-                    stale_idle_logged = True
-                    self.logger.write("opencode.stream.stale_idle", turn_id=turn_id)
-                if update.deltas and first_text_ms is None:
-                    first_text_ms = elapsed_ms(started)
-                    await self.send_json({"type": "assistant.first_text", "turn_id": turn_id, "latency_ms": first_text_ms})
-                    self.logger.write("assistant.first_text", turn_id=turn_id, latency_ms=first_text_ms)
-                    self.logger.write("opencode.stream.first_delta", turn_id=turn_id, latency_ms=first_text_ms)
-                for delta in update.deltas:
-                    full_text += delta
-                    await self.send_json({"type": "assistant.delta", "turn_id": turn_id, "delta": delta})
-                    for chunk in chunker.push(speech_filter.push(delta)):
-                        await self.speak(chunk, turn_id=turn_id)
-                if update.completed:
-                    if not update.full_text and not full_text:
-                        if completion_grace_deadline is None:
-                            completion_grace_deadline = (
-                                time.perf_counter() + self.config.event_completion_grace_sec
+                        first_text_ms = elapsed_ms(started)
+                        await self.send_json(
+                            {"type": "assistant.first_text", "turn_id": turn_id, "latency_ms": first_text_ms}
+                        )
+                        self.logger.write("assistant.first_text", turn_id=turn_id, latency_ms=first_text_ms)
+                        self.logger.write(
+                            "opencode.stream.first_delta",
+                            turn_id=turn_id,
+                            latency_ms=first_text_ms,
+                            source=source,
+                        )
+                    for delta in update.deltas:
+                        if not self.turn_is_active(turn_id):
+                            return False
+                        full_text += delta
+                        await self.send_json({"type": "assistant.delta", "turn_id": turn_id, "delta": delta})
+                        for chunk in chunker.push(speech_filter.push(delta)):
+                            await self.speak(chunk, turn_id=turn_id)
+                            if not self.turn_is_active(turn_id):
+                                return False
+                    if not hedge_active:
+                        hedge_deadline = time.perf_counter() + 3.0
+                    if completion_observed and self.config.event_completion_grace_sec > 0:
+                        # Completion can arrive before one or more part events.
+                        # Debounce from the latest unseen text, not the first
+                        # premature session.idle signal.
+                        completion_grace_deadline = (
+                            time.perf_counter() + self.config.event_completion_grace_sec
+                        )
+
+                if not update.completed:
+                    return False
+                # A completed messages snapshot is already the canonical
+                # polling observation. Event completion, however, is only a
+                # signal: part events can still be queued behind session.idle.
+                if source == "poll" and not completion_observed:
+                    return bool(update.full_text or full_text)
+                completion_observed = True
+                if self.config.event_completion_grace_sec <= 0:
+                    return bool(update.full_text or full_text)
+                if completion_grace_deadline is None:
+                    completion_grace_deadline = (
+                        time.perf_counter() + self.config.event_completion_grace_sec
+                    )
+                    self.logger.write("opencode.stream.completion_grace", turn_id=turn_id)
+                return False
+
+            while self.turn_is_active(turn_id) and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
+                now = time.perf_counter()
+                if first_text_ms is None and elapsed_ms(started) >= int(
+                    self.config.first_text_timeout_sec * 1000
+                ):
+                    await self.timeout_silent_turn(turn_id, started, "event")
+                    return
+                if first_text_ms is None and not no_first_text_logged and elapsed_ms(started) >= 10_000:
+                    no_first_text_logged = True
+                    self.logger.write(
+                        "opencode.stream.first_delta.delayed",
+                        turn_id=turn_id,
+                        latency_ms=elapsed_ms(started),
+                        event_healthy=event_healthy,
+                        poll_active=bool(poll_task and not poll_task.done()),
+                    )
+                if completion_grace_deadline is not None and now >= completion_grace_deadline:
+                    # Reconcile through the same message-id tracker before
+                    # closing TTS, so a suffix observed only by polling still
+                    # reaches both the screen and speech exactly once.
+                    try:
+                        messages = await asyncio.wait_for(
+                            self.client.messages(session_id),
+                            timeout=1.0,
+                        )
+                    except asyncio.TimeoutError:
+                        self.logger.write(
+                            "opencode.stream.completion_reconcile.timeout",
+                            turn_id=turn_id,
+                            timeout_ms=1_000,
+                        )
+                        if full_text:
+                            stream_source = (
+                                "hybrid"
+                                if text_sources == {"event", "poll"}
+                                else next(iter(text_sources), "event")
                             )
-                            self.logger.write("opencode.stream.completion_grace", turn_id=turn_id)
-                        continue  # wait out the grace for trailing text parts
+                            await self.complete_event_text_turn(
+                                session_id=session_id,
+                                before_messages=before_messages,
+                                turn_id=turn_id,
+                                started=started,
+                                chunker=chunker,
+                                speech_filter=speech_filter,
+                                event_text=full_text,
+                                stream_source=stream_source,
+                            )
+                            self.logger.write(
+                                "opencode.stream.done",
+                                turn_id=turn_id,
+                                latency_ms=elapsed_ms(started),
+                                last_event_ms=last_event_ms,
+                                final_fetch="timeout",
+                            )
+                            return
+                        completion_grace_deadline = time.perf_counter() + poll_interval
+                        continue
+                    except Exception as exc:  # noqa: BLE001 - keep SSE alive and retry the grace fetch.
+                        self.logger.write(
+                            "opencode.stream.completion_reconcile.error",
+                            turn_id=turn_id,
+                            error=repr(exc),
+                        )
+                        if full_text:
+                            stream_source = (
+                                "hybrid"
+                                if text_sources == {"event", "poll"}
+                                else next(iter(text_sources), "event")
+                            )
+                            await self.complete_event_text_turn(
+                                session_id=session_id,
+                                before_messages=before_messages,
+                                turn_id=turn_id,
+                                started=started,
+                                chunker=chunker,
+                                speech_filter=speech_filter,
+                                event_text=full_text,
+                                stream_source=stream_source,
+                            )
+                            self.logger.write(
+                                "opencode.stream.done",
+                                turn_id=turn_id,
+                                latency_ms=elapsed_ms(started),
+                                last_event_ms=last_event_ms,
+                                final_fetch="error",
+                            )
+                            return
+                        completion_grace_deadline = time.perf_counter() + poll_interval
+                        continue
+                    update = tracker.update_messages(messages)
+                    if not self.turn_is_active(turn_id):
+                        return
+                    await consume_update(update, "poll")
+                    if not self.turn_is_active(turn_id):
+                        return
+                    if not update.full_text and not full_text:
+                        hedge_active = True
+                        ensure_polling()
+                        completion_grace_deadline = time.perf_counter() + poll_interval
+                        continue
+                    stream_source = (
+                        "hybrid" if text_sources == {"event", "poll"} else next(iter(text_sources), "event")
+                    )
                     await self.complete_event_text_turn(
                         session_id=session_id,
                         before_messages=before_messages,
@@ -1779,7 +2824,81 @@ class VoiceConnection:
                         started=started,
                         chunker=chunker,
                         speech_filter=speech_filter,
-                        event_text=update.full_text or full_text,
+                        event_text=full_text,
+                        stream_source=stream_source,
+                    )
+                    self.logger.write(
+                        "opencode.stream.done",
+                        turn_id=turn_id,
+                        latency_ms=elapsed_ms(started),
+                        last_event_ms=last_event_ms,
+                    )
+                    return
+                if not hedge_active and now >= hedge_deadline:
+                    hedge_active = True
+                    ensure_polling()
+                    self.logger.write("opencode.stream.poll_hedge.start", turn_id=turn_id, after_ms=3000)
+
+                source: str
+                turn_deadline = started + self.config.max_turn_sec
+                deadline = turn_deadline if hedge_active else min(turn_deadline, hedge_deadline)
+                if first_text_ms is None:
+                    deadline = min(deadline, started + self.config.first_text_timeout_sec)
+                if first_text_ms is None and not no_first_text_logged:
+                    deadline = min(deadline, started + 10.0)
+                if completion_grace_deadline is not None:
+                    deadline = min(deadline, completion_grace_deadline)
+                timeout = max(0.01, deadline - now)
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    continue
+                event_type = str(event.get("type") or "")
+                if event_type == "_poll_error":
+                    continue
+                if event_type == "_poll_messages":
+                    messages = event.get("messages")
+                    update = tracker.update_messages(messages if isinstance(messages, list) else [])
+                    source = "poll"
+                else:
+                    if event_type == "_stream_error":
+                        # This is an actual connection/read/parser failure, not
+                        # model silence. Keep the turn alive through an
+                        # independent polling producer.
+                        event_healthy = False
+                        hedge_active = True
+                        ensure_polling()
+                        self.logger.write(
+                            "opencode.stream.error",
+                            turn_id=turn_id,
+                            reason=str(event.get("reason") or "event_stream_error"),
+                            prompt_sent=prompt_sent,
+                        )
+                        continue
+                    last_event_ms = elapsed_ms(started)
+                    update = tracker.update_event(event)
+                    source = "event"
+                if not self.turn_is_active(turn_id):
+                    return
+                if tracker.stale_idles and not stale_idle_logged:
+                    stale_idle_logged = True
+                    self.logger.write("opencode.stream.stale_idle", turn_id=turn_id)
+                completed = await consume_update(update, source)
+                if completed:
+                    if not self.turn_is_active(turn_id):
+                        return
+                    stream_source = (
+                        "hybrid" if text_sources == {"event", "poll"} else next(iter(text_sources), source)
+                    )
+                    await self.complete_event_text_turn(
+                        session_id=session_id,
+                        before_messages=before_messages,
+                        turn_id=turn_id,
+                        started=started,
+                        chunker=chunker,
+                        speech_filter=speech_filter,
+                        event_text=full_text,
+                        stream_source=stream_source,
                     )
                     self.logger.write(
                         "opencode.stream.done",
@@ -1789,12 +2908,15 @@ class VoiceConnection:
                     )
                     return
 
-            if self.active_turn_id == turn_id:
+            if self.turn_is_active(turn_id):
                 await self.send_json({"type": "turn.timeout", "turn_id": turn_id})
                 self.logger.write("turn.timeout", turn_id=turn_id, latency_ms=elapsed_ms(started), stream_source="event")
                 self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
                 self.active_turn_id = None
         finally:
+            if "poll_task" in locals() and poll_task is not None:
+                poll_task.cancel()
+                await asyncio.gather(poll_task, return_exceptions=True)
             reader_task.cancel()
             try:
                 await reader_task
@@ -1818,6 +2940,57 @@ class VoiceConnection:
                 ready.set()
             await queue.put({"type": "_stream_error", "reason": repr(exc)})
 
+    async def poll_opencode_messages(
+        self,
+        *,
+        session_id: str,
+        queue: asyncio.Queue[dict[str, Any]],
+        turn_id: int,
+        interval_sec: float,
+        request_timeout_sec: float = 1.0,
+    ) -> None:
+        """Produce bounded polling observations without blocking SSE consumption."""
+
+        attempt = 0
+        try:
+            while self.turn_is_active(turn_id):
+                attempt += 1
+                started = time.perf_counter()
+                try:
+                    messages = await asyncio.wait_for(
+                        self.client.messages(session_id),
+                        timeout=request_timeout_sec,
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.write(
+                        "opencode.stream.poll_hedge.timeout",
+                        turn_id=turn_id,
+                        attempt=attempt,
+                        timeout_ms=int(request_timeout_sec * 1000),
+                    )
+                    await queue.put({"type": "_poll_error", "reason": "timeout"})
+                except Exception as exc:  # noqa: BLE001 - SSE remains authoritative.
+                    self.logger.write(
+                        "opencode.stream.poll_hedge.error",
+                        turn_id=turn_id,
+                        attempt=attempt,
+                        error=repr(exc),
+                    )
+                    await queue.put({"type": "_poll_error", "reason": type(exc).__name__})
+                else:
+                    if attempt == 1 or attempt % 10 == 0:
+                        self.logger.write(
+                            "opencode.stream.poll_hedge.observation",
+                            turn_id=turn_id,
+                            attempt=attempt,
+                            latency_ms=elapsed_ms(started),
+                            message_count=len(messages),
+                        )
+                    await queue.put({"type": "_poll_messages", "messages": messages})
+                await asyncio.sleep(interval_sec)
+        except asyncio.CancelledError:
+            raise
+
     async def complete_event_text_turn(
         self,
         session_id: str,
@@ -1827,30 +3000,86 @@ class VoiceConnection:
         chunker: TTSChunker,
         speech_filter: SpeechTextFilter,
         event_text: str,
+        stream_source: str = "event",
     ) -> None:
+        # Fetch the canonical message before closing TTS. OpenCode can expose
+        # session completion before its last part event reaches our SSE queue;
+        # any prefix-compatible suffix must pass through the ordinary delta
+        # and speech pipeline before provider EOF.
+        final_error: Any | None = None
+        try:
+            messages = await asyncio.wait_for(
+                self.client.messages(session_id),
+                timeout=1.0,
+            )
+        except asyncio.TimeoutError:
+            self.logger.write(
+                "opencode.stream.final_fetch.timeout",
+                turn_id=turn_id,
+                timeout_ms=1_000,
+            )
+            final_text = event_text
+        except Exception as exc:  # noqa: BLE001 - streamed text is already authoritative enough to finish.
+            self.logger.write(
+                "opencode.stream.final_fetch.error",
+                turn_id=turn_id,
+                error=repr(exc),
+            )
+            final_text = event_text
+        else:
+            if not self.turn_is_active(turn_id):
+                return
+            final_tracker = AssistantTextTracker(before_messages)
+            final_update = final_tracker.update(messages)
+            final_text = final_update.full_text or event_text
+            final_error = final_update.error
+        if final_text.startswith(event_text):
+            final_suffix = final_text[len(event_text) :]
+            if final_suffix:
+                await self.send_json(
+                    {"type": "assistant.delta", "turn_id": turn_id, "delta": final_suffix}
+                )
+                for chunk in chunker.push(speech_filter.push(final_suffix)):
+                    await self.speak(chunk, turn_id=turn_id)
+                    if not self.turn_is_active(turn_id):
+                        return
+                if stream_source == "event":
+                    stream_source = "hybrid"
+        elif final_text != event_text:
+            # Protocol v0 has append-only deltas, so a rewrite cannot retract
+            # already rendered text. Keep the canonical complete payload and
+            # avoid speaking a corrupt partial replacement.
+            self.logger.write(
+                "opencode.stream.final_rewrite",
+                turn_id=turn_id,
+                streamed_chars=len(event_text),
+                final_chars=len(final_text),
+            )
         for chunk in chunker.push(speech_filter.flush()) + chunker.flush():
             await self.speak(chunk, turn_id=turn_id)
-        messages = await self.client.messages(session_id)
-        final_tracker = AssistantTextTracker(before_messages)
-        final_update = final_tracker.update(messages)
-        final_text = final_update.full_text or event_text
+            if not self.turn_is_active(turn_id):
+                return
+        await self.finish_speaking_turn(turn_id)
+        if not self.turn_is_active(turn_id):
+            return
         self.log_if_silent_completion(turn_id, final_text)
-        if final_update.error:
+        if final_error:
             await self.send_json(
                 {
                     "type": "turn.error",
                     "turn_id": turn_id,
-                    "message": str(final_update.error)[:1000],
-                    "failure": classify_turn_failure(final_update.error),
+                    "message": str(final_error)[:1000],
+                    "failure": classify_turn_failure(final_error),
                 }
             )
-            self.logger.write("turn.error", turn_id=turn_id, error=final_update.error)
+            self.logger.write("turn.error", turn_id=turn_id, error=final_error)
         await self.send_json(
             {
                 "type": "turn.complete",
                 "turn_id": turn_id,
                 "latency_ms": elapsed_ms(started),
                 "text": final_text,
+                "stream_source": stream_source,
             }
         )
         self.logger.write(
@@ -1858,9 +3087,13 @@ class VoiceConnection:
             turn_id=turn_id,
             latency_ms=elapsed_ms(started),
             response_chars=len(final_text),
-            stream_source="event",
+            stream_source=stream_source,
         )
-        self.logger.state_transition("thinking", "ready", turn_id=turn_id)
+        self.logger.state_transition(
+            "thinking",
+            "awaiting_playback" if self.turn_spoken_any else "ready",
+            turn_id=turn_id,
+        )
         self.active_turn_id = None
         await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
 
@@ -1900,46 +3133,243 @@ class VoiceConnection:
                 await self.compact(reason="context_overflow_error", before_tokens=before_tokens)
                 tracker = AssistantTextTracker(await self.client.messages(session_id))
 
-    def build_speaker(self) -> DeepgramSpeakSession | CartesiaSpeakSession:
-        # Bind the current generation so audio still streaming from a
-        # barged-in speaker cannot reach the lane or resurrect playback.
-        generation = self.speak_generation
-
-        async def deliver(data: bytes, turn_id: int | None) -> None:
-            if generation != self.speak_generation:
+    def build_speaker(self) -> TTSProvider:
+        async def deliver(token: PlaybackToken, data: bytes) -> None:
+            if (
+                token.generation != self.speak_generation
+                or self.turn_playback_tokens.get(token.turn_id) != token
+            ):
                 self.stale_tts_chunks += 1
                 if self.stale_tts_chunks == 1 or self.stale_tts_chunks % 50 == 0:
-                    self.logger.write("tts.stale_audio.drop", chunks=self.stale_tts_chunks, turn_id=turn_id)
+                    self.logger.write(
+                        "tts.stale_audio.drop",
+                        chunks=self.stale_tts_chunks,
+                        turn_id=token.turn_id,
+                        playback_generation=token.generation,
+                    )
                 return
-            await self.send_tts_audio(data, turn_id)
+            await self.send_tts_audio(data, token)
 
-        # Built fresh each call (not a module-level constant) so tests can
-        # patch opencode_voice.server.DeepgramSpeakSession/CartesiaSpeakSession
-        # and have the swap take effect; adding a provider is one entry here
-        # plus one class with the same start/speak/close(config, on_audio,
-        # on_event) shape.
-        tts_provider_sessions: dict[str, type] = {
-            "deepgram": DeepgramSpeakSession,
-            "cartesia": CartesiaSpeakSession,
-        }
-        session_cls = tts_provider_sessions.get(self.config.tts_provider, DeepgramSpeakSession)
-        return session_cls(
-            config=self.config,
-            on_audio=deliver,
-            on_event=self.send_json,
+        if self.config.tts_provider == "cartesia":
+            return CartesiaTTSProvider(
+                CartesiaTTSOptions(
+                    api_key=os.environ.get("CARTESIA_API_KEY", ""),
+                    voice_id=self.config.cartesia_voice_id,
+                    model=self.config.cartesia_tts_model,
+                    version=self.config.cartesia_version,
+                    sample_rate=self.config.tts_sample_rate,
+                ),
+                deliver,
+                self.handle_tts_provider_event,
+            )
+        return DeepgramTTSProvider(
+            DeepgramTTSOptions(
+                api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
+                model=self.config.deepgram_tts_model,
+                sample_rate=self.config.tts_sample_rate,
+            ),
+            deliver,
+            self.handle_tts_provider_event,
         )
+
+    async def handle_tts_provider_event(self, event: dict[str, Any]) -> None:
+        # Provider detail belongs in local diagnostics, never normal UI. Keep
+        # only categorical lifecycle/error fields; raw provider text remains
+        # excluded while terminal ownership is preserved end-to-end.
+        event_type = str(event.get("type") or "tts.provider.event")
+        token = self.tts_token_from_provider_event(event)
+        error_code = str(event.get("error_code") or "") or (
+            "provider_transport_failure"
+            if event_type in {"tts.turn.failed", "tts.transport.disconnected"}
+            else None
+        )
+        self.logger.write(
+            "tts.provider.event",
+            provider_event=event_type,
+            provider=str(event.get("provider") or self.config.tts_provider),
+            stage=event_type.rsplit(".", 1)[-1],
+            error_code=error_code,
+            provider_context_id=event.get("context_id"),
+            provider_request_id=event.get("request_id"),
+            provider_connection_epoch=event.get("epoch"),
+            provider_message_type=event.get("message_type"),
+            close_code=event.get("close_code"),
+            turn_id=token.turn_id if token else event.get("turn_id"),
+            playback_generation=token.generation if token else None,
+            text_chars=event.get("chars"),
+        )
+
+        if token is None:
+            return
+        if event_type == "tts.turn.begin":
+            self.tts_terminal_tokens.pop(token, None)
+            self.tts_last_audio_at.pop(token, None)
+            if self.native_audio_engine:
+                self.native_audio_engine.begin_turn(token)
+            elif self.native_speaker:
+                begin_turn = getattr(self.native_speaker, "begin_turn", None)
+                if begin_turn:
+                    begin_turn(token)
+            await self.on_tts_turn_began(token)
+        elif event_type == "tts.turn.finish":
+            self.arm_tts_terminal_watchdog(token)
+        elif event_type in {"tts.turn.done", "tts.turn.failed"}:
+            outcome = "done" if event_type == "tts.turn.done" else "failed"
+            await self.on_tts_turn_terminal(token, outcome, error_code=error_code)
+
+    @staticmethod
+    def tts_token_from_provider_event(event: dict[str, Any]) -> PlaybackToken | None:
+        turn_id = event.get("turn_id")
+        generation = event.get("playback_generation")
+        if generation is None:
+            generation = event.get("generation", event.get("token"))
+        if isinstance(turn_id, bool) or not isinstance(turn_id, int):
+            return None
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            return None
+        return PlaybackToken(generation, turn_id)
+
+    async def on_tts_turn_began(self, token: PlaybackToken) -> None:
+        """Subclass hook for protocol-specific per-turn lifecycle state."""
+
+        return None
+
+    def arm_tts_terminal_watchdog(self, token: PlaybackToken) -> None:
+        previous = self.tts_terminal_watchdogs.pop(token, None)
+        if previous and not previous.done():
+            previous.cancel()
+        task = asyncio.create_task(self.watch_tts_terminal(token))
+        self.tts_terminal_watchdogs[token] = task
+
+        def discard(done: asyncio.Task[None]) -> None:
+            if self.tts_terminal_watchdogs.get(token) is done:
+                self.tts_terminal_watchdogs.pop(token, None)
+
+        task.add_done_callback(discard)
+
+    async def watch_tts_terminal(self, token: PlaybackToken) -> None:
+        """Fail a context that stops producing PCM but never reports done."""
+
+        started_at = time.monotonic()
+        try:
+            while not self.closed and token not in self.tts_terminal_tokens:
+                last_audio_at = self.tts_last_audio_at.get(token)
+                deadline = (last_audio_at + 2.0) if last_audio_at is not None else (started_at + 5.0)
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(min(0.25, remaining))
+                    continue
+                await self.handle_tts_provider_event(
+                    {
+                        "type": "tts.turn.failed",
+                        "provider": self.config.tts_provider,
+                        "turn_id": token.turn_id,
+                        "playback_generation": token.generation,
+                        "error_code": "provider_done_timeout",
+                    }
+                )
+                return
+        except asyncio.CancelledError:
+            raise
+
+    async def on_tts_turn_terminal(
+        self,
+        token: PlaybackToken,
+        outcome: str,
+        *,
+        error_code: str | None = None,
+    ) -> None:
+        if token in self.tts_terminal_tokens:
+            return
+        self.tts_terminal_tokens[token] = outcome
+        failure_was_current = outcome == "failed" and token.generation == self.speak_generation
+        watchdog = self.tts_terminal_watchdogs.pop(token, None)
+        current = asyncio.current_task()
+        if watchdog and watchdog is not current and not watchdog.done():
+            watchdog.cancel()
+        if failure_was_current:
+            # A failed provider turn must stop its already-buffered spoken
+            # remainder while preserving the completed screen text.
+            self.speak_generation += 1
+            if self.native_audio_engine:
+                self.native_audio_engine.invalidate_generation(self.speak_generation)
+            if self.native_speaker:
+                invalidate = getattr(self.native_speaker, "invalidate_generation", None)
+                if invalidate:
+                    invalidate(self.speak_generation, "provider_failed")
+                else:
+                    self.native_speaker.flush(reason="provider_failed")
+        elif self.native_audio_engine:
+            await self.native_audio_engine.finish_turn(token, outcome)
+        elif self.native_speaker:
+            finish_turn = getattr(self.native_speaker, "finish_turn", None)
+            if finish_turn:
+                await finish_turn(token, outcome)
+        if self.tts_turn_token == token:
+            self.tts_turn_token = None
+
+        if outcome != "failed":
+            return
+        if not failure_was_current:
+            # A delayed failure marker from a generation already interrupted
+            # must not close a newly reconnected provider or alarm the user.
+            self.logger.write(
+                "tts.turn.failure.stale",
+                turn_id=token.turn_id,
+                playback_generation=token.generation,
+                active_playback_generation=self.speak_generation,
+            )
+            return
+        self.tts_failed_turns.add(token.turn_id)
+        if token not in self.tts_failure_reported:
+            self.tts_failure_reported.add(token)
+            await self.send_json(
+                voice_bridge_issue_payload(
+                    capability="voice_audio",
+                    diagnostic_code="tts_provider_unavailable",
+                    safe_detail="Voice playback interrupted",
+                    retryable=True,
+                    debug_ref=str(self.logger.run_dir),
+                    voice_lane_id=self.voice_lane_id,
+                )
+            )
+        failed_speaker = self.speaker
+        if failed_speaker is not None:
+            self.speaker = None
+            self.spawn_background(self.recover_speaker_after_failure(failed_speaker))
+
+    async def recover_speaker_after_failure(self, failed_speaker: TTSProvider) -> None:
+        await self.close_speaker_quietly(failed_speaker)
+        if not self.closed and self.speaker is None:
+            await self.prewarm_speaker()
 
     async def prewarm_speaker(self) -> None:
         """Open the TTS socket while the model is thinking so the handshake
         is off the first-audio path."""
-        if self.speaker is not None or self.config.credential_issue_for("voice_audio"):
+        if self.config.credential_issue_for("voice_audio"):
+            return
+        if self.speaker is not None:
+            if bool(getattr(self.speaker, "connected", True)):
+                return
+            try:
+                await self.speaker.connect()
+            except Exception as exc:  # noqa: BLE001 - speak() retries; prewarm is best-effort.
+                self.logger.write(
+                    "tts.prewarm.error",
+                    stage="reconnect",
+                    error_code=type(exc).__name__,
+                )
             return
         speaker = self.build_speaker()
         self.speaker = speaker
         try:
-            await speaker.start()
+            await speaker.connect()
         except Exception as exc:  # noqa: BLE001 - speak() retries; prewarm is best-effort.
-            self.logger.write("tts.prewarm.error", error=repr(exc))
+            self.logger.write(
+                "tts.prewarm.error",
+                stage="connect",
+                error_code=type(exc).__name__,
+            )
             if self.speaker is speaker:
                 self.speaker = None
 
@@ -1948,17 +3378,81 @@ class VoiceConnection:
         if issue:
             await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
             return
-        self.turn_spoken_any = True
+        if self.active_turn_id is not None and self.active_turn_id != turn_id:
+            return
         # Rolling record of what the assistant said recently; the pending
         # barge-in resolver matches transcripts against it to spot echo.
         self.spoken_text_recent = (self.spoken_text_recent + " " + text)[-1000:]
+        if turn_id in self.tts_failed_turns:
+            return
         if self.speaker is None:
             self.speaker = self.build_speaker()
         speaker = self.speaker
-        await speaker.start()
-        if self.speaker is not speaker:
+        token = self.turn_playback_tokens.setdefault(turn_id, PlaybackToken(self.speak_generation, turn_id))
+        if token.generation != self.speak_generation:
             return
-        await speaker.speak(text, turn_id=turn_id)
+        try:
+            await speaker.connect()
+            if (
+                self.speaker is not speaker
+                or (self.active_turn_id is not None and self.active_turn_id != turn_id)
+                or token.generation != self.speak_generation
+            ):
+                return
+            if self.tts_turn_token != token:
+                await speaker.begin_turn(token)
+                self.tts_turn_token = token
+            if (
+                (self.active_turn_id is not None and self.active_turn_id != turn_id)
+                or token.generation != self.speak_generation
+            ):
+                return
+            await speaker.append_text(token, text)
+            self.turn_spoken_any = True
+        except StalePlaybackToken:
+            return
+        except (TTSProviderError, OSError, asyncio.TimeoutError) as exc:
+            self.logger.write(
+                "tts.turn.error",
+                turn_id=turn_id,
+                stage="append_text",
+                error_code=type(exc).__name__,
+            )
+            await self.handle_tts_provider_event(
+                {
+                    "type": "tts.turn.failed",
+                    "provider": self.config.tts_provider,
+                    "turn_id": token.turn_id,
+                    "playback_generation": token.generation,
+                    "error_code": "append_failed",
+                }
+            )
+
+    async def finish_speaking_turn(self, turn_id: int) -> None:
+        token = self.tts_turn_token
+        speaker = self.speaker
+        if not speaker or not token or token.turn_id != turn_id or turn_id in self.tts_failed_turns:
+            return
+        try:
+            await speaker.finish_turn(token)
+        except StalePlaybackToken:
+            return
+        except (TTSProviderError, OSError, asyncio.TimeoutError) as exc:
+            self.logger.write(
+                "tts.turn.error",
+                turn_id=turn_id,
+                stage="finish_turn",
+                error_code=type(exc).__name__,
+            )
+            await self.handle_tts_provider_event(
+                {
+                    "type": "tts.turn.failed",
+                    "provider": self.config.tts_provider,
+                    "turn_id": token.turn_id,
+                    "playback_generation": token.generation,
+                    "error_code": "finish_failed",
+                }
+            )
 
     def log_if_silent_completion(self, turn_id: int, response_text: str) -> None:
         """A completed turn with real reply text but zero speak() calls means
@@ -1969,11 +3463,14 @@ class VoiceConnection:
         if response_text.strip() and not self.turn_spoken_any:
             self.logger.write("tts.no_speakable_text", turn_id=turn_id, response_chars=len(response_text))
 
-    async def send_tts_audio(self, data: bytes, turn_id: int | None) -> None:
+    async def send_tts_audio(self, data: bytes, turn_id: int | PlaybackToken | None) -> None:
+        legacy_turn_id = turn_id.turn_id if isinstance(turn_id, PlaybackToken) else turn_id
+        if isinstance(turn_id, PlaybackToken):
+            self.tts_last_audio_at[turn_id] = time.monotonic()
         if not self.tts_first_audio_seen:
             self.tts_first_audio_seen = True
-            await self.send_json({"type": "tts.first_audio", "turn_id": turn_id})
-            self.logger.write("tts.first_audio", turn_id=turn_id)
+            await self.send_json({"type": "tts.first_audio", "turn_id": legacy_turn_id})
+            self.logger.write("tts.first_audio", turn_id=legacy_turn_id)
         async with self.send_lock:
             await self.websocket.send_bytes(data)
 
@@ -1981,29 +3478,65 @@ class VoiceConnection:
         """Stop the active turn and any speakers; the single owner of the
         speak-generation bump that keeps stale TTS audio off the wire.
         Returns True when something was actually cut off."""
+        was_audible = self.playback_is_audible(tail_sec=0.0)
+        cancelled_token = self.tts_turn_token
+        running_turn = self.turn_task
+        interrupted = bool(
+            self.active_turn_id is not None
+            or was_audible
+            or self.playback_has_pending_audio()
+            or cancelled_token is not None
+            or (running_turn and not running_turn.done())
+        )
+        if not interrupted:
+            return False
+        if running_turn and running_turn is not asyncio.current_task() and not running_turn.done():
+            running_turn.cancel()
         self.speak_generation += 1
+        if self.native_audio_engine:
+            self.native_audio_engine.invalidate_generation(self.speak_generation)
+        if self.native_speaker:
+            # Invalidate and clear local PCM synchronously before provider
+            # cancellation or OpenCode abort can block.
+            invalidate = getattr(self.native_speaker, "invalidate_generation", None)
+            if invalidate:
+                invalidate(self.speak_generation, reason)
+            else:  # compatibility for injected device fakes
+                self.native_speaker.flush(reason=reason)
         self.eager_turn_text = None
         self.clear_pending_barge_in()
-        interrupted = self.active_turn_id is not None or bool(self.speaker or self.native_speaker)
         if self.active_turn_id is not None:
             self.logger.write("turn.abort", turn_id=self.active_turn_id, reason=reason)
         self.active_turn_id = None
-        if self.speaker:
-            # Deepgram's graceful close waits for the server to flush the
-            # rest of the utterance (seen live: 4s of dead air after a
-            # confirmed interrupt). Stale audio is generation-guarded, so
-            # detach now and let the socket close in the background.
-            speaker = self.speaker
-            self.speaker = None
-            self.spawn_background(self.close_speaker_quietly(speaker))
-        if self.native_speaker:
-            # Flush instead of close: tearing the device stream down every
-            # interrupt forces the echo canceller to re-converge from scratch
-            # on the next turn, and that first ~1.5s leak is exactly what
-            # triggers the echo barge-ins.
-            self.native_speaker.flush(reason=reason)
+        if self.speaker and cancelled_token:
+            # The generation fence is already complete. Provider cancellation
+            # is tracked independently so a Clear timeout/reconnect can never
+            # delay OpenCode abort or the protocol interruption acknowledgement.
+            self.tts_terminal_tokens.setdefault(cancelled_token, "cancelled")
+            watchdog = self.tts_terminal_watchdogs.pop(cancelled_token, None)
+            if watchdog and watchdog is not asyncio.current_task() and not watchdog.done():
+                watchdog.cancel()
+            self.spawn_background(self.cancel_speaker_turn(self.speaker, cancelled_token, reason))
+        self.tts_turn_token = None
+        # The native device stream stays alive across interruption; generation
+        # invalidation above already flushed it without resetting AEC.
         self.native_speaker_unavailable = False
-        return interrupted
+        return True
+
+    async def cancel_speaker_turn(self, speaker: TTSProvider, token: PlaybackToken, reason: str) -> None:
+        try:
+            await speaker.cancel_turn(token, reason)
+        except Exception as exc:  # noqa: BLE001 - local fencing remains authoritative.
+            self.logger.write(
+                "tts.cancel.error",
+                stage="provider_cancel",
+                error_code=type(exc).__name__,
+                turn_id=token.turn_id,
+                playback_generation=token.generation,
+            )
+            if self.speaker is speaker:
+                self.speaker = None
+            await self.close_speaker_quietly(speaker)
 
     def spawn_background(self, coro: Awaitable[None]) -> None:
         # Retain a strong reference until the task finishes; a bare
@@ -2012,11 +3545,11 @@ class VoiceConnection:
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
-    async def close_speaker_quietly(self, speaker: DeepgramSpeakSession | CartesiaSpeakSession) -> None:
+    async def close_speaker_quietly(self, speaker: TTSProvider) -> None:
         try:
             await speaker.close()
         except Exception as exc:  # noqa: BLE001 - background close is best-effort.
-            self.logger.write("tts.close.error", error=repr(exc))
+            self.logger.write("tts.close.error", stage="close", error_code=type(exc).__name__)
 
     async def abort_fork_turn(self) -> None:
         if self.fork_session_id:
@@ -2192,6 +3725,11 @@ class TurnSeam:
     # after the text finished can still report firstAudioMs.
     completed: bool = False
     pending_complete: dict[str, Any] | None = None
+    tts_expected: bool = False
+    provider_terminal: bool = False
+    provider_outcome: str | None = None
+    playback_started: bool = False
+    playback_drained: bool = False
 
 
 @dataclass
@@ -2255,8 +3793,10 @@ class SidepodConnection(VoiceConnection):
         self.lane_turn_counter = 0
         self.pending_turn_id: str | None = None
         self.transcript_seq = 0
+        self.last_interim_transcript = ""
         self.speech_started_at: float | None = None
         self.pending_latency: dict[str, Any] = {}
+        self.admitted_eot_started_at: float | None = None
         # One turn runs at a time; the dict form only tolerates stragglers
         # from an aborted turn arriving after the next one starts.
         self.turn_seams: dict[int, TurnSeam] = {}
@@ -2465,7 +4005,27 @@ class SidepodConnection(VoiceConnection):
             )
             return
         if bool(payload.get("value")):
-            if await self.start_native_audio():
+            try:
+                started = await self.start_native_audio()
+            except Exception as exc:  # noqa: BLE001 - keep the v0 lane alive while STT reconnects.
+                self.logger.write(
+                    "flux.connection.error",
+                    stage="initial_connect",
+                    error_code=type(exc).__name__,
+                )
+                await self.stop_audio(reason="stt_initial_connect_failed")
+                await self.send_json(
+                    voice_bridge_issue_payload(
+                        capability="voice_audio",
+                        diagnostic_code="stt_transport_unhealthy",
+                        safe_detail="Voice recognition reconnecting",
+                        retryable=True,
+                        debug_ref=str(self.logger.run_dir),
+                        voice_lane_id=self.voice_lane_id,
+                    )
+                )
+                return
+            if started:
                 self.start_mic_watchdog()
                 await self.send_json(
                     {
@@ -2476,24 +4036,31 @@ class SidepodConnection(VoiceConnection):
                     }
                 )
         else:
-            self.cancel_mic_watchdog()
+            await self.shutdown_mic_watchdog()
             await self.stop_audio(reason=str(payload.get("reason") or "live.set.false"))
 
     def start_mic_watchdog(self) -> None:
         self.cancel_mic_watchdog()
         self.mic_watchdog_task = asyncio.create_task(self.mic_watchdog())
 
-    def cancel_mic_watchdog(self) -> None:
-        if self.mic_watchdog_task and not self.mic_watchdog_task.done():
-            self.mic_watchdog_task.cancel()
+    def cancel_mic_watchdog(self) -> asyncio.Task[None] | None:
+        task = self.mic_watchdog_task
+        if task and not task.done():
+            task.cancel()
         self.mic_watchdog_task = None
+        return task
+
+    async def shutdown_mic_watchdog(self) -> None:
+        task = self.cancel_mic_watchdog()
+        if task and task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
 
     async def mic_watchdog(self) -> None:
         try:
             await asyncio.sleep(MIC_WATCHDOG_SEC)
         except asyncio.CancelledError:
             return
-        if not self.native_mic or self.audio_input_chunks:
+        if not (self.native_mic or self.native_audio_engine) or self.audio_input_chunks:
             return
         self.logger.write("native_audio.silent", window_sec=MIC_WATCHDOG_SEC)
         await self.stop_audio(reason="mic_watchdog_silent")
@@ -2544,7 +4111,7 @@ class SidepodConnection(VoiceConnection):
         await self.send_json(stopped)
 
     async def stop(self) -> None:
-        self.cancel_mic_watchdog()
+        await self.shutdown_mic_watchdog()
         await self.stop_audio(reason="sidepod_stop")
         if self.turn_task and not self.turn_task.done():
             self.turn_task.cancel()
@@ -2555,28 +4122,52 @@ class SidepodConnection(VoiceConnection):
         if self.native_speaker:
             await self.native_speaker.close()
             self.native_speaker = None
+        if self.native_audio_engine:
+            await self.native_audio_engine.close()
+            self.native_audio_engine = None
         # The parent's legacy `stopped` message dies at the translation seam;
         # the v0 ack is handle_stop's job.
         await super().stop()
         self.protocol_turn_id = ""
         self.pending_turn_id = None
+        self.last_interim_transcript = ""
         self.lane_registered = False
         await self.lane_registry.release(self.connection_id)
 
     async def close(self) -> None:
-        self.cancel_mic_watchdog()
+        await self.shutdown_mic_watchdog()
         try:
             await super().close()
         finally:
             self.lane_registered = False
             await self.lane_registry.release(self.connection_id)
 
-    async def send_tts_audio(self, data: bytes, turn_id: int | None) -> None:
-        if not self.tts_first_audio_seen:
-            self.tts_first_audio_seen = True
-            await self.send_json({"type": "tts.first_audio", "turn_id": turn_id})
-            self.logger.write("tts.first_audio", turn_id=turn_id)
+    async def send_tts_audio(self, data: bytes, turn_id: int | PlaybackToken | None) -> None:
         if self.native_speaker_unavailable:
+            return
+        token = turn_id if isinstance(turn_id, PlaybackToken) else PlaybackToken(self.speak_generation, int(turn_id or 0))
+        self.tts_last_audio_at[token] = time.monotonic()
+        if self.native_audio_engine is not None:
+            if not await self.native_audio_engine.play(data, token):
+                if token.generation != self.speak_generation:
+                    self.stale_tts_chunks += 1
+                    self.logger.write(
+                        "native_tts.stale_generation.drop",
+                        turn_id=token.turn_id,
+                        bytes=len(data),
+                        playback_generation=token.generation,
+                        active_playback_generation=self.speak_generation,
+                    )
+                    return
+                self.tts_unavailable_chunks += 1
+                if self.tts_unavailable_chunks == 1 or self.tts_unavailable_chunks % 50 == 0:
+                    self.logger.write(
+                        "native_tts.play.unavailable",
+                        turn_id=token.turn_id,
+                        bytes=len(data),
+                        chunks=self.tts_unavailable_chunks,
+                        playback_generation=token.generation,
+                    )
             return
         if self.native_speaker is None:
             speaker = NativeSpeakerSession(
@@ -2585,34 +4176,129 @@ class SidepodConnection(VoiceConnection):
                 on_issue=self.send_json,
                 on_render=self.feed_render_reference,
                 on_drain=self.on_playback_drained,
+                on_first_frame=self.on_first_playback_frame,
             )
             if not await speaker.start():
                 self.native_speaker_unavailable = True
                 return
+            speaker.playback_generation = self.speak_generation
+            speaker.begin_turn(token)
             self.native_speaker = speaker
-        if not await self.native_speaker.play(data, turn_id):
+        if not await self.native_speaker.play(data, token):
+            if token.generation != self.speak_generation:
+                self.stale_tts_chunks += 1
+                self.logger.write(
+                    "native_tts.stale_generation.drop",
+                    turn_id=token.turn_id,
+                    bytes=len(data),
+                    playback_generation=token.generation,
+                    active_playback_generation=self.speak_generation,
+                )
+                return
             self.tts_unavailable_chunks += 1
             if self.tts_unavailable_chunks == 1 or self.tts_unavailable_chunks % 50 == 0:
                 self.logger.write(
                     "native_tts.play.unavailable",
-                    turn_id=turn_id,
+                    turn_id=token.turn_id,
                     bytes=len(data),
                     chunks=self.tts_unavailable_chunks,
                 )
 
+    async def on_first_playback_frame(self, token: PlaybackToken) -> None:
+        """`speaking` begins at device exposure, never provider arrival."""
+        if token.generation != self.speak_generation or self.tts_first_audio_seen:
+            return
+        self.tts_first_audio_seen = True
+        await self.send_json({"type": "tts.first_audio", "turn_id": token.turn_id})
+        self.logger.write(
+            "tts.first_audio",
+            turn_id=token.turn_id,
+            playback_generation=token.generation,
+        )
+        self.logger.state_transition("awaiting_playback", "speaking", turn_id=token.turn_id)
+
+    async def on_tts_turn_began(self, token: PlaybackToken) -> None:
+        await super().on_tts_turn_began(token)
+        seam = self.turn_seams.get(token.turn_id)
+        if seam is not None:
+            seam.provider_terminal = False
+            seam.provider_outcome = None
+            seam.playback_drained = False
+
+    async def on_tts_turn_terminal(
+        self,
+        token: PlaybackToken,
+        outcome: str,
+        *,
+        error_code: str | None = None,
+    ) -> None:
+        already_terminal = token in self.tts_terminal_tokens
+        await super().on_tts_turn_terminal(token, outcome, error_code=error_code)
+        if already_terminal:
+            return
+        seam = self.turn_seams.get(token.turn_id)
+        if seam is None:
+            return
+        seam.provider_terminal = True
+        seam.provider_outcome = outcome
+        if not self.playback_has_pending_audio():
+            # A provider can legitimately finish without a non-silent frame
+            # after speech filtering. There will be no device drain callback.
+            seam.playback_drained = True
+        if seam.completed and seam.pending_complete is not None and seam.playback_drained:
+            await self.flush_pending_completions(
+                reason="provider_failed" if outcome == "failed" else "provider_done",
+                legacy_id=token.turn_id,
+            )
+
     def feed_render_reference(self, data: bytes) -> None:
         # Called on the playback worker thread just before the device write,
         # so the timestamp approximates when this chunk starts playing.
-        self.render_audio_ring.append(data)
+        probe_data = self.render_to_probe_resampler.push(data) if self.render_to_probe_resampler else data
+        self.render_audio_ring.append(probe_data)
         if self.echo_canceller:
             self.echo_canceller.process_render(data)
 
-    async def on_playback_drained(self) -> None:
-        await self.flush_pending_completions(reason="playback_drained")
+    async def on_playback_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "playback.event")
+        detail = {key: value for key, value in event.items() if key != "type"}
+        self.logger.write(event_type, **detail)
+
+    async def on_playback_drained(self, token: PlaybackToken | None = None) -> None:
+        legacy_id = token.turn_id if token is not None else None
+        if legacy_id is None:
+            pending_ids = [item_id for item_id, seam in self.turn_seams.items() if seam.pending_complete]
+            if len(pending_ids) == 1:
+                legacy_id = pending_ids[0]
+                token = self.turn_playback_tokens.get(legacy_id)
+        seam = self.turn_seams.get(legacy_id) if legacy_id is not None else None
+        if seam is not None:
+            seam.playback_drained = True
+            # Older injected speakers predate provider lifecycle events. Real
+            # providers must explicitly own EOF; keep compatibility confined
+            # to fakes/adapters that don't advertise the terminal contract.
+            if not bool(getattr(self.speaker, "supports_terminal_events", False)):
+                seam.provider_terminal = True
+                seam.provider_outcome = seam.provider_outcome or "done"
+                if token is not None:
+                    self.tts_terminal_tokens.setdefault(token, "done")
+                    if self.tts_turn_token == token:
+                        self.tts_turn_token = None
+            if seam.provider_terminal:
+                await self.flush_pending_completions(
+                    reason="playback_drained",
+                    legacy_id=legacy_id,
+                )
+                if seam.completed:
+                    self.logger.state_transition("speaking", "ready", turn_id=legacy_id)
         # Reply finished speaking: return the lane to a resting listening
         # state so the viewer's activity indicator stops reading "speaking".
         # Only while the mic is still live and no new turn has taken over.
-        if self.native_mic is None or self.active_turn_id is not None or self.barge_pending:
+        if (
+            self.native_mic is None and self.native_audio_engine is None
+            or self.active_turn_id is not None
+            or self.interruption_state.phase in {InterruptionPhase.CANDIDATE, InterruptionPhase.INTERRUPTED}
+        ):
             return
         if not self.voice_lane_id:
             return
@@ -2631,6 +4317,21 @@ class SidepodConnection(VoiceConnection):
         # with no active turn or speech is just the user starting to talk.
         if not await self.interrupt_playback(reason):
             return
+        for seam in self.turn_seams.values():
+            if seam.lane_id != turn_id:
+                continue
+            interrupted_latency = {
+                key: value for key, value in seam.latency.items() if isinstance(value, (int, float))
+            }
+            interrupted_latency["totalMs"] = elapsed_ms(seam.started_at)
+            self.logger.write(
+                "sidepod.turn.latency.interrupted",
+                turn_id=seam.lane_id,
+                stream_source=seam.stream_source,
+                interruption_reason=reason,
+                **interrupted_latency,
+            )
+            break
         self.clear_pending_completions()
         await self.abort_fork_turn()
         payload: dict[str, Any] = {"type": "interrupted", "sentAt": iso_utc_now(), "reason": reason}
@@ -2646,6 +4347,12 @@ class SidepodConnection(VoiceConnection):
             self.speech_started_at = time.perf_counter()
             return
         if etype == "speech.transcript":
+            # Flux can send interim text before StartOfTurn. Only an episode
+            # already owned as an ordinary user turn may create provisional
+            # sidepod text; candidates and pre-start text remain private until
+            # the controller admits their final EOT.
+            if self.interruption_state.phase is not InterruptionPhase.USER_TURN:
+                return
             text = str(event.get("transcript") or "")
             if text.strip():
                 await self.send_lane_transcript(text, final=False, confidence=event.get("confidence"))
@@ -2657,9 +4364,17 @@ class SidepodConnection(VoiceConnection):
         # Other raw STT events (speech.resumed, socket notices) stay off the lane.
 
     async def on_transcript_admitted(self, transcript: str, confidence: float | None) -> None:
+        self.admitted_eot_started_at = time.perf_counter()
         await self.send_lane_transcript(transcript, final=True, confidence=confidence)
 
     async def send_lane_transcript(self, text: str, final: bool, confidence: Any = None) -> None:
+        # Flux emits Update about four times per second even if its current
+        # turn transcript hasn't changed. Repainting the same provisional text
+        # wastes protocol/TUI work and made live sessions look noisy. The final
+        # event is never deduplicated because it closes the transcript turn.
+        if not final and text == self.last_interim_transcript:
+            return
+        self.last_interim_transcript = "" if final else text
         turn_id = self.ensure_pending_turn()
         if "firstTranscriptMs" not in self.pending_latency and self.speech_started_at is not None:
             self.pending_latency["firstTranscriptMs"] = elapsed_ms(self.speech_started_at)
@@ -2686,7 +4401,11 @@ class SidepodConnection(VoiceConnection):
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         if str(payload.get("type") or "") == "turn.start":
-            await self.flush_pending_completions(reason="new_turn")
+            # A new turn is not evidence that the previous reply finished
+            # speaking.  Only release an old completion that already owns
+            # both provider EOF and device drain; an interrupted/nonterminal
+            # reply must never be reported as successfully complete.
+            await self.flush_pending_completions(reason="new_turn", ready_only=True)
         outbound = self.translate_to_v0(payload)
         if outbound is None:
             self.logger.write("sidepod.lane.internal", message_type=payload.get("type"))
@@ -2751,12 +4470,21 @@ class SidepodConnection(VoiceConnection):
         # Completed seams were only kept for late first-audio; a new turn
         # supersedes them.
         for old_id in [k for k, v in self.turn_seams.items() if v.completed]:
+            old_seam = self.turn_seams[old_id]
+            if old_seam.pending_complete is not None:
+                self.logger.write(
+                    "sidepod.turn.complete.superseded",
+                    turn_id=old_seam.lane_id,
+                    provider_terminal=old_seam.provider_terminal,
+                    playback_drained=old_seam.playback_drained,
+                )
             del self.turn_seams[old_id]
         self.turn_seams[legacy_id] = TurnSeam(
             lane_id=lane_id,
-            started_at=time.perf_counter(),
+            started_at=self.admitted_eot_started_at or time.perf_counter(),
             latency=dict(self.pending_latency),
         )
+        self.admitted_eot_started_at = None
         self.pending_latency = {}
         out: dict[str, Any] = {
             "type": "thinking",
@@ -2795,6 +4523,8 @@ class SidepodConnection(VoiceConnection):
         if seam:
             first_audio_ms = elapsed_ms(seam.started_at)
             seam.latency["firstAudioMs"] = first_audio_ms
+            seam.playback_started = True
+            seam.playback_drained = False
             if seam.pending_complete is not None:
                 seam.pending_complete["latency"] = {
                     key: value for key, value in seam.latency.items() if isinstance(value, (int, float))
@@ -2822,16 +4552,25 @@ class SidepodConnection(VoiceConnection):
             if isinstance(value, (int, float))
         }
         total_ms = payload.get("latency_ms")
-        if isinstance(total_ms, (int, float)):
-            latency["totalMs"] = total_ms
-        stream_source = seam.stream_source if seam else "event"
-        self.logger.write("sidepod.turn.latency", turn_id=lane_id, stream_source=stream_source, **latency)
+        model_complete_ms = total_ms if isinstance(total_ms, (int, float)) else None
+        payload_stream_source = str(payload.get("stream_source") or "")
+        if seam and payload_stream_source in {"event", "poll", "hybrid", "poll_after_event"}:
+            seam.stream_source = payload_stream_source
+        stream_source = seam.stream_source if seam else (payload_stream_source or "event")
+        wire_stream_source = "poll_after_event" if stream_source == "hybrid" else stream_source
+        self.logger.write(
+            "sidepod.turn.latency.text",
+            turn_id=lane_id,
+            stream_source=stream_source,
+            modelCompleteMs=model_complete_ms,
+            **latency,
+        )
         out: dict[str, Any] = {
             "type": "complete",
             "sentAt": iso_utc_now(),
             "turnId": lane_id,
             "latency": latency,
-            "streamSource": stream_source,
+            "streamSource": wire_stream_source,
         }
         # Poll-fallback turns stream no assistant.delta events, so this is
         # the viewer's only copy of the reply text (the reducer falls back
@@ -2839,11 +4578,14 @@ class SidepodConnection(VoiceConnection):
         text = str(payload.get("text") or "")
         if text:
             out["fullSpokenText"] = text
-        if seam and self.turn_spoken_any and not self.native_speaker_unavailable:
+        if seam:
+            seam.tts_expected = bool(self.turn_spoken_any and not self.native_speaker_unavailable)
+        if seam and seam.tts_expected and not (seam.provider_terminal and seam.playback_drained):
             seam.pending_complete = out
             self.logger.write("sidepod.turn.complete.pending_playback", turn_id=lane_id)
-            self.spawn_background(self.flush_pending_completion_after_timeout(legacy_id))
             return None
+        latency["totalMs"] = elapsed_ms(seam.started_at) if seam else int(model_complete_ms or 0)
+        self.logger.write("sidepod.turn.latency", turn_id=lane_id, stream_source=stream_source, **latency)
         return out
 
     async def flush_pending_completion_after_timeout(self, legacy_id: int, delay_sec: float = 10.0) -> None:
@@ -2851,16 +4593,44 @@ class SidepodConnection(VoiceConnection):
         seam = self.turn_seams.get(legacy_id)
         if not seam or seam.pending_complete is None:
             return
-        await self.flush_pending_completions(reason="playback_timeout", legacy_id=legacy_id)
+        # Kept as a compatibility hook for older callers. Elapsed wall time is
+        # never evidence that provider output or device playout is complete.
+        if seam.provider_terminal and seam.playback_drained:
+            await self.flush_pending_completions(reason="terminal_watchdog", legacy_id=legacy_id)
+        else:
+            self.logger.write(
+                "sidepod.turn.complete.still_pending",
+                turn_id=seam.lane_id,
+                provider_terminal=seam.provider_terminal,
+                playback_drained=seam.playback_drained,
+            )
 
-    async def flush_pending_completions(self, *, reason: str, legacy_id: int | None = None) -> None:
+    async def flush_pending_completions(
+        self,
+        *,
+        reason: str,
+        legacy_id: int | None = None,
+        ready_only: bool = False,
+    ) -> None:
         for item_id, seam in list(self.turn_seams.items()):
             if legacy_id is not None and item_id != legacy_id:
                 continue
             if seam.pending_complete is None:
                 continue
+            if ready_only and not (seam.provider_terminal and seam.playback_drained):
+                continue
             complete = seam.pending_complete
             seam.pending_complete = None
+            latency = complete.setdefault("latency", {})
+            if isinstance(latency, dict):
+                latency["totalMs"] = elapsed_ms(seam.started_at)
+            self.logger.write(
+                "sidepod.turn.latency",
+                turn_id=seam.lane_id,
+                stream_source=seam.stream_source,
+                completion_reason=reason,
+                **(latency if isinstance(latency, dict) else {}),
+            )
             self.logger.write("sidepod.turn.complete.flush", turn_id=seam.lane_id, reason=reason)
             await self.send_json(complete)
 
@@ -2911,230 +4681,49 @@ class DeepgramFluxSession:
     def __init__(self, config: VoiceConfig, on_event: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
         self.config = config
         self.on_event = on_event
-        self.websocket: Any = None
-        self.reader_task: asyncio.Task[None] | None = None
+        self.transport: FluxTransport | None = None
+        self.connection_epoch = 0
 
     async def start(self) -> None:
-        api_key = os.environ["DEEPGRAM_API_KEY"]
-        url = build_flux_url(
+        options = FluxTransportOptions(
+            api_key=os.environ["DEEPGRAM_API_KEY"],
             model=self.config.deepgram_stt_model,
             sample_rate=self.config.deepgram_sample_rate,
             eot_threshold=self.config.flux_eot_threshold,
             eot_timeout_ms=self.config.flux_eot_timeout_ms,
             eager_eot_threshold=self.config.flux_eager_eot_threshold,
         )
-        self.websocket = await connect_ws(url, {"Authorization": f"Token {api_key}"})
-        self.reader_task = asyncio.create_task(self._read_loop())
+        self.transport = FluxTransport(options, self._handle_transport_event)
+        await self.transport.start()
+        try:
+            self.connection_epoch = await self.transport.wait_connected(
+                timeout_sec=options.connect_timeout_sec + 0.5
+            )
+        except Exception:
+            await self.transport.close()
+            self.transport = None
+            raise
 
     async def send_audio(self, data: bytes) -> None:
-        if self.websocket:
-            await self.websocket.send(data)
+        # Compatibility coroutine for browser callers; submit itself is
+        # synchronous and never awaits network I/O.
+        if self.transport:
+            self.transport.submit(data)
 
     async def close(self) -> None:
-        if self.reader_task and not self.reader_task.done():
-            self.reader_task.cancel()
-        if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
+        if self.transport:
+            await self.transport.close()
+            self.transport = None
 
-    async def _read_loop(self) -> None:
-        try:
-            async for message in self.websocket:
-                if isinstance(message, str):
-                    await self.on_event(parse_flux_message(message))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - reconnect is user-driven for now.
-            await self.on_event({"type": "deepgram.error", "message": repr(exc)})
+    def submit_audio(self, data: bytes) -> bool:
+        return bool(self.transport and self.transport.submit(data))
 
+    def health_snapshot(self) -> Any:
+        return self.transport.health_snapshot() if self.transport else None
 
-class DeepgramSpeakSession:
-    def __init__(
-        self,
-        config: VoiceConfig,
-        on_audio: Callable[[bytes, int | None], Awaitable[None]],
-        on_event: Callable[[dict[str, Any]], Awaitable[None]],
-    ) -> None:
-        self.config = config
-        self.on_audio = on_audio
-        self.on_event = on_event
-        self.websocket: Any = None
-        self.reader_task: asyncio.Task[None] | None = None
-        self.flush_limiter = FlushLimiter()
-        self.current_turn_id: int | None = None
-        self._start_lock = asyncio.Lock()
-
-    async def start(self) -> None:
-        # Idempotent: prewarm and speak() may both race to open the socket.
-        async with self._start_lock:
-            if self.websocket:
-                return
-            api_key = os.environ["DEEPGRAM_API_KEY"]
-            self.websocket = await connect_ws(
-                build_tts_url(self.config.deepgram_tts_model, self.config.deepgram_sample_rate),
-                {"Authorization": f"Token {api_key}"},
-            )
-            self.reader_task = asyncio.create_task(self._read_loop())
-
-    async def speak(self, text: str, turn_id: int) -> None:
-        if not self.websocket:
-            await self.start()
-        self.current_turn_id = turn_id
-        await self.websocket.send(json.dumps({"type": "Speak", "text": text}))
-        if self.flush_limiter.allow():
-            await self.websocket.send(json.dumps({"type": "Flush"}))
-            await self.on_event({"type": "tts.flush", "turn_id": turn_id, "chars": len(text)})
-        else:
-            await self.on_event({"type": "tts.flush.deferred", "turn_id": turn_id, "chars": len(text)})
-
-    async def close(self) -> None:
-        if self.websocket:
-            try:
-                await self.websocket.send(json.dumps({"type": "Close"}))
-            except Exception:
-                pass
-        if self.reader_task and not self.reader_task.done():
-            self.reader_task.cancel()
-        if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
-
-    async def _read_loop(self) -> None:
-        try:
-            async for message in self.websocket:
-                if isinstance(message, (bytes, bytearray)):
-                    await self.on_audio(bytes(message), self.current_turn_id)
-                elif isinstance(message, str):
-                    await self.on_event({"type": "tts.metadata", "raw": json.loads(message)})
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - surfaced to the UI for visibility.
-            await self.on_event({"type": "tts.error", "message": repr(exc)})
-
-
-class CartesiaSpeakSession:
-    """Same start/speak/close/on_audio surface as DeepgramSpeakSession, so
-    build_speaker() can pick either without the rest of the connection caring.
-
-    Cartesia has no single-context Flush primitive: each speak() call opens
-    its own context_id, one complete non-continued request per chunk. Unlike
-    Deepgram's single always-open context (inherently ordered), Cartesia
-    synthesizes concurrent contexts on the same socket and interleaves their
-    audio as it arrives — confirmed live: three back-to-back context_ids came
-    back with chunks alternating between contexts, not in send order. Two
-    contexts in flight together means two sentences' audio interleaved into
-    one playback queue, which is audible as garbled/simultaneous speech.
-    speak() therefore holds a lock for a context's entire lifetime — sent,
-    streamed, and done — so the next call can't start a second context until
-    the first one's audio has fully arrived. (An Event doesn't work here:
-    Event.set() wakes every waiter at once, so two speak() calls queued
-    behind one Event would both slip through together and race exactly like
-    the bug this is fixing.)
-    """
-
-    def __init__(
-        self,
-        config: VoiceConfig,
-        on_audio: Callable[[bytes, int | None], Awaitable[None]],
-        on_event: Callable[[dict[str, Any]], Awaitable[None]],
-    ) -> None:
-        self.config = config
-        self.on_audio = on_audio
-        self.on_event = on_event
-        self.websocket: Any = None
-        self.reader_task: asyncio.Task[None] | None = None
-        self.current_turn_id: int | None = None
-        self._context_turns: dict[str, int | None] = {}
-        self._context_done: dict[str, asyncio.Event] = {}
-        self._context_lock = asyncio.Lock()
-        self._start_lock = asyncio.Lock()
-        self.closed = False
-
-    async def start(self) -> None:
-        async with self._start_lock:
-            if self.websocket:
-                return
-            api_key = os.environ["CARTESIA_API_KEY"]
-            self.websocket = await connect_ws(
-                build_cartesia_tts_url(self.config.cartesia_version),
-                {"X-API-Key": api_key},
-            )
-            self.reader_task = asyncio.create_task(self._read_loop())
-
-    async def speak(self, text: str, turn_id: int) -> None:
-        if not self.websocket:
-            await self.start()
-        async with self._context_lock:
-            if self.closed:
-                return
-            self.current_turn_id = turn_id
-            context_id = str(uuid.uuid4())
-            done_event = asyncio.Event()
-            self._context_turns[context_id] = turn_id
-            self._context_done[context_id] = done_event
-            await self.websocket.send(
-                json.dumps(
-                    {
-                        "model_id": self.config.cartesia_tts_model,
-                        "transcript": text,
-                        "context_id": context_id,
-                        "voice": {"mode": "id", "id": self.config.cartesia_voice_id},
-                        "output_format": {
-                            "container": "raw",
-                            "encoding": "pcm_s16le",
-                            "sample_rate": self.config.deepgram_sample_rate,
-                        },
-                        "language": "en",
-                    }
-                )
-            )
-            await self.on_event({"type": "tts.flush", "turn_id": turn_id, "chars": len(text)})
-            # Held until this context's audio has fully arrived (or close()
-            # force-releases it), keeping the lock so no other context opens.
-            await done_event.wait()
-
-    async def close(self) -> None:
-        self.closed = True
-        for done_event in self._context_done.values():
-            done_event.set()
-        if self.reader_task and not self.reader_task.done():
-            self.reader_task.cancel()
-        if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
-        self._context_turns.clear()
-        self._context_done.clear()
-
-    async def _read_loop(self) -> None:
-        try:
-            async for message in self.websocket:
-                if not isinstance(message, str):
-                    continue
-                payload = json.loads(message)
-                msg_type = payload.get("type")
-                context_id = payload.get("context_id")
-                turn_id = self._context_turns.get(context_id)
-                if msg_type == "chunk" and payload.get("data"):
-                    await self.on_audio(base64.b64decode(payload["data"]), turn_id)
-                elif msg_type == "done" or payload.get("done"):
-                    self._context_turns.pop(context_id, None)
-                    done_event = self._context_done.pop(context_id, None)
-                    if done_event:
-                        done_event.set()
-                elif msg_type == "error":
-                    self._context_turns.pop(context_id, None)
-                    done_event = self._context_done.pop(context_id, None)
-                    if done_event:
-                        done_event.set()
-                    await self.on_event({"type": "tts.error", "message": payload.get("error") or repr(payload)})
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - surfaced to the UI for visibility.
-            await self.on_event({"type": "tts.error", "message": repr(exc)})
-
-
-async def connect_ws(url: str, headers: dict[str, str]) -> Any:
-    try:
-        return await websockets.connect(url, additional_headers=headers)
-    except TypeError:
-        return await websockets.connect(url, extra_headers=headers)
+    async def _handle_transport_event(self, event: dict[str, Any]) -> None:
+        epoch = event.get("transport_epoch") or event.get("epoch")
+        if isinstance(epoch, int):
+            self.connection_epoch = epoch
+            event["flux_connection_epoch"] = epoch
+        await self.on_event(event)

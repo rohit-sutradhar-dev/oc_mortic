@@ -13,6 +13,20 @@ from opencode_voice import managed_opencode
 
 
 class ManagedOpenCodeStartupTests(unittest.TestCase):
+    def test_helper_pins_uvicorn_to_standard_asyncio_for_happy_eyeballs(self) -> None:
+        app = object()
+        with (
+            patch.object(helper_main, "load_local_dotenv"),
+            patch.object(helper_main, "preflight_startup"),
+            patch.object(helper_main, "create_app", return_value=app),
+            patch.object(helper_main.uvicorn, "run") as run,
+        ):
+            result = helper_main.main(["--opencode-url", "http://127.0.0.1:4096"])
+
+        self.assertEqual(result, 0)
+        self.assertIs(run.call_args.args[0], app)
+        self.assertEqual(run.call_args.kwargs["loop"], "asyncio")
+
     def test_start_managed_opencode_uses_owned_process_group(self) -> None:
         fake_process = SimpleNamespace(pid=4242, poll=lambda: None)
         with (
@@ -25,6 +39,30 @@ class ManagedOpenCodeStartupTests(unittest.TestCase):
         self.assertEqual(url, "http://127.0.0.1:43210")
         self.assertIs(process, fake_process)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.args[0][0:2], [
+            "opencode",
+            "serve",
+        ])
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["BUN_OPTIONS"],
+            "--dns-result-order=ipv4first",
+        )
+        self.assertIs(popen.call_args.kwargs["stdout"], helper_main.sys.stderr)
+
+    def test_managed_opencode_preserves_existing_bun_options(self) -> None:
+        fake_process = SimpleNamespace(pid=4242, poll=lambda: None)
+        with (
+            patch.dict(os.environ, {"BUN_OPTIONS": "--smol"}, clear=False),
+            patch.object(helper_main, "free_port", return_value=43210),
+            patch.object(helper_main, "is_healthy", return_value=True),
+            patch.object(helper_main.subprocess, "Popen", return_value=fake_process) as popen,
+        ):
+            helper_main.start_managed_opencode(model_name="inception/mercury-2")
+
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["BUN_OPTIONS"],
+            "--smol --dns-result-order=ipv4first",
+        )
 
 
 class ManagedOpenCodeLeaseTests(unittest.TestCase):

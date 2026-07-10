@@ -32,6 +32,32 @@ class FrameSlicer:
         return frames
 
 
+class Pcm16Resampler:
+    """Small streaming wrapper around LiveKit's native PCM resampler."""
+
+    def __init__(self, input_rate: int, output_rate: int) -> None:
+        self.input_rate = input_rate
+        self.output_rate = output_rate
+        self._identity = input_rate == output_rate
+        self._resampler: Any | None = None
+        if not self._identity:
+            from livekit import rtc  # deferred with the other native audio dependency
+
+            self._resampler = rtc.AudioResampler(input_rate, output_rate, num_channels=1)
+
+    def push(self, data: bytes) -> bytes:
+        if self._identity:
+            return data
+        assert self._resampler is not None
+        return b"".join(bytes(frame.data) for frame in self._resampler.push(bytearray(data)))
+
+    def flush(self) -> bytes:
+        if self._identity:
+            return b""
+        assert self._resampler is not None
+        return b"".join(bytes(frame.data) for frame in self._resampler.flush())
+
+
 class EchoCanceller:
     """Full-duplex echo cancellation around the native mic/speaker pair.
 
