@@ -298,6 +298,8 @@ class HealthEndpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "opencode_voice.server.helper_readiness_issues",
             return_value=(),
+        ), patch(
+            "opencode_voice.server.SidepodConnection.schedule_audio_prewarm",
         ):
             app = create_app(
                 VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),
@@ -330,6 +332,8 @@ class HealthEndpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "opencode_voice.server.helper_readiness_issues",
             return_value=(),
+        ), patch(
+            "opencode_voice.server.SidepodConnection.schedule_audio_prewarm",
         ):
             app = create_app(
                 VoiceConfig(opencode_url="http://opencode.test", run_root=tmp, keep_fork_default=True),
@@ -359,6 +363,8 @@ class SidepodTransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "opencode_voice.server.helper_readiness_issues",
             return_value=(),
+        ), patch(
+            "opencode_voice.server.SidepodConnection.schedule_audio_prewarm",
         ):
             app = create_app(
                 VoiceConfig(opencode_url="http://opencode.test", run_root=tmp),

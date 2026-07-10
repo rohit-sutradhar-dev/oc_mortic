@@ -431,6 +431,7 @@ class UnavailableDeviceAudio:
 
 class AvailableDeviceAudio(UnavailableDeviceAudio):
     stream_delay_ms = 0
+    capture_enabled = True
 
     async def start(self) -> bool:
         return True
@@ -443,6 +444,27 @@ class AvailableDeviceAudio(UnavailableDeviceAudio):
 
     def set_ducked(self, ducked: bool) -> None:
         return None
+
+    def set_capture_enabled(self, enabled: bool) -> None:
+        self.capture_enabled = enabled
+
+
+class BlockingDeviceAudio(AvailableDeviceAudio):
+    started: asyncio.Event
+    release: asyncio.Event
+    instances: list["BlockingDeviceAudio"] = []
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.closed = False
+        type(self).instances.append(self)
+
+    async def start(self) -> bool:
+        type(self).started.set()
+        await type(self).release.wait()
+        return True
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class StarvedDeviceAudio(AvailableDeviceAudio):
@@ -469,6 +491,22 @@ class FakeFlux:
 
     async def close(self) -> None:
         return None
+
+
+class CountingFlux(FakeFlux):
+    starts = 0
+
+    async def start(self) -> None:
+        type(self).starts += 1
+
+
+class BlockingFlux(FakeFlux):
+    started: asyncio.Event
+    release: asyncio.Event
+
+    async def start(self) -> None:
+        type(self).started.set()
+        await type(self).release.wait()
 
 
 START_PAYLOAD = {
@@ -505,6 +543,12 @@ def lane_connection(
         **kwargs,
     )
     return connection, websocket, fake_client
+
+
+async def wait_for_mic_transition(connection: SidepodConnection) -> None:
+    task = connection.mic_start_task
+    if task:
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def assert_all_lane_messages_valid(test: unittest.TestCase, sent: list[dict[str, Any]]) -> None:
@@ -1275,6 +1319,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "reason": "user.toggle",
                 }
             )
+            await wait_for_mic_transition(connection)
             listening = websocket.sent[-1]
             self.assertEqual(listening["type"], "listening")
             self.assertEqual(listening["mode"], "live")
@@ -1293,6 +1338,64 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(connection.native_mic)
             self.assertEqual(len(websocket.sent), count_before_mute, "mute must not emit a synthetic complete")
             assert_all_lane_messages_valid(self, websocket.sent)
+
+    async def test_duplex_mute_gates_capture_without_interrupting_or_restarting_playback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ), patch(
+            "opencode_voice.server.PersistentDeviceAudioEngine", AvailableDeviceAudio
+        ):
+            connection, websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            await connection.handle_control(
+                {
+                    "type": "live.set",
+                    "clientEventId": "evt_soft_mute_on",
+                    "sentAt": "2026-07-04T00:02:10.000Z",
+                    "value": True,
+                }
+            )
+            await wait_for_mic_transition(connection)
+            engine = connection.native_audio_engine
+            self.assertIsNotNone(engine)
+            connection.active_turn_id = 42
+
+            await connection.handle_control(
+                {
+                    "type": "live.set",
+                    "clientEventId": "evt_soft_mute_off",
+                    "sentAt": "2026-07-04T00:02:11.000Z",
+                    "value": False,
+                    "reason": "user.toggle",
+                }
+            )
+            self.assertIs(connection.native_audio_engine, engine)
+            self.assertFalse(engine.capture_enabled)
+            self.assertEqual(connection.active_turn_id, 42)
+            self.assertNotIn("interrupted", [message["type"] for message in websocket.sent])
+            await connection.handle_flux_event(
+                {
+                    "type": "speech.end",
+                    "transcript": "discard this muted audio",
+                    "turn_index": 77,
+                }
+            )
+            self.assertNotIn("transcript", [message["type"] for message in websocket.sent])
+            self.assertEqual(connection.active_turn_id, 42)
+
+            await connection.handle_control(
+                {
+                    "type": "live.set",
+                    "clientEventId": "evt_soft_mute_resume",
+                    "sentAt": "2026-07-04T00:02:12.000Z",
+                    "value": True,
+                }
+            )
+            self.assertIs(connection.native_audio_engine, engine)
+            self.assertTrue(engine.capture_enabled)
+            self.assertEqual(websocket.sent[-1]["type"], "listening")
+            connection.active_turn_id = None
+            await connection.close()
 
     async def test_silent_mic_watchdog_reports_permission_issue_and_stops_capture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
@@ -1313,6 +1416,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "value": True,
                 }
             )
+            await wait_for_mic_transition(connection)
             await asyncio.wait_for(connection.mic_watchdog_task, timeout=5)
 
             issue = websocket.sent[-1]
@@ -1339,7 +1443,135 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "value": True,
                 }
             )
+            await wait_for_mic_transition(connection)
             self.assertNotIn("listening", [message["type"] for message in websocket.sent])
+
+    async def test_fast_mute_cancels_pending_device_start_without_stale_listening(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ), patch(
+            "opencode_voice.server.PersistentDeviceAudioEngine", BlockingDeviceAudio
+        ):
+            BlockingDeviceAudio.started = asyncio.Event()
+            BlockingDeviceAudio.release = asyncio.Event()
+            BlockingDeviceAudio.instances = []
+            connection, websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            await connection.handle_control(
+                {
+                    "type": "live.set",
+                    "clientEventId": "evt_live_race_on",
+                    "sentAt": "2026-07-04T00:05:00.000Z",
+                    "value": True,
+                }
+            )
+            await asyncio.wait_for(BlockingDeviceAudio.started.wait(), timeout=1)
+
+            await connection.handle_control(
+                {
+                    "type": "live.set",
+                    "clientEventId": "evt_live_race_off",
+                    "sentAt": "2026-07-04T00:05:00.010Z",
+                    "value": False,
+                }
+            )
+
+            self.assertFalse(connection.mic_desired_live)
+            self.assertIsNone(connection.native_audio_engine)
+            self.assertTrue(BlockingDeviceAudio.instances[0].closed)
+            self.assertNotIn("listening", [message["type"] for message in websocket.sent])
+            self.assertIsNotNone(connection.flux, "mute should retain the prewarmed transport")
+            await connection.close()
+
+    async def test_slow_transport_does_not_block_fast_mute_or_publish_listening(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramFluxSession", BlockingFlux
+        ), patch(
+            "opencode_voice.server.PersistentDeviceAudioEngine", AvailableDeviceAudio
+        ):
+            BlockingFlux.started = asyncio.Event()
+            BlockingFlux.release = asyncio.Event()
+            connection, websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            await asyncio.sleep(0)
+            await asyncio.wait_for(BlockingFlux.started.wait(), timeout=1)
+
+            await asyncio.wait_for(
+                connection.handle_control(
+                    {
+                        "type": "live.set",
+                        "clientEventId": "evt_slow_transport_on",
+                        "sentAt": "2026-07-04T00:05:30.000Z",
+                        "value": True,
+                    }
+                ),
+                timeout=0.1,
+            )
+            await asyncio.wait_for(
+                connection.handle_control(
+                    {
+                        "type": "live.set",
+                        "clientEventId": "evt_slow_transport_off",
+                        "sentAt": "2026-07-04T00:05:30.010Z",
+                        "value": False,
+                    }
+                ),
+                timeout=0.1,
+            )
+            BlockingFlux.release.set()
+            self.assertTrue(await asyncio.wait_for(connection.ensure_audio_transport(), timeout=1))
+
+            self.assertFalse(connection.mic_desired_live)
+            self.assertIsNone(connection.native_audio_engine)
+            self.assertNotIn("listening", [message["type"] for message in websocket.sent])
+            await connection.close()
+
+    async def test_start_prewarm_and_mute_reuse_one_flux_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.NativeMicSession", FakeNativeMic
+        ), patch(
+            "opencode_voice.server.DeepgramFluxSession", CountingFlux
+        ), patch(
+            "opencode_voice.server.PersistentDeviceAudioEngine", UnavailableDeviceAudio
+        ):
+            FakeNativeMic.ok = True
+            CountingFlux.starts = 0
+            connection, _websocket, _client = lane_connection(tmp)
+            await connection.handle_control(START_PAYLOAD)
+            await asyncio.sleep(0)
+            self.assertTrue(await connection.ensure_audio_transport())
+            self.assertEqual(CountingFlux.starts, 1)
+
+            for suffix in ("first", "second"):
+                await connection.handle_control(
+                    {
+                        "type": "live.set",
+                        "clientEventId": f"evt_live_{suffix}_on",
+                        "sentAt": "2026-07-04T00:06:00.000Z",
+                        "value": True,
+                    }
+                )
+                await wait_for_mic_transition(connection)
+                await connection.handle_control(
+                    {
+                        "type": "live.set",
+                        "clientEventId": f"evt_live_{suffix}_off",
+                        "sentAt": "2026-07-04T00:06:01.000Z",
+                        "value": False,
+                    }
+                )
+
+            self.assertEqual(CountingFlux.starts, 1)
+            records = [
+                json.loads(line)
+                for line in connection.logger.path.read_text(encoding="utf-8").splitlines()
+            ]
+            prewarm = next(record for record in records if record["event"] == "flux.prewarm")
+            self.assertGreaterEqual(prewarm["latency_ms"], 0)
+            mic_ready = [record for record in records if record["event"] == "native_audio.mic.ready"]
+            self.assertEqual(len(mic_ready), 2)
+            self.assertTrue(all(record["transport_prepared"] for record in mic_ready))
+            await connection.close()
 
 
 class SidepodLaneEnforcementTests(unittest.IsolatedAsyncioTestCase):

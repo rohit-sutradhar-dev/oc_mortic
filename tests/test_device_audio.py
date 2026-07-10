@@ -173,6 +173,27 @@ class PersistentDeviceAudioEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.stream_delay_ms, 60)
         await engine.close()
 
+    async def test_capture_gate_sends_silence_without_stopping_output_stream(self) -> None:
+        captured: list[bytes] = []
+        engine, factory = self.make_engine(capture_events=captured)
+        await engine.start()
+        assert factory.stream is not None
+
+        engine.set_capture_enabled(False)
+        self.assertEqual(factory.stream.tick(b"\x22\x00" * 480), self.SILENCE)
+        await wait_until(lambda: len(captured) == 1)
+
+        self.assertEqual(captured, [self.SILENCE])
+        self.assertFalse(engine.capture_enabled)
+        self.assertTrue(factory.stream.started)
+        self.assertFalse(factory.stream.stopped)
+
+        engine.set_capture_enabled(True)
+        factory.stream.tick(b"\x33\x00" * 480)
+        await wait_until(lambda: len(captured) == 2)
+        self.assertEqual(captured[-1], b"\x33\x00" * 480)
+        await engine.close()
+
     async def test_eighty_ms_prebuffer_plays_once_and_drains_after_starvation_grace(self) -> None:
         first: list[PlaybackToken] = []
         drained: list[PlaybackToken] = []

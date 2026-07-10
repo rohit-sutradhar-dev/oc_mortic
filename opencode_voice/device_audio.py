@@ -109,6 +109,7 @@ class PersistentDeviceAudioEngine:
         self._capture_queue: asyncio.Queue[bytes] | None = None
         self._capture_task: asyncio.Task[None] | None = None
         self._capture_dropped_frames = 0
+        self._capture_enabled = True
 
         self._active_generation = 0
         self._resampler_token: PlaybackToken | None = None
@@ -167,6 +168,21 @@ class PersistentDeviceAudioEngine:
     @property
     def capture_dropped_frames(self) -> int:
         return self._capture_dropped_frames
+
+    @property
+    def capture_enabled(self) -> bool:
+        with self._buffer_lock:
+            return self._capture_enabled
+
+    def set_capture_enabled(self, enabled: bool) -> None:
+        with self._buffer_lock:
+            self._capture_enabled = bool(enabled)
+        if not enabled and self._capture_queue is not None:
+            while not self._capture_queue.empty():
+                try:
+                    self._capture_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
     async def start(self) -> bool:
         if self._closed:
@@ -429,6 +445,8 @@ class PersistentDeviceAudioEngine:
             except Exception as exc:  # noqa: BLE001 - fail safe to silence, never raw echo.
                 self._last_error = repr(exc)
                 capture = bytes(indata.nbytes if hasattr(indata, "nbytes") else len(indata))
+            if not self.capture_enabled:
+                capture = bytes(len(capture))
             self._schedule_capture(capture)
             if first_token is not None and self._on_first_frame is not None:
                 self._schedule_async(self._on_first_frame, first_token)
@@ -619,6 +637,8 @@ class PersistentDeviceAudioEngine:
         try:
             while not self._closed:
                 data = await queue.get()
+                if not self.capture_enabled:
+                    data = bytes(len(data))
                 await self._on_capture(data)
         except asyncio.CancelledError:
             raise

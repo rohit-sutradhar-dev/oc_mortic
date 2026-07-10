@@ -15,6 +15,7 @@ test("orb label reflects the live lane activity, not a constant", () => {
   assert.equal(orbLabel("connecting", true), "connecting");
   assert.equal(orbLabel("ready", true), "listening");
   assert.equal(orbLabel("ready", false), "muted");
+  assert.equal(orbLabel("ready", false, true), "starting");
   // Regression: the orb no longer stamps a hardcoded "thinking".
   assert.doesNotMatch(src, /overlayCentered\(rowText, "thinking"\)/);
 });
@@ -149,6 +150,13 @@ test("the mic toggle emits protocol v0 live.set and drops PTT plumbing", () => {
   assert.match(src, /value:\s*next/);
   assert.match(src, /reason:\s*"user\.toggle"/);
   assert.match(src, /recordSmoke\("mic\.state"/);
+  assert.match(src, /const \[getMicDesired, setMicDesired\] = createSignal\(false\)/);
+  assert.match(src, /const next = !getMicDesired\(\)/);
+  assert.equal(src.includes("setMicLive(next)"), false, "mic must not render live before helper confirmation");
+  assert.match(src, /STARTING MIC… · M TO CANCEL/);
+  assert.match(src, /event\.type === "ready" && getMicDesired\(\)/);
+  assert.match(src, /event\.type === "listening" && !getMicDesired\(\)/);
+  assert.match(src, /laneStatus !== "connecting"[\s\S]*protocolBase\("live\.set"\)/);
   assert.match(src, /key:\s*"m",\s*cmd:\s*"mortic\.mic\.toggle"/);
   assert.match(src, /mode:\s*"mortic\.sidepod"[\s\S]*mortic\.mic\.toggle/);
   // Hold-PTT plumbing is fully retired from the UI (still defined in the
@@ -245,8 +253,13 @@ test("the lane client validates both directions against the shared schema", () =
   assert.match(src, /backoffMs = Math\.min\(backoffMs \* 2, 8000\)/);
 });
 
-test("end session sends stop and muting mid-reply barges in", () => {
-  assert.match(src, /stopVoiceLane\("user\.end_session", \{ releaseHelper: true \}\)/);
+test("end session stops the lane while mic mute remains a capture-only gate", () => {
+  assert.match(src, /stopVoiceLane\("user\.end_session"\)/);
+  assert.equal(
+    src.includes('stopVoiceLane("user.end_session", { releaseHelper: true })'),
+    false,
+    "normal call end should keep the helper warm for the next /mortic"
+  );
   assert.match(src, /protocolBase\("stop"\)/);
   assert.match(src, /STOP_ACK_TIMEOUT_MS/);
   assert.match(src, /event\.type === "stopped" && stopAckTimer/);
@@ -255,5 +268,5 @@ test("end session sends stop and muting mid-reply barges in", () => {
   assert.match(src, /helper\.stop\.immediate/);
   assert.match(src, /stopVoiceLane\("client\.shutdown", \{ releaseHelper: true, immediateHelperStop: true \}\)/);
   assert.match(src, /protocolBase\("barge_in"\)/);
-  assert.match(src, /reason:\s*"user\.mute"/);
+  assert.equal(src.includes('reason: "user.mute"'), false);
 });

@@ -142,7 +142,7 @@ function renderBrailleOrb(phase, active, captionColor, label) {
 // The orb owns the ACTIVITY axis (what Mortic is doing); the hero caption and
 // prompt annex own the control/transport axis (mic + connection). Kept
 // distinct so the two surfaces never say the same thing.
-export function orbLabel(laneStatus, micLive) {
+export function orbLabel(laneStatus, micLive, micDesired = micLive) {
   if (laneStatus === "connecting") {
     return "connecting";
   }
@@ -153,6 +153,9 @@ export function orbLabel(laneStatus, micLive) {
     return "speaking";
   }
   // ready / idle: mic state decides whether we're actively listening.
+  if (micDesired && !micLive) {
+    return "starting";
+  }
   return micLive ? "listening" : "muted";
 }
 
@@ -194,10 +197,9 @@ function commandRow(key, label, status, color, onMouseDown) {
   return clickable(`║ ${fit(key, 6)} ${fit(label, 15)} ${fit(status, 9)} ║`, color, onMouseDown);
 }
 
-// One state bit is the entire voice control surface: mic muted or mic live.
-// Turn segmentation is the engine's job (native end-of-turn detection lives
-// server-side); the UI only gates whether the mic may listen. Lane transport
-// state outranks mic state in the caption so a dead engine is never silent.
+// Desired and confirmed-live are deliberately separate. A provider/device
+// handshake can take noticeable time, and calling that interval "live" tells
+// users to speak into audio that is not being captured yet.
 function heroCaption(state) {
   if (!state.focused) {
     return "/MORTIC TO FOCUS";
@@ -208,6 +210,9 @@ function heroCaption(state) {
   if (state.laneStatus === "connecting") {
     return "CONNECTING VOICE…";
   }
+  if (state.micDesired && !state.micLive) {
+    return "STARTING MIC… · M TO CANCEL";
+  }
   return state.micLive ? "MIC LIVE · M TO MUTE" : "MIC MUTED · M TO TALK";
 }
 
@@ -217,7 +222,7 @@ function renderHero(state, theme) {
   const muted = theme.textMuted;
   const secondaryAccent = theme.secondary;
   const ok = theme.success;
-  const active = state.micLive;
+  const active = state.micLive || state.laneStatus === "thinking" || state.laneStatus === "speaking";
   const color = active ? ok : muted;
   const border = state.focused ? secondaryAccent : accent;
   return [
@@ -226,7 +231,12 @@ function renderHero(state, theme) {
       [
         center("M O R T I C", INNER),
         center("", INNER),
-        ...renderBrailleOrb(state.phase, active, secondaryAccent, orbLabel(state.laneStatus, state.micLive)).map((item) =>
+        ...renderBrailleOrb(
+          state.phase,
+          active,
+          secondaryAccent,
+          orbLabel(state.laneStatus, state.micLive, state.micDesired)
+        ).map((item) =>
           typeof item === "string"
             ? center(item, INNER)
             : { text: center(item.text, INNER), color: item.color }
@@ -244,11 +254,12 @@ function renderHero(state, theme) {
 function renderControlPanel(state, actions, theme) {
   const accent = theme.accent;
   const muted = theme.textMuted;
-  const micColor = state.micLive ? theme.success : muted;
+  const micStarting = state.micDesired && !state.micLive;
+  const micColor = state.micLive ? theme.success : micStarting ? theme.warning : muted;
   return [
     line("", muted),
     line(`╔ COMMAND DECK${"═".repeat(WIDTH - 15)}╗`, accent),
-    commandRow("[M]", "Microphone", state.micLive ? "LIVE" : "MUTED", micColor, actions.toggleMic),
+    commandRow("[M]", "Microphone", state.micLive ? "LIVE" : micStarting ? "STARTING" : "MUTED", micColor, actions.toggleMic),
     commandRow("[X]", "Clear Lane", "", theme.warning, actions.clear),
     commandRow("[T]", "Transcript", "", accent, actions.openTranscript),
     commandRow("[H]", "Handoff", state.handoffReady ? "READY" : "DRAFT", accent, actions.openHandoff),
@@ -455,6 +466,9 @@ function renderPromptAnnex(state, theme) {
   } else if (state.laneStatus === "connecting") {
     label = "CONNECTING";
     color = theme.warning;
+  } else if (state.micDesired && !state.micLive) {
+    label = "MIC STARTING";
+    color = theme.warning;
   }
   return text({ fg: color }, [`MORTIC · ${label} — Esc exit`]);
 }
@@ -481,6 +495,7 @@ const id = "mortic.sidepod";
 
 export async function tui(api) {
     const [getMicLive, setMicLive] = createSignal(false);
+    const [getMicDesired, setMicDesired] = createSignal(false);
     const [getFocused, setFocused] = createSignal(false);
     // idle -> connecting -> ready/thinking/speaking, or offline when the
     // helper cannot be reached. Drives the hero caption and prompt annex.
@@ -496,11 +511,11 @@ export async function tui(api) {
     ]);
 
     const requestRender = () => api.renderer.requestRender();
-    // The orb animation ticks only while the mic is live; idle sessions run
-    // no timer at all.
+    // Animate while either side of the conversation is active.
     let animationTimer;
     const syncAnimation = () => {
-      const active = getMicLive();
+      const laneStatus = getLaneStatus();
+      const active = getMicLive() || laneStatus === "thinking" || laneStatus === "speaking";
       if (active && !animationTimer) {
         animationTimer = setInterval(() => {
           setPhase((getPhase() + 1) % 8);
@@ -579,6 +594,8 @@ export async function tui(api) {
         recordSmoke("managed.confirm.cancelled");
         api.ui.dialog.clear();
         setLaneStatus("idle");
+        setMicDesired(false);
+        setMicLive(false);
         restorePromptFocus();
       });
 
@@ -721,11 +738,12 @@ export async function tui(api) {
         recordSmoke("exit.confirmed");
         setModal(null);
         api.ui.dialog.clear();
-        // Tell the engine to tear the lane down (stop -> stopped ack closes
-        // the socket; a 2s timeout closes it regardless). The helper is
-        // stopped only after that ack/timeout so fork cleanup has a chance to
-        // run before the managed server exits.
-        stopVoiceLane("user.end_session", { releaseHelper: true });
+        // Tear down the lane, microphone, provider transport, and fork, but
+        // retain the idle helper for this OpenCode process. Re-entering
+        // /mortic is then a local health check instead of another helper plus
+        // managed-OpenCode cold boot. App disposal still terminates it.
+        stopVoiceLane("user.end_session");
+        setMicDesired(false);
         setMicLive(false);
         setUserText("Mortic session ended.");
         setAssistantText("Start Mortic again for a fresh voice lane.");
@@ -752,7 +770,15 @@ export async function tui(api) {
       if (getModal()) {
         return;
       }
+      const laneStatus = getLaneStatus();
+      if (laneStatus !== "connecting" && laneStatus !== "offline" && laneStatus !== "idle") {
+        if (laneStatus === "speaking") {
+          laneClient.send({ ...protocolBase("barge_in"), reason: "user.clear" });
+        }
+        laneClient.send({ ...protocolBase("live.set"), value: false, reason: "user.clear" });
+      }
       mutate(() => {
+        setMicDesired(false);
         setMicLive(false);
         setUserText("Voice lane cleared.");
         setAssistantText("Ready for the next spoken turn.");
@@ -795,6 +821,7 @@ export async function tui(api) {
         }
         if (typeof ui.micLive === "boolean") {
           setMicLive(ui.micLive);
+          setMicDesired(ui.micLive);
         }
         if (ui.userText !== undefined) {
           setUserText(ui.userText);
@@ -817,6 +844,13 @@ export async function tui(api) {
     const laneClient = createLaneClient({
       recordSmoke,
       onEvent: (event) => {
+        if (event.type === "listening" && !getMicDesired()) {
+          // A cancelled start must not resurrect the mic if an old helper
+          // acknowledgement was already in flight.
+          laneClient.send({ ...protocolBase("live.set"), value: false, reason: "stale.listening" });
+          recordSmoke("mic.listening.stale");
+          return;
+        }
         const result = reduceLaneEvent(laneState, event);
         laneState = result.state;
         if (event.type === "stopped" && stopAckTimer) {
@@ -830,10 +864,15 @@ export async function tui(api) {
           }
         }
         applyLaneUi(result.ui);
+        if (event.type === "ready" && getMicDesired()) {
+          laneClient.send({ ...protocolBase("live.set"), value: true, reason: "lane.ready" });
+          recordSmoke("mic.start.after_ready");
+        }
         if (event.type === "voice_bridge_issue" && START_BLOCKING_ISSUES.has(String(event.diagnosticCode || ""))) {
           laneClient.close();
           laneState = createLaneState();
           mutate(() => {
+            setMicDesired(false);
             setMicLive(false);
             setLaneStatus("offline");
             restorePromptFocus();
@@ -844,7 +883,11 @@ export async function tui(api) {
       onOpen: () => sendStart(),
       onDown: () => {
         if (getFocused()) {
-          mutate(() => setLaneStatus("connecting"));
+          mutate(() => {
+            setMicDesired(false);
+            setMicLive(false);
+            setLaneStatus("connecting");
+          });
         }
       }
     });
@@ -880,6 +923,8 @@ export async function tui(api) {
     // wait, and M retries from the offline state.
     const failVoiceStartup = (reason, { restoreFocus = false } = {}) =>
       mutate(() => {
+        setMicDesired(false);
+        setMicLive(false);
         setLaneStatus("offline");
         if (!offlineToastShown) {
           offlineToastShown = true;
@@ -985,6 +1030,8 @@ export async function tui(api) {
         stopHelper();
         recordSmoke("helper.stop.immediate");
       }
+      setMicDesired(false);
+      setMicLive(false);
       setLaneStatus("idle");
     };
     // ------------------------------------------------------------------------
@@ -1004,16 +1051,23 @@ export async function tui(api) {
         return;
       }
       mutate(() => {
-        const next = !getMicLive();
-        setMicLive(next);
-        if (!next && laneStatus === "speaking") {
-          // Muting mid-reply is an explicit interruption, not just a gate.
-          laneClient.send({ ...protocolBase("barge_in"), reason: "user.mute" });
+        const next = !getMicDesired();
+        setMicDesired(next);
+        if (!next) {
+          // Privacy intent is immediate even though helper cleanup is async.
+          setMicLive(false);
         }
-        laneClient.send({ ...protocolBase("live.set"), value: next, reason: "user.toggle" });
-        setUserText(next ? "Mic is live. Speak normally." : "Mic is muted. Tap M to talk.");
-        appendTranscript("user", next ? "Mic unmuted." : "Mic muted.");
-        recordSmoke("mic.state", { live: next, via: next ? "m-unmute" : "m-mute" });
+        if (laneStatus !== "connecting") {
+          laneClient.send({ ...protocolBase("live.set"), value: next, reason: "user.toggle" });
+        }
+        const userText = next
+          ? laneStatus === "connecting"
+            ? "Voice is connecting. Microphone will start when ready."
+            : "Starting microphone…"
+          : "Mic is muted. Tap M to talk.";
+        setUserText(userText);
+        appendTranscript("user", next ? "Microphone starting." : "Mic muted.");
+        recordSmoke("mic.state", { desired: next, confirmedLive: getMicLive(), via: next ? "m-unmute" : "m-mute" });
       });
     };
 
@@ -1144,6 +1198,7 @@ export async function tui(api) {
       const transcript = getTranscript();
       return {
         micLive: getMicLive(),
+        micDesired: getMicDesired(),
         focused: getFocused(),
         laneStatus: getLaneStatus(),
         phase: getPhase(),
@@ -1156,6 +1211,7 @@ export async function tui(api) {
     const getAnnexState = createMemo(() => ({
       focused: getFocused(),
       micLive: getMicLive(),
+      micDesired: getMicDesired(),
       laneStatus: getLaneStatus()
     }));
 

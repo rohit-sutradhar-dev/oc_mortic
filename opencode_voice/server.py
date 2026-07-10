@@ -965,6 +965,11 @@ class VoiceConnection:
         self.stt_transport_healthy = True
         self.stt_unhealthy_reported = False
         self.flux_watchdog_task: asyncio.Task[None] | None = None
+        self.audio_transport_task: asyncio.Task[bool] | None = None
+        self.mic_start_task: asyncio.Task[None] | None = None
+        self.mic_start_generation = 0
+        self.mic_desired_live = False
+        self.mic_capture_gated = False
         self.speaker: TTSProvider | None = None
         self.tts_turn_token: PlaybackToken | None = None
         self.tts_failed_turns: set[int] = set()
@@ -1022,6 +1027,8 @@ class VoiceConnection:
             self.interruption_decision_task,
             self.interruption_expiry_task,
             self.flux_watchdog_task,
+            self.audio_transport_task,
+            self.mic_start_task,
             getattr(self, "mic_watchdog_task", None),
             *self.tts_terminal_watchdogs.values(),
             *self.background_tasks,
@@ -1031,7 +1038,14 @@ class VoiceConnection:
         for task in pending_tasks:
             task.cancel()
         if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
+            try:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                # ASGI websocket shutdown can cancel the lane handler while
+                # its owned prewarm tasks are draining. They have already
+                # been cancelled; finish deterministic resource cleanup and
+                # let the disconnect complete normally.
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
         self.background_tasks.clear()
         self.tts_terminal_watchdogs.clear()
         if self.native_audio_engine:
@@ -1128,17 +1142,24 @@ class VoiceConnection:
         self.fork_session_id = None
         self.voice_lane_id = None
 
-    async def start_audio(self) -> None:
+    async def start_audio(self) -> bool:
         issue = self.config.credential_issue_for("voice_audio")
         if issue:
             await self.send_json(issue.to_voice_bridge_issue(debug_ref=str(self.logger.run_dir)))
-            return
+            return False
         if self.flux:
-            return
-        self.reset_audio_input_counters()
-        self.flux = DeepgramFluxSession(self.config, on_event=self.handle_flux_event)
-        await self.flux.start()
-        epoch = getattr(self.flux, "connection_epoch", None)
+            return True
+        flux = DeepgramFluxSession(self.config, on_event=self.handle_flux_event)
+        try:
+            await flux.start()
+        except asyncio.CancelledError:
+            await flux.close()
+            raise
+        except Exception:
+            await flux.close()
+            raise
+        self.flux = flux
+        epoch = getattr(flux, "connection_epoch", None)
         if isinstance(epoch, int):
             self.adopt_flux_connection_epoch(epoch)
         else:
@@ -1146,11 +1167,48 @@ class VoiceConnection:
         self.logger.write("flux.connection.ready", flux_connection_epoch=self.flux_connection_epoch)
         if self.flux_watchdog_task is None or self.flux_watchdog_task.done():
             self.flux_watchdog_task = asyncio.create_task(self.watch_flux_transport())
+        return True
+
+    async def ensure_audio_transport(self) -> bool:
+        if self.flux is not None:
+            return True
+        task = self.audio_transport_task
+        if task is None or task.done():
+            task = asyncio.create_task(self.start_audio())
+            self.audio_transport_task = task
+        try:
+            # Mic startup may be cancelled by a newer M/off request. The
+            # transport prewarm remains useful and must finish independently.
+            return bool(await asyncio.shield(task))
+        finally:
+            if task.done() and self.audio_transport_task is task:
+                self.audio_transport_task = None
+
+    async def prewarm_audio_transport(self) -> None:
+        if self.config.credential_issue_for("voice_audio") or self.closed:
+            return
+        started_at = time.perf_counter()
+        try:
+            ready = await self.ensure_audio_transport()
+            self.logger.write("flux.prewarm", ready=ready, latency_ms=elapsed_ms(started_at))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - M retries on demand.
+            self.logger.write("flux.prewarm.error", error_code=type(exc).__name__)
+
+    def schedule_audio_prewarm(self) -> None:
+        if self.flux is not None or self.config.credential_issue_for("voice_audio"):
+            return
+        self.spawn_background(self.prewarm_audio_transport())
 
     async def start_native_audio(self) -> bool:
-        await self.start_audio()
+        if not await self.ensure_audio_transport():
+            return False
         if self.closed or self.flux is None or self.native_mic or self.native_audio_engine:
+            if self.native_audio_engine:
+                self.native_audio_engine.set_capture_enabled(True)
             return bool(self.native_mic or self.native_audio_engine)
+        self.reset_audio_input_counters()
         self.ensure_echo_canceller()
         self.capture_to_flux_resampler = Pcm16Resampler(
             self.config.device_sample_rate, self.config.deepgram_sample_rate
@@ -1175,7 +1233,15 @@ class VoiceConnection:
             capture_processor=self.filter_mic_frame,
             on_event=self.on_playback_event,
         )
-        if await engine.start():
+        try:
+            engine_started = await engine.start()
+        except asyncio.CancelledError:
+            await engine.close()
+            raise
+        except Exception:
+            await engine.close()
+            raise
+        if engine_started:
             engine.invalidate_generation(self.speak_generation)
             self.native_audio_engine = engine
             self.force_half_duplex = False
@@ -1186,6 +1252,7 @@ class VoiceConnection:
                 jitter_target_ms=80,
             )
             return True
+        await engine.close()
 
         # A synchronized stream is the only supported automatic full-duplex
         # mode.  Separate device streams are retained solely as the explicit
@@ -1202,10 +1269,16 @@ class VoiceConnection:
             on_audio=self.handle_native_audio,
             on_issue=self.send_json,
         )
-        if not await native_mic.start():
-            if self.flux:
-                await self.flux.close()
-                self.flux = None
+        try:
+            mic_started = await native_mic.start()
+        except asyncio.CancelledError:
+            await native_mic.close()
+            raise
+        except Exception:
+            await native_mic.close()
+            raise
+        if not mic_started:
+            await native_mic.close()
             return False
         self.native_mic = native_mic
         return True
@@ -1306,14 +1379,7 @@ class VoiceConnection:
             and self.playback_is_audible()
         )
 
-    async def stop_audio(self, reason: str) -> None:
-        if self.flux_watchdog_task and not self.flux_watchdog_task.done():
-            self.flux_watchdog_task.cancel()
-            try:
-                await self.flux_watchdog_task
-            except asyncio.CancelledError:
-                pass
-        self.flux_watchdog_task = None
+    async def stop_audio(self, reason: str, *, keep_transport: bool = False) -> None:
         if self.native_audio_engine:
             await self.native_audio_engine.close()
             self.native_audio_engine = None
@@ -1321,13 +1387,31 @@ class VoiceConnection:
             await self.native_mic.close()
             self.native_mic = None
         self.log_audio_input_summary(reason=reason)
-        if self.flux:
-            await self.flux.close()
-            self.flux = None
-        self.flux_connection_epoch = None
-        self.stt_transport_healthy = True
-        self.stt_unhealthy_reported = False
+        if not keep_transport:
+            transport_task = self.audio_transport_task
+            if transport_task and transport_task is not asyncio.current_task() and not transport_task.done():
+                transport_task.cancel()
+                await asyncio.gather(transport_task, return_exceptions=True)
+            self.audio_transport_task = None
+            if self.flux_watchdog_task and not self.flux_watchdog_task.done():
+                self.flux_watchdog_task.cancel()
+                try:
+                    await self.flux_watchdog_task
+                except asyncio.CancelledError:
+                    pass
+            self.flux_watchdog_task = None
+            if self.flux:
+                await self.flux.close()
+                self.flux = None
+            self.flux_connection_epoch = None
+            self.stt_transport_healthy = True
+            self.stt_unhealthy_reported = False
         self.force_half_duplex = False
+        if not keep_transport:
+            self.mic_capture_gated = False
+        self.reset_capture_interruption_state()
+
+    def reset_capture_interruption_state(self) -> None:
         self.interruption_state = InterruptionSnapshot(updated_at_ms=self.interruption_elapsed_ms())
         self.interruption_episode = None
         self.interruption_episodes.clear()
@@ -1712,6 +1796,17 @@ class VoiceConnection:
                 await self.set_stt_transport_health(False, event_type.rsplit(".", 1)[-1])
             elif event_type == "flux.transport.send_ok":
                 await self.set_stt_transport_health(True, "send_ok")
+            return
+        if self.mic_capture_gated:
+            episode = self.interruption_episode_for(event, started=event_type == "speech.start")
+            self.expire_interruption_episode(episode)
+            self.final_transcript = ""
+            self.logger.write(
+                "speech.muted.drop",
+                event_type=event_type,
+                flux_connection_epoch=episode.flux_epoch,
+                turn_index=episode.turn_index,
+            )
             return
         event_epoch = event.get("flux_connection_epoch")
         if (
@@ -3426,6 +3521,10 @@ class SidepodConnection(VoiceConnection):
             )
             return
         self.lane_registered = True
+        # Open Flux while the fork is being prepared. This removes the
+        # provider handshake from the first M press without prompting for or
+        # opening the microphone before the user asks.
+        self.schedule_audio_prewarm()
         if not self.config.keep_fork_default:
             await reap_stale_voice_forks(self.client, self.logger, exclude_ids={source_session_id})
         try:
@@ -3437,6 +3536,7 @@ class SidepodConnection(VoiceConnection):
         except Exception as exc:  # noqa: BLE001 - keep sidepod transport alive.
             self.lane_registered = False
             await self.lane_registry.release(self.connection_id)
+            await self.stop_audio(reason="lane_start_failed")
             self.logger.write("sidepod.start.error", source_session_id=source_session_id, error=repr(exc))
             await self.send_protocol_issue(
                 diagnostic_code="voice_lane_start_failed",
@@ -3476,6 +3576,95 @@ class SidepodConnection(VoiceConnection):
             }
         )
 
+    def schedule_mic_start(self) -> None:
+        self.mic_desired_live = True
+        if self.native_mic or self.native_audio_engine:
+            return
+        if self.mic_start_task and not self.mic_start_task.done():
+            return
+        self.mic_start_generation += 1
+        generation = self.mic_start_generation
+        transport_prepared = self.flux is not None
+        task = asyncio.create_task(self.start_mic_generation(generation, transport_prepared))
+        self.mic_start_task = task
+
+        def clear_finished(done: asyncio.Task[None]) -> None:
+            if self.mic_start_task is done:
+                self.mic_start_task = None
+
+        task.add_done_callback(clear_finished)
+
+    async def cancel_pending_mic_start(self, reason: str) -> None:
+        task = self.mic_start_task
+        was_pending = self.mic_desired_live or bool(task and not task.done())
+        self.mic_desired_live = False
+        self.mic_start_generation += 1
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self.mic_start_task is task:
+            self.mic_start_task = None
+        if was_pending:
+            self.logger.write("native_audio.start.cancel", reason=reason)
+
+    async def start_mic_generation(self, generation: int, transport_prepared: bool) -> None:
+        started_at = time.perf_counter()
+        try:
+            started = await self.start_native_audio()
+        except asyncio.CancelledError:
+            await self.stop_audio(reason="mic_start_cancelled", keep_transport=True)
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the v0 lane alive while STT reconnects.
+            if generation != self.mic_start_generation or not self.mic_desired_live:
+                return
+            self.mic_desired_live = False
+            self.logger.write(
+                "flux.connection.error",
+                stage="initial_connect",
+                error_code=type(exc).__name__,
+            )
+            await self.stop_audio(reason="stt_initial_connect_failed")
+            await self.send_json(
+                voice_bridge_issue_payload(
+                    capability="voice_audio",
+                    diagnostic_code="stt_transport_unhealthy",
+                    safe_detail="Voice recognition reconnecting",
+                    retryable=True,
+                    debug_ref=str(self.logger.run_dir),
+                    voice_lane_id=self.voice_lane_id,
+                )
+            )
+            return
+
+        if generation != self.mic_start_generation or not self.mic_desired_live:
+            await self.stop_audio(reason="mic_start_superseded", keep_transport=True)
+            return
+        if not started:
+            self.mic_desired_live = False
+            return
+        self.mic_capture_gated = False
+        self.start_mic_watchdog()
+        # Recheck after every awaited startup operation. A fast M/off must
+        # never be followed by a stale listening acknowledgement.
+        if generation != self.mic_start_generation or not self.mic_desired_live:
+            await self.shutdown_mic_watchdog()
+            await self.stop_audio(reason="mic_start_superseded", keep_transport=True)
+            return
+        self.logger.write(
+            "native_audio.mic.ready",
+            latency_ms=elapsed_ms(started_at),
+            transport_prepared=transport_prepared,
+            mode=self.duplex_mode(),
+        )
+        await self.send_json(
+            {
+                "type": "listening",
+                "sentAt": iso_utc_now(),
+                "voiceLaneId": self.voice_lane_id,
+                "mode": "live",
+            }
+        )
+
     async def handle_live_set(self, payload: dict[str, Any]) -> None:
         if not self.fork_session_id or not self.voice_lane_id:
             await self.send_protocol_issue(
@@ -3484,28 +3673,14 @@ class SidepodConnection(VoiceConnection):
             )
             return
         if bool(payload.get("value")):
-            try:
-                started = await self.start_native_audio()
-            except Exception as exc:  # noqa: BLE001 - keep the v0 lane alive while STT reconnects.
-                self.logger.write(
-                    "flux.connection.error",
-                    stage="initial_connect",
-                    error_code=type(exc).__name__,
-                )
-                await self.stop_audio(reason="stt_initial_connect_failed")
-                await self.send_json(
-                    voice_bridge_issue_payload(
-                        capability="voice_audio",
-                        diagnostic_code="stt_transport_unhealthy",
-                        safe_detail="Voice recognition reconnecting",
-                        retryable=True,
-                        debug_ref=str(self.logger.run_dir),
-                        voice_lane_id=self.voice_lane_id,
-                    )
-                )
-                return
-            if started:
+            if self.native_audio_engine and self.flux:
+                self.mic_desired_live = True
+                self.mic_capture_gated = False
+                self.mic_start_generation += 1
+                self.native_audio_engine.set_capture_enabled(True)
+                self.reset_audio_input_counters()
                 self.start_mic_watchdog()
+                self.logger.write("native_audio.capture_gate", enabled=True, reason="live.set.true")
                 await self.send_json(
                     {
                         "type": "listening",
@@ -3514,9 +3689,31 @@ class SidepodConnection(VoiceConnection):
                         "mode": "live",
                     }
                 )
+            else:
+                self.schedule_mic_start()
         else:
+            reason = str(payload.get("reason") or "live.set.false")
+            self.mic_capture_gated = True
+            if self.native_audio_engine:
+                # Apply the privacy gate before any cancellation await.
+                self.native_audio_engine.set_capture_enabled(False)
+            await self.cancel_pending_mic_start(reason)
             await self.shutdown_mic_watchdog()
-            await self.stop_audio(reason=str(payload.get("reason") or "live.set.false"))
+            if self.native_audio_engine:
+                # Soft mute: the synchronized device/AEC/output clock keeps
+                # running, while real capture is replaced with timed silence
+                # before it can reach Flux.
+                self.log_audio_input_summary(reason=reason)
+                self.reset_audio_input_counters()
+                active_episode = self.interruption_episode
+                self.reset_capture_interruption_state()
+                if active_episode is not None:
+                    self.expire_interruption_episode(active_episode)
+                self.logger.write("native_audio.capture_gate", enabled=False, reason=reason)
+            else:
+                # Explicit half-duplex fallback owns a separate mic stream,
+                # so closing it cannot disturb speaker playback.
+                await self.stop_audio(reason=reason, keep_transport=True)
 
     def start_mic_watchdog(self) -> None:
         self.cancel_mic_watchdog()
@@ -3541,6 +3738,7 @@ class SidepodConnection(VoiceConnection):
             return
         if not (self.native_mic or self.native_audio_engine) or self.audio_input_chunks:
             return
+        self.mic_desired_live = False
         self.logger.write("native_audio.silent", window_sec=MIC_WATCHDOG_SEC)
         await self.stop_audio(reason="mic_watchdog_silent")
         await self.send_json(
@@ -3590,6 +3788,7 @@ class SidepodConnection(VoiceConnection):
         await self.send_json(stopped)
 
     async def stop(self) -> None:
+        await self.cancel_pending_mic_start("sidepod_stop")
         await self.shutdown_mic_watchdog()
         await self.stop_audio(reason="sidepod_stop")
         if self.turn_task and not self.turn_task.done():
@@ -3612,6 +3811,7 @@ class SidepodConnection(VoiceConnection):
         await self.lane_registry.release(self.connection_id)
 
     async def close(self) -> None:
+        await self.cancel_pending_mic_start("sidepod_close")
         await self.shutdown_mic_watchdog()
         try:
             await super().close()
