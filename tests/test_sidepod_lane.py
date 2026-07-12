@@ -27,6 +27,7 @@ from opencode_voice.server import (
     SIDEPOD_PROTOCOL_VERSION,
     SidepodConnection,
     classify_turn_failure,
+    compaction_growth_required,
 )
 from tests.fakes import FakeOpenCodeClient
 
@@ -56,7 +57,7 @@ class LaneFakeClient(FakeOpenCodeClient):
         self._events_staged = asyncio.Event()
         self.event_directories: list[str | None] = []
 
-    async def fork_session(self, session_id: str) -> dict[str, str]:
+    async def fork_session(self, session_id: str, message_id: str | None = None) -> dict[str, str]:
         fork = await super().fork_session(session_id)
         # Real forks inherit the source thread's directory (not the server's).
         return {**fork, "directory": "/project/source-thread"}
@@ -140,6 +141,201 @@ class LaneFakeClient(FakeOpenCodeClient):
 
     async def prompt_text(self, session_id: str, text: str, model: Any, agent: str) -> Any:
         raise RuntimeError("poll path should not run when the event stream works")
+
+
+class StructuredLaneClient(LaneFakeClient):
+    def __init__(
+        self,
+        response: dict[str, str] | None = None,
+        *,
+        responses: list[dict[str, str]] | None = None,
+        with_tool: bool = False,
+    ) -> None:
+        super().__init__()
+        self.response = response or {
+            "displayText": "The target is 2026 in interruption.py.",
+            "spokenText": "The target is twenty twenty-six in the interruption controller module.",
+        }
+        self.responses = responses or [self.response]
+        self.with_tool = with_tool
+        self.prompt_payloads: list[dict[str, Any]] = []
+
+    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+        return await self.messages(session_id)
+
+    async def prompt_async(
+        self,
+        session_id: str,
+        text: str,
+        model: Any,
+        agent: str,
+        **kwargs: Any,
+    ) -> Any:
+        self.prompts.append((session_id, text))
+        self.prompt_payloads.append(kwargs)
+        message_id = f"msg_structured_{len(self.prompts)}"
+        parts: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
+        if self.with_tool:
+            tool_part = {
+                "id": f"prt_tool_{len(self.prompts)}",
+                "sessionID": session_id,
+                "messageID": message_id,
+                "type": "tool",
+                "tool": "read",
+                "state": {"status": "running"},
+            }
+            parts.append(tool_part)
+            events.append({"type": "message.part.updated", "properties": {"part": tool_part}})
+        response = self.responses[min(len(self.prompts) - 1, len(self.responses) - 1)]
+        info = {
+            "id": message_id,
+            "role": "assistant",
+            "sessionID": session_id,
+            "structured": response,
+            "time": {"created": len(self.prompts), "completed": len(self.prompts) + 1},
+        }
+        self._assistant_messages = [*self._assistant_messages, {"info": info, "parts": parts}]
+        self._staged_events = [
+            *events,
+            {"type": "message.updated", "properties": {"info": info}},
+            {"type": "session.idle", "properties": {"sessionID": session_id}},
+        ]
+        self._events_staged.set()
+        return {"ok": True}
+
+
+class CompactionLaneClient(LaneFakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.summarize_calls = 0
+        self.summarize_started = asyncio.Event()
+        self.summarize_release = asyncio.Event()
+        self.summarize_release.set()
+        self.context_tokens = 80_000
+        self.emit_compacted = True
+        self.summary_error = False
+        self.wait_for_idle_calls = 0
+
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+        messages = [
+            {
+                "info": {
+                    "id": "msg_active",
+                    "role": "assistant",
+                    "time": {"created": 1, "completed": 2},
+                    "tokens": {"input": self.context_tokens, "output": 10},
+                },
+                "parts": [{"type": "text", "text": "active"}],
+            }
+        ]
+        if self.summarize_calls:
+            info: dict[str, Any] = {
+                "id": f"msg_summary_{self.summarize_calls}",
+                "role": "assistant",
+                "summary": True,
+                "sessionID": session_id,
+                "time": {"created": 3, "completed": 4},
+                "finish": "error" if self.summary_error else "stop",
+            }
+            if self.summary_error:
+                info["error"] = {"name": "UnknownError"}
+            messages.append(
+                {
+                    "info": info,
+                    "parts": [{"type": "text", "text": "canonical summary"}],
+                }
+            )
+            messages.append(
+                {
+                    "info": {
+                        "id": "msg_post_summary_active",
+                        "role": "assistant",
+                        "time": {"created": 5, "completed": 6},
+                        "tokens": {"input": self.context_tokens, "output": 10},
+                    },
+                    "parts": [{"type": "text", "text": "retained active tail"}],
+                }
+            )
+        return messages
+
+    async def summarize(self, session_id: str, model: Any, auto: bool = False) -> dict[str, bool]:
+        self.summarize_calls += 1
+        self.summarize_started.set()
+        await self.summarize_release.wait()
+        summary = next(
+            message["info"]
+            for message in await self.messages(session_id)
+            if message["info"].get("summary") is True
+        )
+        self._staged_events = [
+            {"type": "message.updated", "properties": {"info": summary}},
+        ]
+        if self.summary_error:
+            self._staged_events.append(
+                {
+                    "type": "session.error",
+                    "properties": {"sessionID": session_id, "error": summary["error"]},
+                }
+            )
+        elif self.emit_compacted:
+            self._staged_events.append(
+                {"type": "session.compacted", "properties": {"sessionID": session_id}}
+            )
+        self._events_staged.set()
+        return {"ok": True}
+
+    async def wait_for_idle(self, session_id: str) -> None:
+        self.wait_for_idle_calls += 1
+
+
+class StructuredLegacyDecoderClient(StructuredLaneClient):
+    """The legacy reader breaks after the first structured prompt in 1.17.18."""
+
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+        if self.prompts:
+            raise RuntimeError("legacy structured message decoder rejected retryCount")
+        return await super().messages(session_id)
+
+    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+        return list(self._assistant_messages)
+
+
+class BrokenPreflightClient(StructuredLaneClient):
+    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+        raise RuntimeError("message projection unavailable")
+
+
+class BlockingPreflightClient(StructuredLaneClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_next = False
+        self.blocked = asyncio.Event()
+
+    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+        if self.block_next:
+            self.block_next = False
+            self.blocked.set()
+            await asyncio.Event().wait()
+        return list(self._assistant_messages)
+
+
+class OverflowRecoveryClient(LaneFakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cutoffs: list[tuple[str, str | None]] = []
+        self._assistant_messages = [
+            {"info": {"id": "msg_before", "role": "assistant"}, "parts": []},
+            {"info": {"id": "msg_failed_user", "role": "user"}, "parts": [{"type": "text", "text": "ask"}]},
+            {"info": {"id": "msg_overflow", "role": "assistant", "error": "context length"}, "parts": []},
+        ]
+
+    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+        return await self.messages(session_id)
+
+    async def fork_session(self, session_id: str, message_id: str | None = None) -> dict[str, str]:
+        self.cutoffs.append((session_id, message_id))
+        return await super().fork_session(session_id, message_id=message_id)
 
 
 class FakeSpeakSession:
@@ -525,6 +721,8 @@ def lane_connection(
     voice_duplex: str = "auto",
     tts_provider: str = "deepgram",
     device_sample_rate: int = 48_000,
+    response_mode: str = "legacy",
+    compaction_wait_sec: float = 10.0,
     **kwargs: Any,
 ) -> tuple[SidepodConnection, FakeWebSocket, LaneFakeClient]:
     websocket = FakeWebSocket()
@@ -536,6 +734,8 @@ def lane_connection(
             voice_duplex=voice_duplex,
             tts_provider=tts_provider,
             device_sample_rate=device_sample_rate,
+            response_mode=response_mode,
+            compaction_wait_sec=compaction_wait_sec,
         ),
         client=fake_client,  # type: ignore[arg-type]
         logger=RunLogger(root=tmp),
@@ -877,6 +1077,202 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
             complete = next(message for message in websocket.sent if message["type"] == "complete")
             self.assertEqual(complete["fullSpokenText"], "First sentence. Trailing sentence.")
             assert_all_lane_messages_valid(self, websocket.sent)
+
+
+class StructuredResponseLaneTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_turn_silently_replaces_stalled_preflight(self) -> None:
+        client = BlockingPreflightClient()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ):
+            connection, websocket, _client = lane_connection(
+                tmp,
+                client=client,
+                response_mode="structured",
+            )
+            await connection.handle_control(START_PAYLOAD)
+            if connection.compaction_task:
+                await connection.compaction_task
+            client.block_next = True
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "First question."})
+            await asyncio.wait_for(client.blocked.wait(), timeout=1)
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "Replacement question."})
+            assert connection.turn_task is not None
+            await asyncio.wait_for(connection.turn_task, timeout=3)
+
+            self.assertNotIn("interrupted", [message["type"] for message in websocket.sent])
+            self.assertEqual(
+                len([message for message in websocket.sent if message["type"] == "assistant.delta"]),
+                1,
+            )
+            self.assertIn("turn.preflight.replaced", connection.logger.path.read_text(encoding="utf-8"))
+            await connection.close()
+
+    async def test_consecutive_structured_turns_use_compatible_message_projection(self) -> None:
+        client = StructuredLegacyDecoderClient()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ):
+            connection, websocket, _client = lane_connection(
+                tmp,
+                client=client,
+                response_mode="structured",
+            )
+            await connection.handle_control(START_PAYLOAD)
+            for transcript in ("First question.", "Second question."):
+                await connection.handle_flux_event({"type": "speech.end", "transcript": transcript})
+                assert connection.turn_task is not None
+                await asyncio.wait_for(connection.turn_task, timeout=3)
+                await connection.on_playback_drained()
+
+            deltas = [message for message in websocket.sent if message["type"] == "assistant.delta"]
+            self.assertEqual(len(deltas), 2)
+            self.assertIsNone(connection.active_turn_id)
+            logs = connection.logger.path.read_text(encoding="utf-8")
+            self.assertNotIn("turn.preflight.error", logs)
+            await connection.close()
+
+    async def test_preflight_projection_failure_is_visible_and_leaves_no_phantom_turn(self) -> None:
+        client = BrokenPreflightClient()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ):
+            connection, websocket, _client = lane_connection(
+                tmp,
+                client=client,
+                response_mode="structured",
+            )
+            await connection.handle_control(START_PAYLOAD)
+            if connection.compaction_task:
+                await connection.compaction_task
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "Can you hear me?"})
+            assert connection.turn_task is not None
+            await asyncio.wait_for(connection.turn_task, timeout=3)
+
+            self.assertIsNone(connection.active_turn_id)
+            self.assertNotIn("interrupted", [message["type"] for message in websocket.sent])
+            issues = [message for message in websocket.sent if message["type"] == "voice_bridge_issue"]
+            self.assertTrue(issues)
+            self.assertIn("turn_failed", [issue["diagnosticCode"] for issue in issues])
+            self.assertIn("turn.preflight.error", connection.logger.path.read_text(encoding="utf-8"))
+            await connection.close()
+
+    async def test_validated_display_and_spoken_fields_route_independently(self) -> None:
+        client = StructuredLaneClient()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ):
+            connection, websocket, _client = lane_connection(
+                tmp, client=client, response_mode="structured"
+            )
+            await connection.handle_control(START_PAYLOAD)
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "Where is the target?"})
+            assert connection.turn_task is not None
+            await asyncio.wait_for(connection.turn_task, timeout=3)
+            await connection.on_playback_drained()
+
+            deltas = [message["delta"] for message in websocket.sent if message["type"] == "assistant.delta"]
+            self.assertEqual(deltas, [client.response["displayText"]])
+            speaker = connection.speaker
+            assert isinstance(speaker, FakeSpeakSession)
+            self.assertEqual(" ".join(speaker.spoken), client.response["spokenText"])
+            complete = next(message for message in websocket.sent if message["type"] == "complete")
+            self.assertEqual(complete["fullSpokenText"], client.response["spokenText"])
+            self.assertEqual(client.prompt_payloads[0]["output_format"]["type"], "json_schema")
+            self.assertIn("StructuredOutput", client.prompt_payloads[0]["system"])
+            assert_all_lane_messages_valid(self, websocket.sent)
+            await connection.close()
+
+    async def test_real_tool_activity_is_observed_once_without_becoming_screen_text(self) -> None:
+        client = StructuredLaneClient(with_tool=True)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ):
+            connection, websocket, _client = lane_connection(
+                tmp, client=client, response_mode="structured"
+            )
+            await connection.handle_control(START_PAYLOAD)
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "Inspect it."})
+            assert connection.turn_task is not None
+            await asyncio.wait_for(connection.turn_task, timeout=3)
+
+            logs = [json.loads(line) for line in connection.logger.path.read_text(encoding="utf-8").splitlines()]
+            activity = [item for item in logs if item["event"] == "opencode.tool.activity"]
+            self.assertEqual([(item["tool"], item["status"]) for item in activity], [("read", "running")])
+            serialized = json.dumps(websocket.sent)
+            self.assertNotIn("prt_tool", serialized)
+            self.assertNotIn('"tool"', serialized)
+            await connection.close()
+
+    async def test_unsafe_first_response_is_repaired_before_screen_or_speech(self) -> None:
+        unsafe = {
+            "displayText": "Use /Users/ana/project/src/App.tsx.",
+            "spokenText": "Use slash Users slash ana slash project slash src slash App dot tsx.",
+        }
+        safe = {
+            "displayText": "Use App.tsx.",
+            "spokenText": "Use the app component.",
+        }
+        client = StructuredLaneClient(responses=[unsafe, safe])
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ):
+            connection, websocket, _client = lane_connection(
+                tmp, client=client, response_mode="structured"
+            )
+            await connection.handle_control(START_PAYLOAD)
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "Which file?"})
+            assert connection.turn_task is not None
+            await asyncio.wait_for(connection.turn_task, timeout=3)
+
+            deltas = [message["delta"] for message in websocket.sent if message["type"] == "assistant.delta"]
+            self.assertEqual(deltas, [safe["displayText"]])
+            speaker = connection.speaker
+            assert isinstance(speaker, FakeSpeakSession)
+            self.assertEqual(" ".join(speaker.spoken), safe["spokenText"])
+            self.assertNotIn("/Users/ana", json.dumps(websocket.sent))
+            self.assertEqual(len(client.prompts), 2)
+            self.assertTrue(all(value is False for value in client.prompt_payloads[1]["tools"].values()))
+            await connection.close()
+
+    async def test_schema_invalid_first_response_can_be_repaired(self) -> None:
+        client = StructuredLaneClient(
+            responses=[
+                {"displayText": "Ready."},  # type: ignore[list-item]
+                {"displayText": "Ready.", "spokenText": "Ready."},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
+            "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
+        ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
+            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+        ):
+            connection, websocket, _client = lane_connection(
+                tmp, client=client, response_mode="structured"
+            )
+            await connection.handle_control(START_PAYLOAD)
+            await connection.handle_flux_event({"type": "speech.end", "transcript": "Are we ready?"})
+            assert connection.turn_task is not None
+            await asyncio.wait_for(connection.turn_task, timeout=3)
+
+            self.assertEqual(
+                [message["delta"] for message in websocket.sent if message["type"] == "assistant.delta"],
+                ["Ready."],
+            )
+            self.assertEqual(len(client.prompts), 2)
+            await connection.close()
 
 
 class SidepodTTSLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
@@ -2218,15 +2614,146 @@ class SilentCompletionLoggingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SidepodCompactionWiringTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_compaction_blocks_turn_before_model_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = CompactionLaneClient()
+            client.summary_error = True
+            connection, websocket, _client = lane_connection(
+                tmp,
+                client=client,
+                response_mode="structured",
+            )
+            await connection.handle_control(START_PAYLOAD)
+            if connection.compaction_task:
+                await connection.compaction_task
+
+            await connection.handle_flux_event(
+                {"type": "speech.end", "transcript": "Question after failed compaction."}
+            )
+            assert connection.turn_task is not None
+            await asyncio.wait_for(connection.turn_task, timeout=3)
+
+            self.assertEqual(client.prompts, [])
+            self.assertIsNone(connection.active_turn_id)
+            self.assertNotIn("assistant.delta", [message["type"] for message in websocket.sent])
+            logs = connection.logger.path.read_text(encoding="utf-8")
+            self.assertIn("turn.preflight.blocked", logs)
+            self.assertNotIn('"event": "turn.start"', logs)
+            await connection.close()
+
     async def test_start_kicks_a_context_check_without_leaking_tokens_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             connection, websocket, _client = lane_connection(tmp)
             await connection.handle_control(START_PAYLOAD)
+            if connection.compaction_task:
+                await connection.compaction_task
 
             self.assertEqual([message["type"] for message in websocket.sent], ["ready"])
             log_lines = connection.logger.path.read_text(encoding="utf-8").splitlines()
             events = [json.loads(line)["event"] for line in log_lines]
             self.assertIn("tokens.check", events)
+
+    async def test_concurrent_triggers_share_one_summarize_and_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = CompactionLaneClient()
+            client.summarize_release.clear()
+            connection, _websocket, _client = lane_connection(tmp, client=client)
+            connection.fork_session_id = "fork_1"
+
+            first = asyncio.create_task(
+                connection.maybe_start_compaction("speech_confirmed", run_in_background=False)
+            )
+            await client.summarize_started.wait()
+            second = asyncio.create_task(
+                connection.maybe_start_compaction("turn_complete", run_in_background=False)
+            )
+            client.summarize_release.set()
+            first_result, second_result = await asyncio.gather(first, second)
+
+            self.assertEqual(client.summarize_calls, 1)
+            self.assertIs(first_result, second_result)
+            self.assertTrue(first_result and first_result.completed)
+            await connection.close()
+
+    async def test_post_compaction_growth_guard_blocks_immediate_repeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = CompactionLaneClient()
+            connection, _websocket, _client = lane_connection(tmp, client=client)
+            connection.fork_session_id = "fork_1"
+
+            first = await connection.maybe_start_compaction("first", run_in_background=False)
+            second = await connection.maybe_start_compaction("second", run_in_background=False)
+
+            self.assertTrue(first and first.completed)
+            self.assertIsNone(second)
+            self.assertEqual(client.summarize_calls, 1)
+            self.assertEqual(compaction_growth_required(70_000), 7_000)
+            logs = connection.logger.path.read_text(encoding="utf-8")
+            self.assertIn("compaction.suppressed", logs)
+            await connection.close()
+
+    async def test_compaction_requires_event_and_validated_new_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = CompactionLaneClient()
+            connection, _websocket, _client = lane_connection(tmp, client=client)
+            connection.fork_session_id = "fork_1"
+
+            outcome = await connection.maybe_start_compaction("test", run_in_background=False)
+
+            self.assertTrue(outcome and outcome.completed)
+            self.assertEqual(outcome.summary_message_id, "msg_summary_1")
+            logs = connection.logger.path.read_text(encoding="utf-8")
+            self.assertIn('"confirmation": "session.compacted"', logs)
+            await connection.close()
+
+    async def test_compaction_summary_error_cannot_be_reported_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = CompactionLaneClient()
+            client.summary_error = True
+            connection, _websocket, _client = lane_connection(tmp, client=client)
+            connection.fork_session_id = "fork_1"
+
+            outcome = await connection.maybe_start_compaction("test", run_in_background=False)
+
+            self.assertTrue(outcome and not outcome.completed)
+            logs = connection.logger.path.read_text(encoding="utf-8")
+            self.assertIn('"event": "compaction.error"', logs)
+            self.assertIn('"error_code": "summary_error"', logs)
+            self.assertNotIn('"event": "compaction.complete"', logs)
+            await connection.close()
+
+    async def test_compaction_idle_fallback_still_validates_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = CompactionLaneClient()
+            client.emit_compacted = False
+            connection, _websocket, _client = lane_connection(
+                tmp,
+                client=client,
+                compaction_wait_sec=0.01,
+            )
+            connection.fork_session_id = "fork_1"
+
+            outcome = await connection.maybe_start_compaction("test", run_in_background=False)
+
+            self.assertTrue(outcome and outcome.completed)
+            self.assertEqual(client.wait_for_idle_calls, 1)
+            logs = connection.logger.path.read_text(encoding="utf-8")
+            self.assertIn("compaction.confirmation.fallback", logs)
+            await connection.close()
+
+    async def test_overflow_recovery_forks_before_persisted_failed_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = OverflowRecoveryClient()
+            connection, _websocket, _client = lane_connection(tmp, client=client)
+            connection.fork_session_id = "fork_failed"
+
+            recovered = await connection.recover_overflow_fork("fork_failed", {"msg_before"})
+
+            self.assertEqual(recovered, "fork_1")
+            self.assertEqual(client.cutoffs, [("fork_failed", "msg_failed_user")])
+            self.assertEqual(connection.fork_session_id, "fork_1")
+            self.assertIn("fork_failed", client.deleted)
+            await connection.close()
 
 
 if __name__ == "__main__":

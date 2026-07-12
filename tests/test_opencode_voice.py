@@ -24,7 +24,7 @@ from opencode_voice.config import (
 )
 from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
 from opencode_voice.logging import RunLogger
-from opencode_voice.opencode_client import SSEParser
+from opencode_voice.opencode_client import OpenCodeClient, SSEParser
 from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, create_app, helper_readiness_issues
 from opencode_voice.state import (
     AssistantTextTracker,
@@ -543,6 +543,35 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(estimate.source, "content_estimate")
         self.assertEqual(estimate.summary_message_id, "msg_summary")
 
+    def test_errored_summary_does_not_reset_active_context(self) -> None:
+        messages = [
+            {
+                "info": {
+                    "id": "msg_assistant",
+                    "role": "assistant",
+                    "time": {"created": 1, "completed": 2},
+                    "tokens": {"input": 80_000, "output": 20},
+                },
+                "parts": [{"type": "text", "text": "active answer"}],
+            },
+            {
+                "info": {
+                    "id": "msg_failed_summary",
+                    "role": "assistant",
+                    "summary": True,
+                    "finish": "error",
+                    "error": {"name": "UnknownError"},
+                    "time": {"created": 3, "completed": 4},
+                },
+                "parts": [],
+            },
+        ]
+
+        estimate = active_context_estimate(messages)
+
+        self.assertEqual(estimate.tokens, 80_000)
+        self.assertIsNone(estimate.summary_message_id)
+
 
 class AssistantTrackerTests(unittest.TestCase):
     def test_tracks_only_new_assistant_delta(self) -> None:
@@ -614,6 +643,61 @@ class SSEParserTests(unittest.TestCase):
         parser.push_line("data: {not json")
 
         self.assertIsNone(parser.push_line(""))
+
+
+class OpenCodeStructuredMessageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_v2_projection_falls_back_to_decodable_legacy_tail(self) -> None:
+        recent = [
+            {"info": {"id": "msg_user", "role": "user"}, "parts": []},
+            {"info": {"id": "msg_assistant", "role": "assistant"}, "parts": []},
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.startswith("/api/session/"):
+                return httpx.Response(200, json={"data": [], "cursor": None})
+            if request.url.params.get("limit") == "2":
+                return httpx.Response(200, json=recent)
+            return httpx.Response(400, json={"name": "BadRequest"})
+
+        client = OpenCodeClient("http://opencode.test")
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(
+            base_url="http://opencode.test",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            messages = await client.messages_for_tracking("ses_structured")
+        finally:
+            await client.close()
+
+        self.assertEqual(messages, recent)
+
+    async def test_nonempty_stale_projection_is_merged_with_recent_structured_pair(self) -> None:
+        summary = {"info": {"id": "msg_summary", "role": "assistant", "summary": True}, "parts": []}
+        recent = [
+            {"info": {"id": "msg_user", "role": "user"}, "parts": []},
+            {"info": {"id": "msg_assistant", "role": "assistant"}, "parts": []},
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.startswith("/api/session/"):
+                return httpx.Response(200, json={"data": [summary], "cursor": None})
+            if request.url.params.get("limit") == "2":
+                return httpx.Response(200, json=recent)
+            return httpx.Response(400, json={"name": "BadRequest"})
+
+        client = OpenCodeClient("http://opencode.test")
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(
+            base_url="http://opencode.test",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            messages = await client.messages_for_tracking("ses_structured")
+        finally:
+            await client.close()
+
+        self.assertEqual(messages, [summary, *recent])
 
 
 class OpenCodeEventTurnTrackerTests(unittest.TestCase):

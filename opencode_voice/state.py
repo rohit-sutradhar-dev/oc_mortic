@@ -126,8 +126,10 @@ def is_completed_assistant_summary(message: dict[str, Any]) -> bool:
     info = message.get("info") if isinstance(message, dict) else None
     if not isinstance(info, dict) or info.get("role") != "assistant" or info.get("summary") is not True:
         return False
+    if info.get("error") or str(info.get("finish") or "").lower() == "error":
+        return False
     time_info = info.get("time") or {}
-    return "completed" in time_info or bool(info.get("finish")) or bool(info.get("error"))
+    return "completed" in time_info or bool(info.get("finish"))
 
 
 def message_id(message: dict[str, Any] | None) -> str | None:

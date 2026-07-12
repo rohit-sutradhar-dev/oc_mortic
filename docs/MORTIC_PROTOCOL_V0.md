@@ -422,6 +422,7 @@ Optional fields:
 
 - `voiceLaneId`: active voice lane id.
 - `submittedTextChars`: character count of submitted user text, not the raw text.
+- `phase`: optional backward-compatible presentation hint. `responding` is the ordinary state; `preparing_context`, `continuing`, and `try_again` provide concise compaction-blocking copy without exposing tokens or provider details.
 
 Example:
 

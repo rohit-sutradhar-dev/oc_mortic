@@ -171,20 +171,34 @@ def notation_response_cases() -> list[ResponseCase]:
         (
             "file-line",
             "Explain that the failure is at [server.py:1486] naturally.",
-            ("server py 1486", "server.py 1486"),
-            ("server module line 1486", "server file line 1486", "server module at line 1486"),
+            ("server py 1486", "server.py 1486", "server.py at line 1486"),
+            (
+                "server module line 1486",
+                "server file line 1486",
+                "server module at line 1486",
+                "server script at line 1486",
+                "server 1486",
+                "server module at line one thousand four hundred eighty six",
+                "server script at line one thousand four hundred eighty six",
+            ),
         ),
         (
             "function",
             "Explain that reconnect(socket, options) performs the retry.",
             ("reconnect socket options",),
-            ("reconnect function", "reconnect takes socket and options"),
+            ("reconnect function", "reconnect takes socket and options", "reconnect socket options"),
         ),
         (
             "generic",
             "Explain that Result<Error> is the returned type without reading angle brackets.",
-            ("Result Error", "Result<Error>"),
-            ("result error type", "result of error type", "result type containing an error"),
+            ("Result Error", "Result<Error>", "Result of Error"),
+            (
+                "result error",
+                "result error type",
+                "result of error",
+                "result of error type",
+                "result type containing an error",
+            ),
         ),
         (
             "nested",
@@ -195,7 +209,7 @@ def notation_response_cases() -> list[ResponseCase]:
         (
             "error-code",
             "Explain Request failed [ETIMEDOUT] without reading brackets.",
-            ("request failed", "ETIMEDOUT"),
+            ("request failed", "ETIMEDOUT", "request timed out"),
             (
                 "request timed out",
                 "E timed out",
@@ -205,8 +219,19 @@ def notation_response_cases() -> list[ResponseCase]:
         (
             "metrics",
             "Report (p50: 2.5s, p95: 4.8s) naturally.",
-            ("p50 2 5", "50th percentile 2 5", "50th percentile latency is 2 5"),
-            ("fiftieth percentile 2 5", "fifty percentile latency is two point five", "p fifty 2 5"),
+            (
+                "p50 2 5",
+                "50th percentile 2 5",
+                "50th percentile latency is 2 5",
+                "median latency is 2 5",
+            ),
+            (
+                "fiftieth percentile 2 5",
+                "fiftieth percentile latency is two point five",
+                "fifty percentile latency is two point five",
+                "median latency is two point five",
+                "p fifty 2 5",
+            ),
         ),
     ]
     cases: list[ResponseCase] = []
@@ -230,9 +255,16 @@ def notation_response_cases() -> list[ResponseCase]:
                 assertions += (
                     SemanticAssertion(
                         "notation:metrics:p95",
-                        ("p95 4 8", "95th percentile 4 8", "95th percentile latency is 4 8"),
+                        (
+                            "p95 4 8",
+                            "95th percentile 4 8",
+                            "95th percentile is 4 8",
+                            "95th percentile latency is 4 8",
+                        ),
                         (
                             "ninety fifth percentile 4 8",
+                            "ninety fifth percentile is four point eight",
+                            "ninety fifth percentile latency is four point eight",
                             "ninety five percentile latency is four point eight",
                             "p ninety five 4 8",
                         ),

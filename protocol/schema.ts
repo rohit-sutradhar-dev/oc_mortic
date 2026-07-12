@@ -152,6 +152,7 @@ export const thinkingEvent = z.looseObject({
   type: z.literal("thinking"),
   turnId: id,
   sourceMode: z.enum(["ptt", "live"]),
+  phase: z.enum(["responding", "preparing_context", "continuing", "try_again"]).optional(),
   voiceLaneId: id.optional(),
   submittedTextChars: z.int().optional(),
 });

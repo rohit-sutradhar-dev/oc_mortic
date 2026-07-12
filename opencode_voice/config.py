@@ -174,6 +174,10 @@ class VoiceConfig:
     # gate the mic while TTS is audible. "full": raw passthrough (headphones).
     # "half": force the gate.
     voice_duplex: str = "auto"
+    # Canary switch for the strict display/spoken response contract. Keep the
+    # legacy path available for one release until both TTS provider matrices
+    # pass on real devices.
+    response_mode: str = "legacy"
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False

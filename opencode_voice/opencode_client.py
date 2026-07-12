@@ -230,14 +230,49 @@ class OpenCodeClient:
         data = payload.get("data") if isinstance(payload, dict) else None
         return data if isinstance(data, list) else []
 
+    async def recent_messages(self, session_id: str, *, limit: int = 2) -> list[dict[str, Any]]:
+        """Read the decodable tail of a legacy session.
+
+        OpenCode 1.17.18 can reject an unbounded list after a structured
+        message is persisted, while the same endpoint still decodes its most
+        recent user/assistant pair. The voice connection merges this tail into
+        its pre-prompt cache so context accounting never collapses to zero.
+        """
+
+        response = await self._client.get(
+            f"/session/{session_id}/message",
+            params={"limit": max(1, limit)},
+        )
+        response.raise_for_status()
+        payload = response.json() if response.content else []
+        return payload if isinstance(payload, list) else []
+
     async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
-        """Prefer the legacy shape, falling back only for its known 400."""
+        """Prefer the legacy shape, merging both compatible 400 fallbacks."""
         try:
             return await self.messages(session_id)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 400:
                 raise
-        return await self.projected_messages(session_id)
+        projected = await self.projected_messages(session_id)
+        recent = await self.recent_messages(session_id)
+        merged = list(projected)
+        positions: dict[str, int] = {}
+        for index, message in enumerate(merged):
+            info = message.get("info") if isinstance(message, dict) else None
+            message_id = str((info or message).get("id") or "") if isinstance(message, dict) else ""
+            if message_id:
+                positions[message_id] = index
+        for message in recent:
+            info = message.get("info") if isinstance(message, dict) else None
+            message_id = str((info or message).get("id") or "") if isinstance(message, dict) else ""
+            if message_id and message_id in positions:
+                merged[positions[message_id]] = message
+            else:
+                if message_id:
+                    positions[message_id] = len(merged)
+                merged.append(message)
+        return merged
 
     async def _get(self, path: str) -> Any:
         response = await self._client.get(path)

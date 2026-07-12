@@ -77,6 +77,7 @@ class TelemetryConfigSnapshot:
 
     tts_provider: str
     duplex_mode: str
+    response_mode: str
     capture_sample_rate_hz: int
     playback_sample_rate_hz: int
     stt_sample_rate_hz: int
@@ -105,7 +106,7 @@ class TelemetryConfigSnapshot:
             or self.jitter_buffer_target_ms < 0
         ):
             raise ValueError("jitter_buffer_target_ms must be a non-negative integer")
-        for name in ("tts_provider", "duplex_mode", "network_profile"):
+        for name in ("tts_provider", "duplex_mode", "response_mode", "network_profile"):
             if _safe_label(getattr(self, name)) != getattr(self, name):
                 raise ValueError(f"{name} must be a safe categorical label")
 
@@ -141,6 +142,7 @@ def snapshot_voice_config(
     return TelemetryConfigSnapshot(
         tts_provider=_safe_label(getattr(config, "tts_provider", "unknown")),
         duplex_mode=_safe_label(getattr(config, "voice_duplex", "unknown")),
+        response_mode=_safe_label(getattr(config, "response_mode", "legacy")),
         capture_sample_rate_hz=device_rate if capture_sample_rate_hz is None else capture_sample_rate_hz,
         playback_sample_rate_hz=device_rate if playback_sample_rate_hz is None else playback_sample_rate_hz,
         stt_sample_rate_hz=stt_rate if stt_sample_rate_hz is None else stt_sample_rate_hz,

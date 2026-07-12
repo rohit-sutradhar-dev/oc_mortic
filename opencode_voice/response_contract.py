@@ -422,6 +422,7 @@ def evaluate_response(value: Any, case: ResponseCase, workspace_root: str | None
                         "Remove credentials and secret values.",
                         gate="safety",
                         field=field,  # type: ignore[arg-type]
+                        repairable=False,
                     )
                 )
 
@@ -438,8 +439,9 @@ def evaluate_response(value: Any, case: ResponseCase, workspace_root: str | None
                 _SPOKEN_PUNCTUATION_RE.search(envelope.spoken_text)
                 or _SPOKEN_FILE_RE.search(envelope.spoken_text)
             ),
-            "Replace the filename or notation with a natural role such as 'the value module'; never say the words "
-            "slash, dot, equals, open bracket, or close bracket.",
+            "Replace the filename or notation with a natural role derived from its basename and distinguishing folder; "
+            "for example, release/status.md becomes 'the release status file.' Never substitute an unrelated generic "
+            "role, and never say slash, dot, equals, open bracket, or close bracket.",
         ),
     ]
     for code, passed, repair in spoken_checks:
@@ -467,11 +469,13 @@ def evaluate_response(value: Any, case: ResponseCase, workspace_root: str | None
                 )
             )
             if not passed:
+                allowed = assertion.display_any if field == "displayText" else spoken_options
+                examples = " or ".join(allowed[:3])
                 violations.append(
                     Violation(
                         "missing_fact",
                         f"{field} is missing semantic assertion {assertion.assertion_id}",
-                        f"Preserve {assertion.assertion_id} in {field} using natural wording.",
+                        f"Preserve the intended claim in {field} using one of these equivalent forms: {examples}.",
                         gate="semantic",
                         field=field,
                     )
@@ -598,7 +602,8 @@ def repair_prompt(original_prompt: str, value: Any, violations: list[Violation])
             sections.append(f"{field_name}:\n" + "\n".join(f"- {text}" for text in by_field[field_name]))
     return (
         "Rewrite only the required final object. Do not repeat completed tool work and do not change the result. "
-        "Preserve every fact, outcome, "
+        "Apply each correction only to its named field and preserve a field that already passes. Never copy an exact "
+        "display path or filename into spokenText. Preserve every fact, outcome, "
         "entity, certainty, negation, and qualification. A correction for spokenText must not remove an exact path "
         "required in displayText.\n\n"
         f"Original user request:\n{original_prompt}\n\n"

@@ -101,6 +101,7 @@ class PersistentDeviceAudioEngine:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream: Any = None
         self._queue: deque[_QueuedFrame] = deque()
+        self._cue_queue: deque[_QueuedFrame] = deque()
         self._buffer_lock = threading.Lock()
         self._capacity_event = asyncio.Event()
         self._capacity_event.set()
@@ -241,6 +242,29 @@ class PersistentDeviceAudioEngine:
                     return False
             return self._token_is_current(token)
 
+    async def play_device_cue(self, data: bytes, token: PlaybackToken) -> bool:
+        """Mix exact device-rate PCM without creating a speech burst.
+
+        Cues share generation fencing and the final render/AEC reference, but
+        never trigger first-speech or provider-drain callbacks.
+        """
+
+        if len(data) % self.BYTES_PER_SAMPLE:
+            raise ValueError("PCM16 data must contain complete samples")
+        if self._closed or not self._started or not self._token_is_current(token):
+            return False
+        frames = [data[index : index + self.frame_bytes] for index in range(0, len(data), self.frame_bytes)]
+        if frames and len(frames[-1]) < self.frame_bytes:
+            frames[-1] += bytes(self.frame_bytes - len(frames[-1]))
+        with self._buffer_lock:
+            if token.generation != self._active_generation:
+                return False
+            remaining = max(0, self.options.max_buffer_frames - len(self._cue_queue))
+            if len(frames) > remaining:
+                return False
+            self._cue_queue.extend(_QueuedFrame(token, frame) for frame in frames)
+        return True
+
     def begin_turn(self, token: PlaybackToken) -> bool:
         """Register a provider turn before its first PCM frame arrives."""
 
@@ -296,6 +320,7 @@ class PersistentDeviceAudioEngine:
                 raise ValueError("playback generations must be monotonic")
             self._active_generation = target
             self._queue.clear()
+            self._cue_queue.clear()
             self._state = "idle"
             self._prebuffer_ticks = 0
             self._starved_ticks = 0
@@ -346,6 +371,7 @@ class PersistentDeviceAudioEngine:
         self._closed = True
         with self._buffer_lock:
             self._queue.clear()
+            self._cue_queue.clear()
             self._state = "closed"
             self._audible_until = 0.0
             self._pending_pcm.clear()
@@ -554,6 +580,17 @@ class PersistentDeviceAudioEngine:
                         if candidate.token not in self._first_frame_tokens:
                             self._first_frame_tokens.add(candidate.token)
                             first_token = candidate.token
+        cue: _QueuedFrame | None = None
+        with self._buffer_lock:
+            while self._cue_queue and self._cue_queue[0].token.generation != self._active_generation:
+                self._cue_queue.popleft()
+            if self._cue_queue:
+                cue = self._cue_queue.popleft()
+        if cue is not None:
+            render = _mix_pcm16(render, cue.data)
+            if any(cue.data):
+                with self._buffer_lock:
+                    self._audible_until = self._clock() + self.frame_sec
         return render, first_token, drain_token, freed_capacity, playback_events
 
     def _playback_event_locked(
@@ -585,7 +622,6 @@ class PersistentDeviceAudioEngine:
             samples[index] = max(-32768, min(32767, int(sample * gain)))
         self._current_gain = end_gain
         return samples.tobytes()
-
     def _update_stream_delay(self, time_info: Any) -> None:
         try:
             if isinstance(time_info, dict):
@@ -669,3 +705,18 @@ class PersistentDeviceAudioEngine:
             return
         if error is not None:
             self._last_error = repr(error)
+
+
+def _mix_pcm16(left: bytes, right: bytes) -> bytes:
+    if len(left) != len(right):
+        raise ValueError("PCM frames must have equal length")
+    mixed = array("h")
+    left_samples = array("h")
+    right_samples = array("h")
+    left_samples.frombytes(left)
+    right_samples.frombytes(right)
+    mixed.extend(
+        max(-32768, min(32767, a + b))
+        for a, b in zip(left_samples, right_samples)
+    )
+    return mixed.tobytes()

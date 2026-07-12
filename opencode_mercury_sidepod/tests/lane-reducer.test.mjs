@@ -60,6 +60,18 @@ test("a poll-fallback turn with no deltas renders via fullSpokenText", () => {
   assert.deepEqual(intents[3].appendTranscript, [{ role: "assistant", text: "Here is the summary." }]);
 });
 
+test("context preparation phases use concise non-technical copy", () => {
+  const { intents } = play([
+    { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live", phase: "preparing_context" },
+    { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live", phase: "continuing" },
+    { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live", phase: "try_again" },
+  ]);
+
+  assert.equal(intents[0].assistantText, "Preparing context…");
+  assert.equal(intents[1].assistantText, "Continuing…");
+  assert.equal(intents[2].assistantText, "Try again.");
+});
+
 test("a straggler partial never steals the running turn", () => {
   // The frozen-viewer bug from run 20260704T140244Z: a partial transcript
   // with a fresh turnId arrived right after thinking; superseding on it made

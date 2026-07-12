@@ -1,7 +1,7 @@
 {
   "title": "Mortic Sidepod <-> Engine protocol v0",
   "protocolVersion": "mortic.sidepod.v0",
-  "x-source-hash": "f97e8be86040dd47b13f0dba35a24b03dd740f6921c99540abfb1beab659e35a",
+  "x-source-hash": "0aa401e47c03aa4625ff4d1f67b0fe44240f1751a4e20aaf094a3b31d6064750",
   "x-generated-by": "protocol/generate.ts",
   "commands": {
     "start": {
@@ -430,6 +430,15 @@
     "thinking": {
       "additionalProperties": {},
       "properties": {
+        "phase": {
+          "enum": [
+            "responding",
+            "preparing_context",
+            "continuing",
+            "try_again"
+          ],
+          "type": "string"
+        },
         "sentAt": {
           "minLength": 1,
           "type": "string"

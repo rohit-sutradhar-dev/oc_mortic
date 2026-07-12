@@ -194,6 +194,25 @@ class PersistentDeviceAudioEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[-1], b"\x33\x00" * 480)
         await engine.close()
 
+    async def test_device_cue_mixes_into_render_reference_without_announcing_speech(self) -> None:
+        rendered: list[bytes] = []
+        first: list[PlaybackToken] = []
+        engine, factory = self.make_engine(render_events=rendered, first_events=first)
+        await engine.start()
+        assert factory.stream is not None
+        token = PlaybackToken(0, 4)
+        cue = b"\x10\x00" * 480
+
+        self.assertTrue(await engine.play_device_cue(cue, token))
+        output = factory.stream.tick()
+        await wait_until(lambda: bool(rendered))
+
+        self.assertEqual(output, cue)
+        self.assertEqual(rendered[-1], cue)
+        self.assertEqual(first, [])
+        self.assertEqual(engine.state, "idle")
+        await engine.close()
+
     async def test_eighty_ms_prebuffer_plays_once_and_drains_after_starvation_grace(self) -> None:
         first: list[PlaybackToken] = []
         drained: list[PlaybackToken] = []

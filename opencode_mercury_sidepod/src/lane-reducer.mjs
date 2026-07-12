@@ -78,7 +78,17 @@ export function reduceLaneEvent(state, event) {
     }
     return {
       state: { ...state, activeTurnId: event.turnId, deltaSeq: 0, assistantBuffer: "" },
-      ui: { status: "thinking", assistantText: "…" },
+      ui: {
+        status: "thinking",
+        assistantText:
+          event.phase === "preparing_context"
+            ? "Preparing context…"
+            : event.phase === "continuing"
+              ? "Continuing…"
+              : event.phase === "try_again"
+                ? "Try again."
+                : "…",
+      },
     };
   }
   if (type === "assistant.delta") {

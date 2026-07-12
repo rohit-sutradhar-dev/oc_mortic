@@ -22,7 +22,7 @@ The shipped v1 interaction model supersedes the PTT/Live design throughout this 
 1. **The protocol is enforced programmatically.** `protocol/schema.ts` (TypeScript) is the normative contract source; generated JSON Schema artifacts are validated at both WebSocket boundaries. The engine's sidepod lane fails closed — off-vocabulary messages are dropped and logged, never sent. See the amended `docs/MORTIC_PROTOCOL_V0.md`.
 2. **Protocol v0 amendment**: explicit `stop` command + `stopped` ack event for lane teardown, and optional `start.opencodeUrl` pinning the engine to the OpenCode server that owns the focused thread. WebSocket disconnect without `stop` still tears down fully.
 3. **The voice lane is live end to end**: `/mortic` discovers or launches the helper (non-blocking; the pod shows `CONNECTING VOICE…` / `VOICE OFFLINE · M TO RETRY`), `start` forks the focused thread, `M` drives real native capture through `live.set`, engine events (`transcript`, `thinking`, `assistant.delta`, `speaking`, `complete` with real latency, `voice_bridge_issue`, `stopped`) render through a sequence/stale-turn-guarded reducer, and End Session performs acknowledged teardown with fork deletion.
-4. **Mute mid-reply sends `barge_in`**; a silent mic (permission denied) is detected by a capture watchdog and surfaces as `Mic permission needed`.
+4. **Mute mid-reply is a privacy-only soft mute.** Capture stops immediately while the current reply continues on the persistent playback/AEC clock; `X`, spoken `stop`/`wait`, or committed barge-in cancels the reply. A silent mic (permission denied) is detected by a capture watchdog and surfaces as `Mic permission needed`.
 
 ## 1. Executive Summary
 

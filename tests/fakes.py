@@ -44,6 +44,9 @@ class FakeOpenCodeClient:
     async def messages(self, session_id: str) -> list[dict[str, Any]]:
         return []
 
+    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+        return await self.messages(session_id)
+
     async def delete_session(self, session_id: str) -> bool:
         self.deleted.append(session_id)
         return True
