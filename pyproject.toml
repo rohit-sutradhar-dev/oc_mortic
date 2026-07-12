@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 mortic-helper = "opencode_voice.__main__:main"
 opencode-voice = "opencode_voice.__main__:main"
+mortic-response-eval = "opencode_voice.response_eval:main"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
@@ -25,7 +26,12 @@ build-backend = "setuptools.build_meta"
 include = ["opencode_voice*"]
 
 [tool.setuptools.package-data]
-opencode_voice = ["protocol_schema.json", "voice_agent.md"]
+opencode_voice = [
+  "protocol_schema.json",
+  "voice_agent.md",
+  "response_eval_agent.md",
+  "response_eval_judge.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

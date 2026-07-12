@@ -90,6 +90,48 @@ class OpenCodeClient:
             {"providerID": model.provider_id, "modelID": model.model_id, "auto": auto},
         )
 
+    async def compact_v2(self, session_id: str) -> None:
+        response = await self._client.post(f"/api/session/{session_id}/compact")
+        response.raise_for_status()
+
+    async def wait_for_idle(self, session_id: str) -> None:
+        response = await self._client.post(f"/api/session/{session_id}/wait")
+        response.raise_for_status()
+
+    async def session_context(self, session_id: str) -> list[dict[str, Any]]:
+        payload = await self._get(f"/api/session/{session_id}/context")
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return data if isinstance(data, list) else []
+
+    async def session_history(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+        after: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, int] = {"limit": limit}
+        if after is not None:
+            params["after"] = after
+        response = await self._client.get(f"/api/session/{session_id}/history", params=params)
+        response.raise_for_status()
+        payload = response.json() if response.content else {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def session_events(self, session_id: str) -> AsyncIterator[dict[str, Any]]:
+        parser = SSEParser()
+        async with self._client.stream(
+            "GET",
+            f"/api/session/{session_id}/event",
+            headers={"accept": "text/event-stream"},
+            timeout=None,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                event = parser.push_line(line)
+                if event is not None:
+                    yield event
+
     async def switch_model(self, session_id: str, model: ModelRef) -> Any:
         return await self._post(f"/api/session/{session_id}/model", {"model": model.session_payload()})
 
@@ -120,12 +162,28 @@ class OpenCodeClient:
         }
         return await self._post(f"/session/{session_id}/message", payload)
 
-    async def prompt_async(self, session_id: str, text: str, model: ModelRef, agent: str) -> Any:
+    async def prompt_async(
+        self,
+        session_id: str,
+        text: str,
+        model: ModelRef,
+        agent: str,
+        *,
+        output_format: dict[str, Any] | None = None,
+        system: str | None = None,
+        tools: dict[str, bool] | None = None,
+    ) -> Any:
         payload = {
             "model": model.prompt_payload(),
             "agent": agent,
             "parts": [{"type": "text", "text": text}],
         }
+        if output_format is not None:
+            payload["format"] = output_format
+        if system is not None:
+            payload["system"] = system
+        if tools is not None:
+            payload["tools"] = tools
         return await self._post(f"/session/{session_id}/prompt_async", payload)
 
     async def events(
@@ -155,6 +213,31 @@ class OpenCodeClient:
     async def messages(self, session_id: str) -> list[dict[str, Any]]:
         data = await self._get(f"/session/{session_id}/message")
         return data if isinstance(data, list) else []
+
+    async def projected_messages(self, session_id: str) -> list[dict[str, Any]]:
+        """Read the v2 message projection used by structured-output turns.
+
+        OpenCode 1.17.18's legacy message decoder rejects a persisted user
+        message whose ``format`` contains ``retryCount``.  The v2 projection
+        reads the same session without decoding it through that legacy schema.
+        """
+        response = await self._client.get(
+            f"/api/session/{session_id}/message",
+            params={"limit": 200},
+        )
+        response.raise_for_status()
+        payload = response.json() if response.content else {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return data if isinstance(data, list) else []
+
+    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+        """Prefer the legacy shape, falling back only for its known 400."""
+        try:
+            return await self.messages(session_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 400:
+                raise
+        return await self.projected_messages(session_id)
 
     async def _get(self, path: str) -> Any:
         response = await self._client.get(path)
