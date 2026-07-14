@@ -25,7 +25,8 @@ from opencode_voice.config import (
     secret_values,
     voice_bridge_issue_payload,
 )
-from opencode_voice.deepgram import SpeechTextFilter, TTSChunker
+from opencode_voice.tts_chunker import TTSChunker
+from opencode_voice.speech_filter import SpeechTextFilter
 from opencode_voice.logging import RunLogger
 from opencode_voice.interruption import (
     EpisodeIdentity,

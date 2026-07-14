@@ -22,7 +22,10 @@ from opencode_voice.config import (
     render_opencode_config,
     voice_bridge_issue_payload,
 )
-from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
+
+from opencode_voice.speech_filter import FlushLimiter, SpeechTextFilter
+from opencode_voice.deepgram import build_flux_url, parse_flux_message
+from opencode_voice.tts_chunker import TTSChunker
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import OpenCodeClient, SSEParser
 from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, create_app, helper_readiness_issues
