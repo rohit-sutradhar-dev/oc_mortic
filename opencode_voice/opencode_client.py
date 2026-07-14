@@ -45,15 +45,142 @@ class OpenCodeClient:
         self.timeout_sec = timeout_sec
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout_sec)
 
-    async def close(self) -> None:
-        await self._client.aclose()
-
     async def health(self) -> dict[str, Any]:
         return await self._get("/global/health")
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         data = await self._get("/session")
         return data if isinstance(data, list) else []
+
+    async def create_session(self) -> dict[str, Any]:
+        return await self._post("/session", {})
+
+    async def get_session(self, session_id: str) -> dict[str, Any]:
+        return await self._get(f"/session/{session_id}")
+
+    async def fork_session(self, session_id: str, message_id: str | None = None) -> dict[str, Any]:
+        payload: dict[str, str] = {}
+        if message_id:
+            payload["messageID"] = message_id
+        return await self._post(f"/session/{session_id}/fork", payload)
+
+    async def update_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._patch(f"/session/{session_id}", payload)
+
+    async def delete_session(self, session_id: str) -> Any:
+        response = await self._client.delete(f"/session/{session_id}")
+        response.raise_for_status()
+        return response.json() if response.content else True
+
+    async def abort(self, session_id: str) -> Any:
+        return await self._post(f"/session/{session_id}/abort", {})
+
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+        data = await self._get(f"/session/{session_id}/message")
+        return data if isinstance(data, list) else []
+
+    async def prompt_text(self, session_id: str, text: str, model: ModelRef, agent: str) -> Any:
+        try:
+            return await self.prompt_sync(session_id, text, model, agent)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in {404, 405}:
+                raise
+        try:
+            return await self._post(
+                f"/api/session/{session_id}/prompt",
+                {"prompt": {"text": text}, "delivery": "queue"},
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in {404, 405}:
+                raise
+        return await self.prompt_sync(session_id, text, model, agent)
+
+    async def events(
+        self,
+        on_open: Callable[[], None] | None = None,
+        directory: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        parser = SSEParser()
+        async with self._client.stream(
+            "GET",
+            "/event",
+            params={"directory": directory} if directory else None,
+            headers={"accept": "text/event-stream"},
+            timeout=None,
+        ) as response:
+            response.raise_for_status()
+            if on_open:
+                on_open()
+            async for line in response.aiter_lines():
+                event = parser.push_line(line)
+                if event is not None:
+                    yield event
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def switch_model(self, session_id: str, model: ModelRef) -> Any:
+        return await self._post(f"/api/session/{session_id}/model", {"model": model.session_payload()})
+
+    async def switch_agent(self, session_id: str, agent: str) -> Any:
+        return await self._post(f"/api/session/{session_id}/agent", {"agent": agent})
+
+    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+        """Prefer the legacy shape, merging both compatible 400 fallbacks."""
+        try:
+            return await self.messages(session_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 400:
+                raise
+        projected = await self._projected_messages(session_id)
+        recent = await self._recent_messages(session_id)
+        merged = list(projected)
+        positions: dict[str, int] = {}
+        for index, message in enumerate(merged):
+            info = message.get("info") if isinstance(message, dict) else None
+            message_id = str((info or message).get("id") or "") if isinstance(message, dict) else ""
+            if message_id:
+                positions[message_id] = index
+        for message in recent:
+            info = message.get("info") if isinstance(message, dict) else None
+            message_id = str((info or message).get("id") or "") if isinstance(message, dict) else ""
+            if message_id and message_id in positions:
+                merged[positions[message_id]] = message
+            else:
+                if message_id:
+                    positions[message_id] = len(merged)
+                merged.append(message)
+        return merged
+
+    async def prompt_async(
+        self,
+        session_id: str,
+        text: str,
+        model: ModelRef,
+        agent: str,
+        *,
+        output_format: dict[str, Any] | None = None,
+        system: str | None = None,
+        tools: dict[str, bool] | None = None,
+    ) -> Any:
+        payload = {
+            "model": model.prompt_payload(),
+            "agent": agent,
+            "parts": [{"type": "text", "text": text}],
+        }
+        if output_format is not None:
+            payload["format"] = output_format
+        if system is not None:
+            payload["system"] = system
+        if tools is not None:
+            payload["tools"] = tools
+        return await self._post(f"/session/{session_id}/prompt_async", payload)
+
+    async def summarize(self, session_id: str, model: ModelRef, auto: bool = False) -> Any:
+        return await self._post(
+            f"/session/{session_id}/summarize",
+            {"providerID": model.provider_id, "modelID": model.model_id, "auto": auto},
+        )
 
     async def agents(self) -> list[str]:
         """Names of the agents this server knows. A voice turn sent with an
@@ -63,32 +190,6 @@ class OpenCodeClient:
         if not isinstance(data, list):
             return []
         return [str(a.get("name")) for a in data if isinstance(a, dict) and a.get("name")]
-
-    async def create_session(self) -> dict[str, Any]:
-        return await self._post("/session", {})
-
-    async def get_session(self, session_id: str) -> dict[str, Any]:
-        return await self._get(f"/session/{session_id}")
-
-    async def update_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._patch(f"/session/{session_id}", payload)
-
-    async def fork_session(self, session_id: str, message_id: str | None = None) -> dict[str, Any]:
-        payload: dict[str, str] = {}
-        if message_id:
-            payload["messageID"] = message_id
-        return await self._post(f"/session/{session_id}/fork", payload)
-
-    async def delete_session(self, session_id: str) -> Any:
-        response = await self._client.delete(f"/session/{session_id}")
-        response.raise_for_status()
-        return response.json() if response.content else True
-
-    async def summarize(self, session_id: str, model: ModelRef, auto: bool = False) -> Any:
-        return await self._post(
-            f"/session/{session_id}/summarize",
-            {"providerID": model.provider_id, "modelID": model.model_id, "auto": auto},
-        )
 
     async def compact_v2(self, session_id: str) -> None:
         response = await self._client.post(f"/api/session/{session_id}/compact")
@@ -132,28 +233,6 @@ class OpenCodeClient:
                 if event is not None:
                     yield event
 
-    async def switch_model(self, session_id: str, model: ModelRef) -> Any:
-        return await self._post(f"/api/session/{session_id}/model", {"model": model.session_payload()})
-
-    async def switch_agent(self, session_id: str, agent: str) -> Any:
-        return await self._post(f"/api/session/{session_id}/agent", {"agent": agent})
-
-    async def prompt_text(self, session_id: str, text: str, model: ModelRef, agent: str) -> Any:
-        try:
-            return await self.prompt_sync(session_id, text, model, agent)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code not in {404, 405}:
-                raise
-        try:
-            return await self._post(
-                f"/api/session/{session_id}/prompt",
-                {"prompt": {"text": text}, "delivery": "queue"},
-            )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code not in {404, 405}:
-                raise
-        return await self.prompt_sync(session_id, text, model, agent)
-
     async def prompt_sync(self, session_id: str, text: str, model: ModelRef, agent: str) -> Any:
         payload = {
             "model": model.prompt_payload(),
@@ -162,59 +241,7 @@ class OpenCodeClient:
         }
         return await self._post(f"/session/{session_id}/message", payload)
 
-    async def prompt_async(
-        self,
-        session_id: str,
-        text: str,
-        model: ModelRef,
-        agent: str,
-        *,
-        output_format: dict[str, Any] | None = None,
-        system: str | None = None,
-        tools: dict[str, bool] | None = None,
-    ) -> Any:
-        payload = {
-            "model": model.prompt_payload(),
-            "agent": agent,
-            "parts": [{"type": "text", "text": text}],
-        }
-        if output_format is not None:
-            payload["format"] = output_format
-        if system is not None:
-            payload["system"] = system
-        if tools is not None:
-            payload["tools"] = tools
-        return await self._post(f"/session/{session_id}/prompt_async", payload)
-
-    async def events(
-        self,
-        on_open: Callable[[], None] | None = None,
-        directory: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        parser = SSEParser()
-        async with self._client.stream(
-            "GET",
-            "/event",
-            params={"directory": directory} if directory else None,
-            headers={"accept": "text/event-stream"},
-            timeout=None,
-        ) as response:
-            response.raise_for_status()
-            if on_open:
-                on_open()
-            async for line in response.aiter_lines():
-                event = parser.push_line(line)
-                if event is not None:
-                    yield event
-
-    async def abort(self, session_id: str) -> Any:
-        return await self._post(f"/session/{session_id}/abort", {})
-
-    async def messages(self, session_id: str) -> list[dict[str, Any]]:
-        data = await self._get(f"/session/{session_id}/message")
-        return data if isinstance(data, list) else []
-
-    async def projected_messages(self, session_id: str) -> list[dict[str, Any]]:
+    async def _projected_messages(self, session_id: str) -> list[dict[str, Any]]:
         """Read the v2 message projection used by structured-output turns.
 
         OpenCode 1.17.18's legacy message decoder rejects a persisted user
@@ -230,7 +257,7 @@ class OpenCodeClient:
         data = payload.get("data") if isinstance(payload, dict) else None
         return data if isinstance(data, list) else []
 
-    async def recent_messages(self, session_id: str, *, limit: int = 2) -> list[dict[str, Any]]:
+    async def _recent_messages(self, session_id: str, *, limit: int = 2) -> list[dict[str, Any]]:
         """Read the decodable tail of a legacy session.
 
         OpenCode 1.17.18 can reject an unbounded list after a structured
@@ -246,33 +273,6 @@ class OpenCodeClient:
         response.raise_for_status()
         payload = response.json() if response.content else []
         return payload if isinstance(payload, list) else []
-
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
-        """Prefer the legacy shape, merging both compatible 400 fallbacks."""
-        try:
-            return await self.messages(session_id)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != 400:
-                raise
-        projected = await self.projected_messages(session_id)
-        recent = await self.recent_messages(session_id)
-        merged = list(projected)
-        positions: dict[str, int] = {}
-        for index, message in enumerate(merged):
-            info = message.get("info") if isinstance(message, dict) else None
-            message_id = str((info or message).get("id") or "") if isinstance(message, dict) else ""
-            if message_id:
-                positions[message_id] = index
-        for message in recent:
-            info = message.get("info") if isinstance(message, dict) else None
-            message_id = str((info or message).get("id") or "") if isinstance(message, dict) else ""
-            if message_id and message_id in positions:
-                merged[positions[message_id]] = message
-            else:
-                if message_id:
-                    positions[message_id] = len(merged)
-                merged.append(message)
-        return merged
 
     async def _get(self, path: str) -> Any:
         response = await self._client.get(path)
