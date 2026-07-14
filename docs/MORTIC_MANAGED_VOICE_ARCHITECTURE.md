@@ -6,6 +6,8 @@ Date: 2026-07-10
 
 Related planning document: [Mortic Server-Helper Hygiene Implementation Plan](MORTIC_SERVER_HELPER_HYGIENE_PLAN.md)
 
+Related provider investigation: [Mortic Structured Streaming Investigation](MORTIC_STRUCTURED_STREAMING_INVESTIGATION.md)
+
 ## Purpose
 
 This document records the architectural direction that landed with `12af132`,
@@ -474,4 +476,3 @@ recorded Phase 0 evidence:
 Until this gate has durable evidence, the managed server should be treated as an
 implemented reliability foundation with a fork-model compatibility dependency,
 not as final proof that every source-thread safety goal is complete.
-

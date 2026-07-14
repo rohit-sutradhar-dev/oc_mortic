@@ -339,6 +339,11 @@ Deliverables:
 - Turns use event-first OpenCode streaming.
 - Polling fallback remains available.
 - Fork is deleted by default when the voice lane ends.
+- Native provider structured streaming through OpenCode ordinary text events is
+  documented but deferred: Mercury 2 exposed only 0–180 ms of measured safe
+  headroom. Revisit the provider-adapter design for autoregressive models that
+  pass the gates in
+  [Mortic Structured Streaming Investigation](MORTIC_STRUCTURED_STREAMING_INVESTIGATION.md).
 
 User acceptance criteria:
 - Voice work does not mutate the source OpenCode thread.
