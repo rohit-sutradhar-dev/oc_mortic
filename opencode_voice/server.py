@@ -16,6 +16,7 @@ import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from opencode_voice.deepgram_stt_provider import DeepgramSTTProvider
 from opencode_voice.echo_probe import PcmRingBuffer, echo_correlation
 from opencode_voice.config import (
     VoiceConfig,
@@ -45,7 +46,6 @@ from opencode_voice.protocol import schema_document as sidepod_schema_document
 from opencode_voice.audio_processing import EchoCanceller, FrameSlicer, Pcm16Resampler
 from opencode_voice.playback import PlaybackToken
 from opencode_voice.device_audio import DeviceAudioOptions, PersistentDeviceAudioEngine
-from opencode_voice.flux_transport import FluxTransport, FluxTransportOptions
 from opencode_voice.tts_providers import (
     CartesiaTTSOptions,
     CartesiaTTSProvider,
@@ -1086,7 +1086,7 @@ class VoiceConnection:
         self.voice_lane_id: str | None = None
         self.protocol_turn_id = ""
         self.sidepod_readiness_issues: tuple[dict[str, Any], ...] = ()
-        self.flux: DeepgramFluxSession | None = None
+        self.flux: DeepgramSTTProvider | None = None
         self.flux_connection_epoch: int | None = None
         self.stt_transport_healthy = True
         self.stt_unhealthy_reported = False
@@ -1283,7 +1283,7 @@ class VoiceConnection:
             return False
         if self.flux:
             return True
-        flux = DeepgramFluxSession(self.config, on_event=self.handle_flux_event)
+        flux = DeepgramSTTProvider(self.config, on_event=self.handle_flux_event)
         try:
             await flux.start()
         except asyncio.CancelledError:
@@ -5163,49 +5163,3 @@ class SidepodConnection(VoiceConnection):
                 voice_lane_id=self.voice_lane_id,
             )
         )
-
-
-class DeepgramFluxSession:
-    def __init__(self, config: VoiceConfig, on_event: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
-        self.config = config
-        self.on_event = on_event
-        self.transport: FluxTransport | None = None
-        self.connection_epoch = 0
-
-    async def start(self) -> None:
-        options = FluxTransportOptions(
-            api_key=os.environ["DEEPGRAM_API_KEY"],
-            model=self.config.deepgram_stt_model,
-            sample_rate=self.config.deepgram_sample_rate,
-            eot_threshold=self.config.flux_eot_threshold,
-            eot_timeout_ms=self.config.flux_eot_timeout_ms,
-            eager_eot_threshold=self.config.flux_eager_eot_threshold,
-        )
-        self.transport = FluxTransport(options, self._handle_transport_event)
-        await self.transport.start()
-        try:
-            self.connection_epoch = await self.transport.wait_connected(
-                timeout_sec=options.connect_timeout_sec + 0.5
-            )
-        except Exception:
-            await self.transport.close()
-            self.transport = None
-            raise
-
-    async def close(self) -> None:
-        if self.transport:
-            await self.transport.close()
-            self.transport = None
-
-    def submit_audio(self, data: bytes) -> bool:
-        return bool(self.transport and self.transport.submit(data))
-
-    def health_snapshot(self) -> Any:
-        return self.transport.health_snapshot() if self.transport else None
-
-    async def _handle_transport_event(self, event: dict[str, Any]) -> None:
-        epoch = event.get("transport_epoch") or event.get("epoch")
-        if isinstance(epoch, int):
-            self.connection_epoch = epoch
-            event["flux_connection_epoch"] = epoch
-        await self.on_event(event)

@@ -857,7 +857,7 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, client = lane_connection(tmp)
             await connection.handle_control(START_PAYLOAD)
@@ -918,7 +918,7 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(tmp)
             await connection.handle_control(START_PAYLOAD)
@@ -982,7 +982,7 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(tmp, client=IdleFirstLaneClient())
             await connection.handle_control(START_PAYLOAD)
@@ -1058,7 +1058,7 @@ class SidepodLaneTurnTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(tmp, client=PartialIdleLaneClient())
             await connection.handle_control(START_PAYLOAD)
@@ -1085,7 +1085,7 @@ class StructuredResponseLaneTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(
                 tmp,
@@ -1115,7 +1115,7 @@ class StructuredResponseLaneTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(
                 tmp,
@@ -1141,7 +1141,7 @@ class StructuredResponseLaneTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(
                 tmp,
@@ -1168,7 +1168,7 @@ class StructuredResponseLaneTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(
                 tmp, client=client, response_mode="structured"
@@ -1196,7 +1196,7 @@ class StructuredResponseLaneTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(
                 tmp, client=client, response_mode="structured"
@@ -1227,7 +1227,7 @@ class StructuredResponseLaneTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(
                 tmp, client=client, response_mode="structured"
@@ -1257,7 +1257,7 @@ class StructuredResponseLaneTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FakeSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(
                 tmp, client=client, response_mode="structured"
@@ -1297,7 +1297,7 @@ class SidepodTTSLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", DelayedLifecycleSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             DelayedLifecycleSpeakSession.latest = None
             connection, websocket, speaker = await self._run_turn_before_first_pcm(tmp)
@@ -1333,7 +1333,7 @@ class SidepodTTSLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", FailFirstSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             connection, websocket, _client = lane_connection(tmp)
             await connection.handle_control(START_PAYLOAD)
@@ -1359,7 +1359,7 @@ class SidepodTTSLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", DelayedLifecycleSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             DelayedLifecycleSpeakSession.latest = None
             connection, websocket, speaker = await self._run_turn_before_first_pcm(tmp)
@@ -1407,7 +1407,7 @@ class SidepodTTSLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", DelayedLifecycleSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             DelayedLifecycleSpeakSession.latest = None
             connection, websocket, speaker = await self._run_turn_before_first_pcm(tmp)
@@ -1435,7 +1435,7 @@ class SidepodTTSLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", DelayedLifecycleSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             DelayedLifecycleSpeakSession.latest = None
             connection, websocket, speaker = await self._run_turn_before_first_pcm(tmp)
@@ -1458,7 +1458,7 @@ class SidepodTTSLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.DeepgramTTSProvider", DelayedLifecycleSpeakSession
         ), patch("opencode_voice.server.NativeSpeakerSession", FakeNativeSpeaker), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ):
             DelayedLifecycleSpeakSession.latest = None
             connection, websocket, speaker = await self._run_turn_before_first_pcm(tmp)
@@ -1700,7 +1700,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_set_starts_listening_and_mute_stops_capture_without_fake_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.NativeMicSession", FakeNativeMic
-        ), patch("opencode_voice.server.DeepgramFluxSession", FakeFlux), patch(
+        ), patch("opencode_voice.server.DeepgramSTTProvider", FakeFlux), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", UnavailableDeviceAudio
         ):
             FakeNativeMic.ok = True
@@ -1737,7 +1737,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplex_mute_gates_capture_without_interrupting_or_restarting_playback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", AvailableDeviceAudio
         ):
@@ -1796,7 +1796,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_silent_mic_watchdog_reports_permission_issue_and_stops_capture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.NativeMicSession", FakeNativeMic
-        ), patch("opencode_voice.server.DeepgramFluxSession", FakeFlux), patch(
+        ), patch("opencode_voice.server.DeepgramSTTProvider", FakeFlux), patch(
             "opencode_voice.server.MIC_WATCHDOG_SEC", 0.01
         ), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", UnavailableDeviceAudio
@@ -1825,7 +1825,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_mic_start_failure_reports_issue_and_never_says_listening(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.NativeMicSession", FakeNativeMic
-        ), patch("opencode_voice.server.DeepgramFluxSession", FakeFlux), patch(
+        ), patch("opencode_voice.server.DeepgramSTTProvider", FakeFlux), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", UnavailableDeviceAudio
         ):
             FakeNativeMic.ok = False
@@ -1844,7 +1844,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fast_mute_cancels_pending_device_start_without_stale_listening(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", BlockingDeviceAudio
         ):
@@ -1881,7 +1881,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_slow_transport_does_not_block_fast_mute_or_publish_listening(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
-            "opencode_voice.server.DeepgramFluxSession", BlockingFlux
+            "opencode_voice.server.DeepgramSTTProvider", BlockingFlux
         ), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", AvailableDeviceAudio
         ):
@@ -1926,7 +1926,7 @@ class SidepodLaneLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
             "opencode_voice.server.NativeMicSession", FakeNativeMic
         ), patch(
-            "opencode_voice.server.DeepgramFluxSession", CountingFlux
+            "opencode_voice.server.DeepgramSTTProvider", CountingFlux
         ), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", UnavailableDeviceAudio
         ):
@@ -2066,7 +2066,7 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_aec_mode_runs_mic_frames_through_the_canceller(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ), patch("opencode_voice.server.NativeMicSession", FakeNativeMic), patch(
             "opencode_voice.server.EchoCanceller", FakeEchoCanceller
         ), patch(
@@ -2085,7 +2085,7 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timed_aec_does_not_mute_stt_at_playback_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ), patch("opencode_voice.server.NativeMicSession", FakeNativeMic), patch(
             "opencode_voice.server.EchoCanceller", FakeEchoCanceller
         ), patch(
@@ -2109,7 +2109,7 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_half_duplex_gate_feeds_silence_while_tts_is_audible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ), patch("opencode_voice.server.NativeMicSession", FakeNativeMic), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", AvailableDeviceAudio
         ):
@@ -2130,7 +2130,7 @@ class SidepodEchoProtectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_full_duplex_passes_raw_frames_even_while_speaking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ENV_WITH_KEYS, clear=True), patch(
-            "opencode_voice.server.DeepgramFluxSession", FakeFlux
+            "opencode_voice.server.DeepgramSTTProvider", FakeFlux
         ), patch("opencode_voice.server.NativeMicSession", FakeNativeMic), patch(
             "opencode_voice.server.PersistentDeviceAudioEngine", AvailableDeviceAudio
         ):

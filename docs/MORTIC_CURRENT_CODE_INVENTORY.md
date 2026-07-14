@@ -25,7 +25,7 @@ This inventory gives Platform and Engine a shared factual map of the current rep
   - `SSEParser` already has focused unit coverage for multiline and malformed frames.
 - `opencode_voice/server.py`
   - `VoiceConnection` has reusable voice-lane orchestration: source session tracking, fork creation, fork cleanup, turn ids, barge-in, event-first turn execution, polling fallback, TTS streaming, context overflow retry, and compaction.
-  - `DeepgramFluxSession` wraps the bounded, epoch-aware Flux sender; provider-neutral TTS lives in `tts_providers.py` with persistent Deepgram and Cartesia implementations.
+  - `DeepgramSTTProvider` wraps the bounded, epoch-aware Flux sender; provider-neutral TTS lives in `tts_providers.py` with persistent Deepgram and Cartesia implementations.
   - `device_audio.py` owns the persistent device-clocked duplex stream, render reference, bounded jitter buffer, and generation-safe playout; `interruption.py` owns pure episode decisions.
   - `EPHEMERAL_PREFIX` and keep/delete behavior are useful starting points for source-thread safety.
 - `opencode_voice/deepgram.py`
