@@ -669,7 +669,7 @@ class OpenCodeStructuredMessageCompatibilityTests(unittest.IsolatedAsyncioTestCa
             transport=httpx.MockTransport(handler),
         )
         try:
-            messages = await client.messages_for_tracking("ses_structured")
+            messages = await client.messages("ses_structured")
         finally:
             await client.close()
 
@@ -696,7 +696,7 @@ class OpenCodeStructuredMessageCompatibilityTests(unittest.IsolatedAsyncioTestCa
             transport=httpx.MockTransport(handler),
         )
         try:
-            messages = await client.messages_for_tracking("ses_structured")
+            messages = await client.messages("ses_structured")
         finally:
             await client.close()
 

@@ -354,7 +354,7 @@ async def observe_structured_turn(
     structured_idle_grace_sec: float = 1.0,
     event_multiplexer: EventMultiplexer | None = None,
 ) -> TurnObservation:
-    before_messages = await client.messages_for_tracking(session_id)
+    before_messages = await client.messages(session_id)
     tracker = StructuredTurnTracker(session_id, before_messages)
     if event_multiplexer is not None:
         queue = event_multiplexer.subscribe(session_id)
@@ -425,7 +425,7 @@ async def observe_structured_turn(
                     # complete the prompt we just submitted.
                     tracker.state.idle_seen = False
                     continue
-                tracker.update_messages(await client.messages_for_tracking(session_id))
+                tracker.update_messages(await client.messages(session_id))
                 if tracker.state.raw_structured is not None:
                     result_source = "hybrid" if result_source == "event" else result_source
                     continue
@@ -455,7 +455,7 @@ async def observe_structured_turn(
                     tracker.update_event(event)
             if time.perf_counter() >= next_poll:
                 previous = tracker.state.raw_structured
-                tracker.update_messages(await client.messages_for_tracking(session_id))
+                tracker.update_messages(await client.messages(session_id))
                 if previous is None and tracker.state.raw_structured is not None:
                     result_source = "hybrid" if event_healthy else "poll"
                 next_poll = time.perf_counter() + 0.5
@@ -532,7 +532,7 @@ class ResponseEvalRunner:
             source_id = str(source.get("id") or "")
             if not source_id:
                 raise RuntimeError("OpenCode did not create an eval source session")
-            source_before = await self.client.messages(source_id)
+            source_before = await self.client._messages(source_id)
             fork = await self.client.fork_session(source_id)
             fork_id = str(fork.get("id") or "")
             if not fork_id:
@@ -633,7 +633,7 @@ class ResponseEvalRunner:
             judge = None
             if self.judge_enabled and not selected_evaluation.violations and selected_value is not None:
                 judge = await self._judge(case, selected_value, directory)
-            source_after = await self.client.messages(source_id)
+            source_after = await self.client._messages(source_id)
             all_tool_activity = [
                 *observation.tool_activity,
                 *(repair_observation.tool_activity if repair_observation else []),
@@ -1031,7 +1031,7 @@ async def run_long_context_profile(
                     try:
                         source = await client.create_session()
                         source_id = str(source.get("id") or "")
-                        source_before = await client.messages(source_id)
+                        source_before = await client._messages(source_id)
                         fork = await client.fork_session(source_id)
                         fork_id = str(fork.get("id") or "")
                         directory = str(fork.get("directory") or workspace)
@@ -1108,7 +1108,7 @@ async def run_long_context_profile(
                                 all_facts=script.ledger,
                                 current_turn=exchange.turn,
                             )
-                            source_after = await client.messages(source_id)
+                            source_after = await client._messages(source_id)
                             results.append(
                                 LongContextCheckpointResult(
                                     script_id=script.script_id,

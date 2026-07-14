@@ -16,6 +16,7 @@ import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from opencode_voice.agent_backend import AgentBackend
 from opencode_voice.deepgram_stt_provider import DeepgramSTTProvider
 from opencode_voice.echo_probe import PcmRingBuffer, echo_correlation
 from opencode_voice.config import (
@@ -891,7 +892,7 @@ class NativeSpeakerSession:
 def create_app(
     config: VoiceConfig,
     *,
-    client_factory: Callable[[str, float], OpenCodeClient] = OpenCodeClient,
+    client_factory: Callable[[str, float], AgentBackend] = OpenCodeClient,
 ) -> FastAPI:
     app = FastAPI(
         title="Mortic Voice Helper",
@@ -1049,7 +1050,7 @@ class VoiceConnection:
     def __init__(
         self,
         config: VoiceConfig,
-        client: OpenCodeClient,
+        client: AgentBackend,
         logger: RunLogger,
         websocket: WebSocket,
     ) -> None:
@@ -2306,11 +2307,7 @@ class VoiceConnection:
         when the legacy decoder rejects ``format.retryCount``.
         """
 
-        compatible = getattr(self.client, "messages_for_tracking", None)
-        if compatible is not None:
-            incoming = await compatible(session_id)
-        else:
-            incoming = await self.client.messages(session_id)
+        incoming = await self.client.messages(session_id)
         cached = self.message_cache.get(session_id)
         if not cached:
             self.message_cache[session_id] = list(incoming)
@@ -2587,7 +2584,7 @@ class VoiceConnection:
         )
 
     async def recover_overflow_fork(self, session_id: str, before_ids: set[str]) -> str:
-        messages = await self.client.messages_for_tracking(session_id)
+        messages = await self.client.messages(session_id)
         new_user_id = next(
             (
                 message_identity(message)[0]
@@ -4043,7 +4040,7 @@ class VoiceConnection:
 
 
 async def reap_stale_voice_forks(
-    client: OpenCodeClient, logger: RunLogger, exclude_ids: set[str] | None = None
+    client: AgentBackend, logger: RunLogger, exclude_ids: set[str] | None = None
 ) -> int:
     exclude_ids = exclude_ids or set()
     try:
@@ -4134,10 +4131,10 @@ class SidepodConnection(VoiceConnection):
     def __init__(
         self,
         config: VoiceConfig,
-        client: OpenCodeClient,
+        client: AgentBackend,
         logger: RunLogger,
         websocket: WebSocket,
-        client_factory: Callable[[str, float], OpenCodeClient] = OpenCodeClient,
+        client_factory: Callable[[str, float], AgentBackend] = OpenCodeClient,
         lane_registry: ActiveSidepodLaneRegistry | None = None,
     ) -> None:
         super().__init__(config=config, client=client, logger=logger, websocket=websocket)

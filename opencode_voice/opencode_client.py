@@ -75,7 +75,7 @@ class OpenCodeClient:
     async def abort(self, session_id: str) -> Any:
         return await self._post(f"/session/{session_id}/abort", {})
 
-    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+    async def _messages(self, session_id: str) -> list[dict[str, Any]]:
         data = await self._get(f"/session/{session_id}/message")
         return data if isinstance(data, list) else []
 
@@ -125,10 +125,10 @@ class OpenCodeClient:
     async def switch_agent(self, session_id: str, agent: str) -> Any:
         return await self._post(f"/api/session/{session_id}/agent", {"agent": agent})
 
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
         """Prefer the legacy shape, merging both compatible 400 fallbacks."""
         try:
-            return await self.messages(session_id)
+            return await self._messages(session_id)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 400:
                 raise

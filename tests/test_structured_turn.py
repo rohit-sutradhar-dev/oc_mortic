@@ -24,7 +24,7 @@ class StructuredClientFake:
         self.prompted = False
         self.session_id = "session_1"
 
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
         if not self.prompted:
             return []
         info: dict[str, Any] = {

@@ -46,14 +46,14 @@ async def run(source_id: str, *, repeat: bool, auto: bool, root: Path) -> Path:
         assert server.url is not None
         client = OpenCodeClient(server.url, timeout_sec=240)
         try:
-            source_before = await client.messages_for_tracking(source_id)
+            source_before = await client.messages(source_id)
             source_hash = _digest(normalized_message_graph(source_before))
             fork = await client.fork_session(source_id)
             fork_id = str(fork["id"])
-            fork_before = await client.messages_for_tracking(fork_id)
+            fork_before = await client.messages(fork_id)
             inheritance = compare_fork_snapshots(
                 source_before,
-                await client.messages_for_tracking(source_id),
+                await client.messages(source_id),
                 fork_before,
             )
             before_tokens = recorded_context_tokens(fork_before) or active_context_estimate(fork_before).tokens
@@ -67,7 +67,7 @@ async def run(source_id: str, *, repeat: bool, auto: bool, root: Path) -> Path:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 first_error = f"{type(exc).__name__}:{status or 'unknown'}"
             first_latency = int((time.perf_counter() - started) * 1000)
-            first_after = await client.messages_for_tracking(fork_id)
+            first_after = await client.messages(fork_id)
             first_after_tokens = active_context_estimate(first_after).tokens
             summaries_after_first = sum(is_completed_assistant_summary(message) for message in first_after)
             first_succeeded = summaries_after_first > summaries_before and first_after_tokens < before_tokens
@@ -80,8 +80,8 @@ async def run(source_id: str, *, repeat: bool, auto: bool, root: Path) -> Path:
                 descendant_id = str(descendant["id"])
                 post_inheritance = compare_fork_snapshots(
                     first_after,
-                    await client.messages_for_tracking(fork_id),
-                    await client.messages_for_tracking(descendant_id),
+                    await client.messages(fork_id),
+                    await client.messages(descendant_id),
                 )
                 post_inheritance_valid = post_inheritance.inherited_content_equal \
                     and post_inheritance.parent_links_valid \
@@ -94,7 +94,7 @@ async def run(source_id: str, *, repeat: bool, auto: bool, root: Path) -> Path:
                 started = time.perf_counter()
                 await client.summarize(fork_id, model, auto=auto)
                 second_latency = int((time.perf_counter() - started) * 1000)
-                second_after = await client.messages_for_tracking(fork_id)
+                second_after = await client.messages(fork_id)
                 second_after_tokens = active_context_estimate(second_after).tokens
                 second_text_dups, second_tool_dups = duplicate_action_hashes(second_after)
                 second = {
@@ -106,7 +106,7 @@ async def run(source_id: str, *, repeat: bool, auto: bool, root: Path) -> Path:
                     "occurred": len(second_after) > len(first_after),
                 }
 
-            source_after = await client.messages_for_tracking(source_id)
+            source_after = await client.messages(source_id)
             evidence = {
                 "schema": "mortic.existing-session-compaction.v1",
                 "createdAt": datetime.now(timezone.utc).isoformat(),

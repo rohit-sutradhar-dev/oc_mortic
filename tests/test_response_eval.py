@@ -273,9 +273,6 @@ class EventClient:
     async def messages(self, session_id: str) -> list[dict[str, Any]]:
         return self.staged_messages if self.prompted else []
 
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
-        return await self.messages(session_id)
-
     async def prompt_async(self, *args: Any, **kwargs: Any) -> dict[str, bool]:
         self.prompted = True
         return {"ok": True}

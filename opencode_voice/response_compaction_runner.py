@@ -107,7 +107,7 @@ async def _run_profile(
                         target=target,
                         token_tracker=token_tracker,
                     )
-                    messages = await client.messages_for_tracking(session_id)
+                    messages = await client.messages(session_id)
                     recorded = token_tracker.current_tokens or recorded_context_tokens(messages)
                     estimated = active_context_estimate(messages).tokens
                     result.measurements.append(
@@ -137,7 +137,7 @@ async def _run_profile(
                             sequence=10_000,
                             token_tracker=token_tracker,
                         )
-                        after_messages = await client.messages_for_tracking(session_id)
+                        after_messages = await client.messages(session_id)
                         result.fork_snapshots.extend(
                             await _snapshot_sibling_forks(client, session_id, after_messages, forks)
                         )
@@ -164,7 +164,7 @@ async def _run_profile(
                         token_tracker=token_tracker,
                     )
                 await asyncio.sleep(0.1)
-                messages = await client.messages_for_tracking(session_id)
+                messages = await client.messages(session_id)
                 tracker.reconcile_messages(messages)
                 if tracker.observations:
                     result.fork_snapshots.extend(
@@ -210,7 +210,7 @@ async def _grow_to_target(
 ) -> None:
     attempts = 0
     while attempts < 80:
-        messages = await client.messages_for_tracking(session_id)
+        messages = await client.messages(session_id)
         current = token_tracker.current_tokens or recorded_context_tokens(messages)
         if current >= target:
             return
@@ -286,8 +286,8 @@ async def _snapshot_sibling_forks(
         fork = await client.fork_session(source_id)
         fork_id = str(fork.get("id") or "")
         fork_ids.append(fork_id)
-        fork_messages = await client.messages_for_tracking(fork_id)
-        source_after = await client.messages_for_tracking(source_id)
+        fork_messages = await client.messages(fork_id)
+        source_after = await client.messages(source_id)
         snapshots.append(compare_fork_snapshots(source_messages, source_after, fork_messages))
     if source_messages:
         cutoff_index = len(source_messages) // 2
@@ -300,8 +300,8 @@ async def _snapshot_sibling_forks(
             cutoff_fork = await client.fork_session(source_id, cutoff_id)
             cutoff_fork_id = str(cutoff_fork.get("id") or "")
             fork_ids.append(cutoff_fork_id)
-            cutoff_messages = await client.messages_for_tracking(cutoff_fork_id)
-            source_after = await client.messages_for_tracking(source_id)
+            cutoff_messages = await client.messages(cutoff_fork_id)
+            source_after = await client.messages(source_id)
             snapshots.append(
                 compare_fork_snapshots(
                     source_messages,

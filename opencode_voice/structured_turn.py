@@ -45,7 +45,7 @@ async def run_structured_turn(
     tools: dict[str, bool] | None = None,
     on_tool_activity: ToolCallback | None = None,
 ) -> StructuredTurnResult:
-    before_messages = await client.messages_for_tracking(session_id)
+    before_messages = await client.messages(session_id)
     tracker = StructuredTurnTracker(session_id, before_messages)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     ready = asyncio.Event()
@@ -101,12 +101,12 @@ async def run_structured_turn(
                 if tracker.state.idle_seen or time.perf_counter() - structured_seen_at >= final_grace_sec:
                     return _result(tracker, started, first_activity_ms, stream_source)
             if tracker.state.assistant_error is not None and tracker.state.raw_structured is None:
-                tracker.update_messages(await client.messages_for_tracking(session_id))
+                tracker.update_messages(await client.messages(session_id))
                 await observe_tools()
                 if tracker.state.raw_structured is None:
                     return _result(tracker, started, first_activity_ms, stream_source)
             if tracker.state.idle_seen and tracker.state.output_seen:
-                tracker.update_messages(await client.messages_for_tracking(session_id))
+                tracker.update_messages(await client.messages(session_id))
                 await observe_tools()
                 if tracker.state.raw_structured is not None:
                     stream_source = "hybrid" if event_healthy else "poll"
@@ -133,7 +133,7 @@ async def run_structured_turn(
                     tracker.update_event(event)
             if time.perf_counter() >= next_poll:
                 previous = tracker.state.raw_structured
-                tracker.update_messages(await client.messages_for_tracking(session_id))
+                tracker.update_messages(await client.messages(session_id))
                 if previous is None and tracker.state.raw_structured is not None:
                     stream_source = "hybrid" if event_healthy else "poll"
                 next_poll = time.perf_counter() + 0.5

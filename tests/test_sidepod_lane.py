@@ -66,7 +66,7 @@ class LaneFakeClient(FakeOpenCodeClient):
         session = await super().get_session(session_id)
         return {**session, "directory": "/project/source-thread"}
 
-    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+    async def _messages(self, session_id: str) -> list[dict[str, Any]]:
         return list(self._assistant_messages)
 
     def events(self, on_open: Any = None, directory: str | None = None) -> Any:
@@ -160,8 +160,8 @@ class StructuredLaneClient(LaneFakeClient):
         self.with_tool = with_tool
         self.prompt_payloads: list[dict[str, Any]] = []
 
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
-        return await self.messages(session_id)
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+        return await self._messages(session_id)
 
     async def prompt_async(
         self,
@@ -217,7 +217,7 @@ class CompactionLaneClient(LaneFakeClient):
         self.summary_error = False
         self.wait_for_idle_calls = 0
 
-    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+    async def _messages(self, session_id: str) -> list[dict[str, Any]]:
         messages = [
             {
                 "info": {
@@ -265,7 +265,7 @@ class CompactionLaneClient(LaneFakeClient):
         await self.summarize_release.wait()
         summary = next(
             message["info"]
-            for message in await self.messages(session_id)
+            for message in await self._messages(session_id)
             if message["info"].get("summary") is True
         )
         self._staged_events = [
@@ -292,17 +292,17 @@ class CompactionLaneClient(LaneFakeClient):
 class StructuredLegacyDecoderClient(StructuredLaneClient):
     """The legacy reader breaks after the first structured prompt in 1.17.18."""
 
-    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+    async def _messages(self, session_id: str) -> list[dict[str, Any]]:
         if self.prompts:
             raise RuntimeError("legacy structured message decoder rejected retryCount")
-        return await super().messages(session_id)
+        return await super()._messages(session_id)
 
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
         return list(self._assistant_messages)
 
 
 class BrokenPreflightClient(StructuredLaneClient):
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
         raise RuntimeError("message projection unavailable")
 
 
@@ -312,7 +312,7 @@ class BlockingPreflightClient(StructuredLaneClient):
         self.block_next = False
         self.blocked = asyncio.Event()
 
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
         if self.block_next:
             self.block_next = False
             self.blocked.set()
@@ -330,8 +330,8 @@ class OverflowRecoveryClient(LaneFakeClient):
             {"info": {"id": "msg_overflow", "role": "assistant", "error": "context length"}, "parts": []},
         ]
 
-    async def messages_for_tracking(self, session_id: str) -> list[dict[str, Any]]:
-        return await self.messages(session_id)
+    async def messages(self, session_id: str) -> list[dict[str, Any]]:
+        return await self._messages(session_id)
 
     async def fork_session(self, session_id: str, message_id: str | None = None) -> dict[str, str]:
         self.cutoffs.append((session_id, message_id))
