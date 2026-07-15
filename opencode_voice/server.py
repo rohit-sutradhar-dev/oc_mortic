@@ -27,6 +27,7 @@ from opencode_voice.config import (
     secret_values,
     voice_bridge_issue_payload,
 )
+from opencode_voice.stt_provider import SpeechEvent
 from opencode_voice.tts_chunker import TTSChunker
 from opencode_voice.speech_filter import SpeechTextFilter
 from opencode_voice.logging import RunLogger
@@ -1284,7 +1285,7 @@ class VoiceConnection:
             return False
         if self.flux:
             return True
-        flux = DeepgramSTTProvider(self.config, on_event=self.handle_flux_event)
+        flux = DeepgramSTTProvider(self.config, on_speech=self.handle_speech_event, on_transport=self.handle_flux_event)
         try:
             await flux.start()
         except asyncio.CancelledError:
@@ -1726,10 +1727,10 @@ class VoiceConnection:
             expired = self.expired_interruption_episode_order.popleft()
             self.expired_interruption_episodes.discard(expired)
 
-    def interruption_episode_for(self, event: dict[str, Any], *, started: bool = False) -> EpisodeIdentity:
-        epoch_value = event.get("flux_connection_epoch")
+    def interruption_episode_for(self, event: SpeechEvent, *, started: bool = False) -> EpisodeIdentity:
+        epoch_value = event.transport_epoch
         epoch = int(epoch_value) if isinstance(epoch_value, int) else int(self.flux_connection_epoch or 0)
-        turn_value = event.get("turn_index")
+        turn_value = event.turn_index
         if isinstance(turn_value, int):
             turn_index = turn_value
         elif not started and self.interruption_episode is not None:
@@ -1899,66 +1900,34 @@ class VoiceConnection:
         except asyncio.CancelledError:
             raise
 
-    async def handle_flux_event(self, event: dict[str, Any]) -> None:
-        event_type = str(event.get("type") or "")
-        if event_type.startswith("flux.transport."):
-            epoch = event.get("flux_connection_epoch") or event.get("epoch")
-            if isinstance(epoch, int) and event_type in {
-                "flux.transport.connected",
-                "flux.transport.send_ok",
-            }:
-                self.adopt_flux_connection_epoch(epoch)
-            self.logger.write(
-                "flux.transport.event",
-                transport_event=event_type,
-                flux_connection_epoch=epoch,
-                stage=event_type.rsplit(".", 1)[-1],
-                error_code=(
-                    event.get("error_code")
-                    or (
-                        "stt_transport_failure"
-                        if event_type.endswith(("error", "timeout"))
-                        else None
-                    )
-                ),
-                status_code=event.get("status_code"),
-            )
-            if event_type in {
-                "flux.transport.send_error",
-                "flux.transport.read_error",
-                "flux.transport.connect_error",
-            }:
-                await self.set_stt_transport_health(False, event_type.rsplit(".", 1)[-1])
-            elif event_type == "flux.transport.send_ok":
-                await self.set_stt_transport_health(True, "send_ok")
-            return
+    async def handle_speech_event(self, event: SpeechEvent):
         if self.mic_capture_gated:
-            episode = self.interruption_episode_for(event, started=event_type == "speech.start")
+            episode = self.interruption_episode_for(event, started=(event.type == "speech.start"))
             self.expire_interruption_episode(episode)
             self.final_transcript = ""
             self.logger.write(
                 "speech.muted.drop",
-                event_type=event_type,
+                event_type=event.type,
                 flux_connection_epoch=episode.flux_epoch,
                 turn_index=episode.turn_index,
             )
             return
-        event_epoch = event.get("flux_connection_epoch")
+
         if (
-            isinstance(event_epoch, int)
+            isinstance(event.transport_epoch, int)
             and self.flux_connection_epoch is not None
-            and event_epoch != self.flux_connection_epoch
+            and event.transport_epoch != self.flux_connection_epoch
         ):
             self.logger.write(
                 "speech.stale_epoch.drop",
-                event_type=str(event.get("type") or ""),
-                flux_connection_epoch=event_epoch,
+                event_type=str(event.type or ""),
+                flux_connection_epoch=event.transport_epoch,
                 active_flux_connection_epoch=self.flux_connection_epoch,
-                turn_index=event.get("turn_index"),
+                turn_index=event.turn_index,
             )
             return
         await self.forward_flux_event(event)
-        if event["type"] == "speech.start":
+        if event.type == "speech.start":
             episode = self.interruption_episode_for(event, started=True)
             if (episode.flux_epoch, episode.turn_index) in self.expired_interruption_episodes:
                 self.logger.write(
@@ -1995,23 +1964,23 @@ class VoiceConnection:
                     playback_exposed=playback_exposed,
                 )
             )
-        elif event["type"] == "speech.resumed":
+        elif event.type == "speech.resumed":
             # Flux TurnResumed means an *eager* EOT prediction was revoked.
             # It is not fresh acoustic evidence and must never flush real
             # playback or abort OpenCode.  We keep it for correlation only.
             self.logger.write(
                 "speech.resumed",
                 action="ignored",
-                flux_connection_epoch=event_epoch,
-                turn_index=event.get("turn_index"),
+                flux_connection_epoch=event.transport_epoch,
+                turn_index=event.turn_index,
             )
             episode = self.interruption_episode_for(event)
             await self.reduce_interruption_event(
                 InterruptionEvent.turn_resumed(episode, self.interruption_elapsed_ms())
             )
-        elif event["type"] == "speech.transcript":
-            transcript = str(event.get("transcript") or "").strip()
-            if event.get("is_final") and transcript:
+        elif event.type == "speech.transcript":
+            transcript = str(event.transcript or "").strip()
+            if event.is_final and transcript:
                 self.final_transcript = transcript
                 self.logger.write("speech.transcript.final", transcript_chars=len(self.final_transcript))
             if transcript:
@@ -2038,11 +2007,11 @@ class VoiceConnection:
                         playback_exposed=self.playback_is_exposed(),
                     )
                 )
-        elif event["type"] == "speech.end":
-            transcript = str(event.get("transcript") or self.final_transcript).strip()
+        elif event.type == "speech.end":
+            transcript = str(event.transcript or self.final_transcript).strip()
             self.final_transcript = ""
-            eager = bool(event.get("eager"))
-            confidence = event.get("confidence")
+            eager = bool(event.eager)
+            confidence = event.confidence
             confidence = float(confidence) if isinstance(confidence, (int, float)) else None
             episode = self.interruption_episode_for(event)
             expired_episode = (episode.flux_epoch, episode.turn_index) in self.expired_interruption_episodes
@@ -2083,8 +2052,8 @@ class VoiceConnection:
                 self.logger.write(
                     "speech.eager_eot.ignored",
                     transcript_chars=len(transcript),
-                    flux_connection_epoch=event_epoch,
-                    turn_index=event.get("turn_index"),
+                    flux_connection_epoch=event.transport_epoch,
+                    turn_index=event.turn_index,
                 )
                 await self.reduce_interruption_event(
                     InterruptionEvent.eager_eot(
@@ -2104,6 +2073,51 @@ class VoiceConnection:
                     playback_exposed=self.playback_is_exposed(),
                 )
             )
+
+    async def handle_flux_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "")
+        if event_type.startswith("flux.transport."):
+            epoch = event.get("flux_connection_epoch") or event.get("epoch")
+            if isinstance(epoch, int) and event_type in {
+                "flux.transport.connected",
+                "flux.transport.send_ok",
+            }:
+                self.adopt_flux_connection_epoch(epoch)
+            self.logger.write(
+                "flux.transport.event",
+                transport_event=event_type,
+                flux_connection_epoch=epoch,
+                stage=event_type.rsplit(".", 1)[-1],
+                error_code=(
+                    event.get("error_code")
+                    or (
+                        "stt_transport_failure"
+                        if event_type.endswith(("error", "timeout"))
+                        else None
+                    )
+                ),
+                status_code=event.get("status_code"),
+            )
+            if event_type in {
+                "flux.transport.send_error",
+                "flux.transport.read_error",
+                "flux.transport.connect_error",
+            }:
+                await self.set_stt_transport_health(False, event_type.rsplit(".", 1)[-1])
+            elif event_type == "flux.transport.send_ok":
+                await self.set_stt_transport_health(True, "send_ok")
+            return
+
+        await self.handle_speech_event(SpeechEvent(
+            type=event_type,
+            transcript=str(event.get("transcript") or ""),
+            is_final=bool(event.get("is_final")),
+            eager=bool(event.get("eager")),
+            confidence=float(c) if (c := event.get("confidence")) is not None and isinstance(c, (int, float)) else None,
+            turn_index=event.get("turn_index") if isinstance(event.get("turn_index"), int) else None,
+            transport_epoch=event.get("flux_connection_epoch") if isinstance(event.get("flux_connection_epoch"), int) else None,
+            raw=event.get("raw") or {}
+        ))
 
     async def enqueue_text_turn(self, text: str, source: str, eager: bool = False) -> None:
         issue = self.config.credential_issue_for("voice_turns")
@@ -4799,8 +4813,8 @@ class SidepodConnection(VoiceConnection):
             payload["turnId"] = turn_id
         await self.send_json(payload)
 
-    async def forward_flux_event(self, event: dict[str, Any]) -> None:
-        etype = str(event.get("type") or "")
+    async def forward_flux_event(self, event: SpeechEvent) -> None:
+        etype = str(event.type or "")
         if etype == "speech.start":
             self.speech_started_at = time.perf_counter()
             return
@@ -4811,9 +4825,9 @@ class SidepodConnection(VoiceConnection):
             # the controller admits their final EOT.
             if self.interruption_state.phase is not InterruptionPhase.USER_TURN:
                 return
-            text = str(event.get("transcript") or "")
+            text = str(event.transcript or "")
             if text.strip():
-                await self.send_lane_transcript(text, final=False, confidence=event.get("confidence"))
+                await self.send_lane_transcript(text, final=False, confidence=event.confidence)
             return
         # speech.end is deliberately NOT forwarded here: the durable
         # (final) transcript entry is emitted from on_transcript_admitted

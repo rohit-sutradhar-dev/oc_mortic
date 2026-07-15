@@ -675,8 +675,9 @@ class StarvedDeviceAudio(AvailableDeviceAudio):
 
 
 class FakeFlux:
-    def __init__(self, config: Any, on_event: Any) -> None:
-        self.on_event = on_event
+    def __init__(self, config: Any, on_speech: Any, on_transport: Any) -> None:
+        self.on_speech = on_speech
+        self.on_transport = on_transport
         self.audio: list[bytes] = []
 
     async def start(self) -> None:
