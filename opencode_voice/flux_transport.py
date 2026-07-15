@@ -9,10 +9,10 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 
+from opencode_voice.callbacks import EventCallback
 from opencode_voice.deepgram import build_flux_url, parse_flux_message
 
 WebSocketConnector = Callable[[str, dict[str, str]], Awaitable[Any]]
-EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
 

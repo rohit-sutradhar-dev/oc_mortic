@@ -9,13 +9,13 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from opencode_voice.audio_processing import Pcm16Resampler
+from opencode_voice.callbacks import EventCallback
 from opencode_voice.playback import PlaybackToken
 
 RenderCallback = Callable[[bytes], None]
 CaptureCallback = Callable[[bytes], Awaitable[None]]
 CaptureProcessor = Callable[[bytes], bytes]
 TokenCallback = Callable[[PlaybackToken], Awaitable[None]]
-EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 StreamFactory = Callable[..., Any]
 Clock = Callable[[], float]
 

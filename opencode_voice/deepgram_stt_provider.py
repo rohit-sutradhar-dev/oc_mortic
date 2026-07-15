@@ -7,9 +7,11 @@ from opencode_voice.config import VoiceConfig
 from opencode_voice.flux_transport import FluxTransport, FluxTransportOptions
 from opencode_voice.stt_provider import SpeechEvent
 
+SpeechCallback = Callable[[SpeechEvent], Awaitable[None]]
+TransportCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 class DeepgramSTTProvider:
-    def __init__(self, config: VoiceConfig, on_speech: Callable[[SpeechEvent], Awaitable[None]], on_transport: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+    def __init__(self, config: VoiceConfig, on_speech: SpeechCallback, on_transport: TransportCallback) -> None:
         self.config = config
         self.on_speech = on_speech
         self.on_transport = on_transport

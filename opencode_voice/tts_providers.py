@@ -11,13 +11,13 @@ from typing import Any, Awaitable, Callable, Protocol
 
 import websockets
 
+from opencode_voice.callbacks import EventCallback
 from opencode_voice.cartesia import build_tts_url as build_cartesia_tts_url
 from opencode_voice.deepgram import build_tts_url as build_deepgram_tts_url
 from opencode_voice.playback import PlaybackToken
 
 WebSocketConnector = Callable[[str, dict[str, str]], Awaitable[Any]]
 AudioCallback = Callable[[PlaybackToken, bytes], Awaitable[None]]
-EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 ContextIdFactory = Callable[[], str]
 Clock = Callable[[], float]
 
