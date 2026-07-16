@@ -25,7 +25,7 @@ from opencode_voice.config import (
     secret_values,
     voice_bridge_issue_payload,
 )
-from opencode_voice.deepgram import SpeechTextFilter, TTSChunker
+from opencode_voice.deepgram import TTSChunker
 from opencode_voice.logging import RunLogger
 from opencode_voice.interruption import (
     EpisodeIdentity,
@@ -64,8 +64,6 @@ from opencode_voice.response_contract import (
 )
 from opencode_voice.structured_turn import StructuredTurnResult, run_structured_turn
 from opencode_voice.state import (
-    AssistantTextTracker,
-    HybridOpenCodeTurnTracker,
     active_context_estimate,
     elapsed_ms,
     event_properties,
@@ -81,6 +79,14 @@ AUDIO_DEPENDENCY_MODULE = "sounddevice"
 # silently denied mic (macOS TCC denies without any error on some terminals).
 MIC_WATCHDOG_SEC = 4.0
 TURN_PREFLIGHT_TIMEOUT_SEC = 3.0
+WORK_FEEDBACK_DELAY_SEC = 4.0
+WORK_ACTIVITY_DEBOUNCE_SEC = 0.5
+WORK_ACTIVITY_PHRASES = {
+    "searching": "I’m searching for that now.",
+    "inspecting": "I’m reviewing the relevant files.",
+    "working": "I’m working through that now.",
+    "finishing": "I’m finishing that up.",
+}
 CONTEXT_OVERFLOW_MARKERS = (
     "maximum context length",
     "context length",
@@ -112,6 +118,29 @@ class CompactionOutcome:
     after_tokens: int | None
     summary_message_id: str | None
     completed: bool
+
+
+@dataclass
+class WorkFeedbackState:
+    turn_id: int
+    started_at: float
+    activity: str = "reasoning"
+    displayed_activity: str = "reasoning"
+    last_activity_sent_at: float = 0.0
+    has_real_tool: bool = False
+    first_tool_at: float | None = None
+    onset_cue_played: bool = False
+    hold_cue_played: bool = False
+    phrase_attempted: bool = False
+    final_ready: bool = False
+    nonverbal_until: float = 0.0
+    feedback_token: PlaybackToken | None = None
+    audio_enqueued: bool = False
+    provider: TTSProvider | None = field(default=None, repr=False)
+    deadline_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    phrase_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    activity_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    drained: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
 class CompactionConfirmationError(RuntimeError):
@@ -180,10 +209,6 @@ def synthesize_tool_cue(sample_rate: int, *, hold: bool) -> bytes:
         value = math.sin(2 * math.pi * frequency * index / sample_rate)
         samples.append(int(32767 * 0.07 * max(0.0, envelope) * value))
     return samples.tobytes()
-
-
-def is_context_overflow_error(exc: Exception) -> bool:
-    return is_context_overflow_value(exc)
 
 
 def is_context_overflow_value(value: Any) -> bool:
@@ -279,13 +304,6 @@ def classify_turn_failure(error: Any) -> str:
     if status in (401, 403) or "auth" in code or "api_key" in code or "access_denied" in code:
         return "provider_auth"
     return "failed"
-
-
-class OpenCodeEventFallback(Exception):
-    def __init__(self, reason: str, prompt_sent: bool = False) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.prompt_sent = prompt_sent
 
 
 class NativeMicSession:
@@ -426,7 +444,7 @@ class NativeSpeakerSession:
         logger: RunLogger,
         on_issue: Callable[[dict[str, Any]], Awaitable[None]],
         on_render: Callable[[bytes], None] | None = None,
-        on_drain: Callable[[], Awaitable[None]] | None = None,
+        on_drain: Callable[[PlaybackToken], Awaitable[None]] | None = None,
         on_first_frame: Callable[[PlaybackToken], Awaitable[None]] | None = None,
     ) -> None:
         self.config = config
@@ -601,6 +619,9 @@ class NativeSpeakerSession:
 
     def turn_is_terminal(self, token: PlaybackToken) -> bool:
         return token in self.terminal_tokens
+
+    def turn_has_started(self, token: PlaybackToken) -> bool:
+        return token in self.first_frame_tokens
 
     def _reset_pcm_pipeline(self, token: PlaybackToken | None = None) -> None:
         # Native resamplers carry delay and FrameSlicer carries a sub-frame
@@ -818,7 +839,7 @@ class NativeSpeakerSession:
                 reason="drained",
             )
         if self.on_drain:
-            await self.on_drain()
+            await self.on_drain(token)
 
     def apply_gain(self, data: bytes) -> bytes:
         if self.current_gain == 1.0 and self.target_gain == 1.0:
@@ -1001,7 +1022,7 @@ def create_app(
                 "run_dir": str(logger.run_dir),
                 "model": config.model.opencode_name,
                 "context_threshold_tokens": config.context_threshold_tokens,
-                "response_mode": config.response_mode,
+                "response_mode": "structured",
                 "credential_issues": [
                     issue.to_voice_bridge_issue(debug_ref=str(logger.run_dir)) for issue in credentials.issues
                 ],
@@ -1076,8 +1097,8 @@ class VoiceConnection:
         self.compaction_running = False
         self.compaction_after_tokens: int | None = None
         self.compaction_summary_message_id: str | None = None
-        self.tool_cue_turns: set[int] = set()
-        self.tool_hold_tasks: dict[int, asyncio.Task[None]] = {}
+        self.work_feedback: dict[int, WorkFeedbackState] = {}
+        self.feedback_by_token: dict[PlaybackToken, WorkFeedbackState] = {}
         self.turn_task: asyncio.Task[None] | None = None
         self.turn_seq = 0
         self.active_turn_id: int | None = None
@@ -1104,6 +1125,7 @@ class VoiceConnection:
         self.tts_failure_reported: set[PlaybackToken] = set()
         self.native_mic: NativeMicSession | None = None
         self.native_speaker: NativeSpeakerSession | None = None
+        self.native_speaker_start_lock = asyncio.Lock()
         self.native_audio_engine: PersistentDeviceAudioEngine | None = None
         self.force_half_duplex = False
         self.native_speaker_unavailable = False
@@ -1156,7 +1178,12 @@ class VoiceConnection:
             self.mic_start_task,
             getattr(self, "mic_watchdog_task", None),
             *self.tts_terminal_watchdogs.values(),
-            *self.tool_hold_tasks.values(),
+            *(
+                task
+                for state in self.work_feedback.values()
+                for task in (state.deadline_task, state.phrase_task, state.activity_task)
+                if task is not None
+            ),
             *self.background_tasks,
         ]
         current = asyncio.current_task()
@@ -1174,8 +1201,16 @@ class VoiceConnection:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
         self.background_tasks.clear()
         self.tts_terminal_watchdogs.clear()
-        self.tool_hold_tasks.clear()
-        self.tool_cue_turns.clear()
+        feedback_providers = {
+            state.provider for state in self.work_feedback.values() if state.provider is not None
+        }
+        if feedback_providers:
+            await asyncio.gather(
+                *(self.close_speaker_quietly(provider) for provider in feedback_providers),
+                return_exceptions=True,
+            )
+        self.work_feedback.clear()
+        self.feedback_by_token.clear()
         if self.native_audio_engine:
             await self.native_audio_engine.close()
             self.native_audio_engine = None
@@ -2171,6 +2206,23 @@ class VoiceConnection:
         self.turn_seq += 1
         turn_id = self.turn_seq
         started = time.perf_counter()
+        self.active_turn_id = turn_id
+        self.turn_playback_tokens[turn_id] = PlaybackToken(self.speak_generation, turn_id)
+        self.tts_first_audio_seen = False
+        self.turn_spoken_any = False
+        await self.send_json(
+            {"type": "turn.start", "turn_id": turn_id, "source": source, "text": text, "eager": eager}
+        )
+        self.logger.state_transition("ready", "thinking", turn_id=turn_id, source=source)
+        self.logger.write(
+            "turn.start",
+            turn_id=turn_id,
+            source=source,
+            eager=eager,
+            session_id=self.fork_session_id,
+            stream_source="event",
+        )
+        self.start_work_feedback(turn_id, started)
         if self.speaker_prewarm_task is None or self.speaker_prewarm_task.done():
             self.speaker_prewarm_task = asyncio.create_task(self.prewarm_speaker())
         try:
@@ -2181,14 +2233,20 @@ class VoiceConnection:
             if decision is not None and not decision.completed:
                 await self.send_json({"type": "compaction.try_again", "turn_id": turn_id})
                 self.logger.write("turn.preflight.blocked", turn_id=turn_id, reason="compaction_failed")
+                self.stop_work_feedback(turn_id, "compaction_failed")
+                self.active_turn_id = None
                 return
             if not await self.maybe_wait_for_compaction(turn_id):
                 self.logger.write("turn.preflight.blocked", turn_id=turn_id, reason="compaction_unconfirmed")
+                self.stop_work_feedback(turn_id, "compaction_unconfirmed")
+                self.active_turn_id = None
                 return
             session_id = self.fork_session_id
             if not session_id:
+                self.stop_work_feedback(turn_id, "fork_unavailable")
+                self.active_turn_id = None
                 return
-            before_messages = await asyncio.wait_for(
+            await asyncio.wait_for(
                 self.read_messages(session_id),
                 timeout=TURN_PREFLIGHT_TIMEOUT_SEC,
             )
@@ -2200,6 +2258,8 @@ class VoiceConnection:
                 turn_id=turn_id,
                 error_code=type(exc).__name__,
             )
+            self.stop_work_feedback(turn_id, "turn_preflight_failed")
+            self.active_turn_id = None
             self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
             await self.send_json(
                 {
@@ -2210,92 +2270,23 @@ class VoiceConnection:
                 }
             )
             return
-        self.active_turn_id = turn_id
-        self.turn_playback_tokens[turn_id] = PlaybackToken(self.speak_generation, turn_id)
-        self.tts_first_audio_seen = False
-        self.turn_spoken_any = False
-        tracker = AssistantTextTracker(before_messages)
-        await self.send_json({"type": "turn.start", "turn_id": turn_id, "source": source, "text": text, "eager": eager})
-        self.logger.state_transition("ready", "thinking", turn_id=turn_id, source=source)
-        self.logger.write(
-            "turn.start",
-            turn_id=turn_id,
-            source=source,
-            eager=eager,
-            session_id=session_id,
-            stream_source="event",
-        )
-        if self.config.response_mode == "structured":
-            try:
-                await self.run_structured_text_turn(
-                    session_id=session_id,
-                    text=text,
-                    turn_id=turn_id,
-                    started=started,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - keep the lane alive and fail closed.
-                if self.turn_is_active(turn_id):
-                    await self.fail_structured_turn(
-                        turn_id,
-                        started,
-                        error=exc,
-                        safety_codes=(),
-                    )
-            return
         try:
-            await self.run_event_text_turn(
+            await self.run_structured_text_turn(
                 session_id=session_id,
                 text=text,
-                before_messages=before_messages,
                 turn_id=turn_id,
                 started=started,
             )
-            return
-        except OpenCodeEventFallback as exc:
-            if not self.turn_is_active(turn_id):
-                return
-            self.logger.write(
-                "opencode.stream.fallback",
-                turn_id=turn_id,
-                reason=exc.reason,
-                prompt_sent=exc.prompt_sent,
-            )
-            await self.send_json(
-                {
-                    "type": "opencode.stream.fallback",
-                    "turn_id": turn_id,
-                    "reason": exc.reason,
-                    "prompt_sent": exc.prompt_sent,
-                }
-            )
-            if exc.prompt_sent:
-                await self.poll_text_turn(
-                    session_id=session_id,
-                    tracker=tracker,
-                    turn_id=turn_id,
-                    started=started,
-                    stream_source="poll_after_event",
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the lane alive and fail closed.
+            if self.turn_is_active(turn_id):
+                await self.fail_structured_turn(
+                    turn_id,
+                    started,
+                    error=exc,
+                    safety_codes=(),
                 )
-                return
-
-        try:
-            tracker = await self.prompt_with_overflow_retry(session_id, text, tracker, turn_id)
-        except Exception as exc:  # noqa: BLE001 - keep the WebSocket alive and make the failure visible.
-            self.active_turn_id = None
-            self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
-            self.logger.write("turn.request.error", turn_id=turn_id, error=repr(exc))
-            await self.send_json({"type": "turn.error", "turn_id": turn_id, "message": repr(exc)})
-            return
-        await self.send_json({"type": "opencode.requested", "turn_id": turn_id})
-        await self.poll_text_turn(
-            session_id=session_id,
-            tracker=tracker,
-            turn_id=turn_id,
-            started=started,
-            stream_source="poll",
-        )
 
     async def read_messages(self, session_id: str) -> list[dict[str, Any]]:
         """Read messages through the OpenCode 1.17 structured-format shim.
@@ -2343,6 +2334,8 @@ class VoiceConnection:
         before_ids = message_ids(before_messages)
         repaired = False
         result = await self.observe_structured_response(session_id, text, turn_id)
+        if self.turn_is_active(turn_id):
+            await self.set_work_activity(turn_id, "finishing")
         if result.response is None and is_context_overflow_value(result.error):
             recovered_session = await self.recover_overflow_fork(session_id, before_ids)
             outcome = await self.maybe_start_compaction(
@@ -2367,6 +2360,7 @@ class VoiceConnection:
         )
         admitted, repair_reason = should_admit_repair(evaluation)
         if result.raw is not None and admitted and self.turn_is_active(turn_id):
+            await self.set_work_activity(turn_id, "finishing")
             repair = await self.observe_structured_response(
                 session_id,
                 repair_prompt(text, result.raw, list(evaluation.violations)),
@@ -2422,6 +2416,9 @@ class VoiceConnection:
         if not self.turn_is_active(turn_id):
             return
 
+        await self.finish_work_feedback_for_final(turn_id)
+        if not self.turn_is_active(turn_id):
+            return
         first_text_ms = elapsed_ms(started)
         await self.send_json({"type": "assistant.first_text", "turn_id": turn_id, "latency_ms": first_text_ms})
         await self.send_json(
@@ -2460,7 +2457,6 @@ class VoiceConnection:
             "awaiting_playback" if self.turn_spoken_any else "ready",
             turn_id=turn_id,
         )
-        self.cancel_tool_hold(turn_id)
         self.active_turn_id = None
         await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
 
@@ -2518,7 +2514,7 @@ class VoiceConnection:
             error_code=type(error).__name__ if not isinstance(error, str) else error,
             safety_codes=safety_codes,
         )
-        self.cancel_tool_hold(turn_id)
+        self.stop_work_feedback(turn_id, "structured_rejected")
         self.speak_generation += 1
         if self.native_audio_engine:
             self.native_audio_engine.invalidate_generation(self.speak_generation)
@@ -2537,53 +2533,383 @@ class VoiceConnection:
         )
 
     async def on_structured_tool_activity(self, turn_id: int, activity: Any) -> None:
-        if activity.tool == "StructuredOutput" or activity.status not in {"pending", "running"}:
+        tool_name = str(activity.tool or "")
+        if (
+            tool_name.casefold().replace("_", "") == "structuredoutput"
+            or activity.status not in {"pending", "running"}
+        ):
             return
-        if turn_id in self.tool_cue_turns:
+        state = self.work_feedback.get(turn_id)
+        if state is None or state.final_ready or not self.turn_is_active(turn_id):
             return
-        self.tool_cue_turns.add(turn_id)
-        await self.play_tool_cue(turn_id, hold=False)
-        task = asyncio.create_task(self.play_tool_hold_after_delay(turn_id), name=f"tool-hold-{turn_id}")
-        self.tool_hold_tasks[turn_id] = task
+        first_tool = not state.has_real_tool
+        state.has_real_tool = True
+        state.first_tool_at = state.first_tool_at or time.perf_counter()
+        activity_name = self.tool_activity_name(tool_name)
+        await self.set_work_activity(turn_id, activity_name)
+        if not first_tool:
+            return
+        if time.perf_counter() < state.started_at + WORK_FEEDBACK_DELAY_SEC:
+            duration = await self.play_tool_cue(turn_id, hold=False)
+            state.onset_cue_played = duration > 0
+            state.nonverbal_until = max(state.nonverbal_until, time.monotonic() + duration + 0.03)
+        self.ensure_feedback_phrase(state, activity_name)
 
-    async def play_tool_hold_after_delay(self, turn_id: int) -> None:
+    @staticmethod
+    def tool_activity_name(tool: str) -> str:
+        normalized = tool.casefold().replace("_", "").replace("-", "")
+        if normalized in {"websearch", "webfetch"}:
+            return "searching"
+        if normalized in {"read", "glob", "grep", "list", "ls"}:
+            return "inspecting"
+        return "working"
+
+    def start_work_feedback(self, turn_id: int, started_at: float) -> None:
+        self.stop_work_feedback(turn_id, "turn_restarted")
+        state = WorkFeedbackState(
+            turn_id=turn_id,
+            started_at=started_at,
+            last_activity_sent_at=started_at,
+        )
+        self.work_feedback[turn_id] = state
+        state.deadline_task = asyncio.create_task(
+            self.run_work_feedback_deadline(state),
+            name=f"work-feedback-deadline-{turn_id}",
+        )
+
+    async def set_work_activity(self, turn_id: int, activity: str) -> None:
+        state = self.work_feedback.get(turn_id)
+        if state is None or state.final_ready or activity == state.activity:
+            return
+        state.activity = activity
+        now = time.perf_counter()
+        first_real_activity = state.displayed_activity == "reasoning"
+        if first_real_activity or now - state.last_activity_sent_at >= WORK_ACTIVITY_DEBOUNCE_SEC:
+            task = state.activity_task
+            if task and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+            state.activity_task = None
+            await self.emit_work_activity(state)
+            return
+        if state.activity_task is None or state.activity_task.done():
+            state.activity_task = asyncio.create_task(
+                self.flush_work_activity(state),
+                name=f"work-activity-{turn_id}",
+            )
+
+    async def flush_work_activity(self, state: WorkFeedbackState) -> None:
         try:
-            await asyncio.sleep(4.0)
-            if self.turn_is_active(turn_id):
-                await self.play_tool_cue(turn_id, hold=True)
+            delay = max(
+                0.0,
+                WORK_ACTIVITY_DEBOUNCE_SEC - (time.perf_counter() - state.last_activity_sent_at),
+            )
+            await asyncio.sleep(delay)
+            await self.emit_work_activity(state)
         except asyncio.CancelledError:
             raise
         finally:
-            if self.tool_hold_tasks.get(turn_id) is asyncio.current_task():
-                self.tool_hold_tasks.pop(turn_id, None)
+            if state.activity_task is asyncio.current_task():
+                state.activity_task = None
 
-    def cancel_tool_hold(self, turn_id: int) -> None:
-        task = self.tool_hold_tasks.pop(turn_id, None)
-        if task and not task.done():
-            task.cancel()
-        self.tool_cue_turns.discard(turn_id)
-
-    async def play_tool_cue(self, turn_id: int, *, hold: bool) -> None:
-        engine = self.native_audio_engine
-        fallback = self.native_speaker
-        token = self.turn_playback_tokens.get(turn_id)
-        if (engine is None and fallback is None) or token is None or not self.turn_is_active(turn_id):
-            self.logger.write("tool.cue.skipped", turn_id=turn_id, hold=hold, reason="device_clock_unavailable")
+    async def emit_work_activity(self, state: WorkFeedbackState) -> None:
+        if (
+            self.work_feedback.get(state.turn_id) is not state
+            or state.final_ready
+            or not self.turn_is_active(state.turn_id)
+            or state.activity == state.displayed_activity
+        ):
             return
+        state.displayed_activity = state.activity
+        state.last_activity_sent_at = time.perf_counter()
+        await self.send_json(
+            {"type": "turn.activity", "turn_id": state.turn_id, "activity": state.activity}
+        )
+
+    async def run_work_feedback_deadline(self, state: WorkFeedbackState) -> None:
+        try:
+            await asyncio.sleep(max(0.0, state.started_at + WORK_FEEDBACK_DELAY_SEC - time.perf_counter()))
+            if (
+                self.work_feedback.get(state.turn_id) is not state
+                or state.final_ready
+                or not self.turn_is_active(state.turn_id)
+            ):
+                return
+            if state.has_real_tool:
+                self.ensure_feedback_phrase(state, state.activity)
+                return
+            duration = await self.play_tool_cue(state.turn_id, hold=True)
+            state.hold_cue_played = duration > 0
+            state.nonverbal_until = max(state.nonverbal_until, time.monotonic() + duration + 0.03)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if state.deadline_task is asyncio.current_task():
+                state.deadline_task = None
+
+    def ensure_feedback_phrase(self, state: WorkFeedbackState, activity: str) -> None:
+        if state.phrase_attempted or state.final_ready:
+            return
+        state.phrase_attempted = True
+        state.phrase_task = asyncio.create_task(
+            self.synthesize_work_feedback(state, activity),
+            name=f"work-feedback-speech-{state.turn_id}",
+        )
+
+    async def synthesize_work_feedback(self, state: WorkFeedbackState, activity: str) -> None:
+        phrase = WORK_ACTIVITY_PHRASES.get(activity, WORK_ACTIVITY_PHRASES["working"])
+        token = PlaybackToken(self.speak_generation, -state.turn_id)
+        state.feedback_token = token
+        self.feedback_by_token[token] = state
+        audio = bytearray()
+        terminal = asyncio.Event()
+        outcome = {"value": "pending"}
+
+        async def collect(incoming: PlaybackToken, data: bytes) -> None:
+            if incoming == token and not state.final_ready and self.work_feedback.get(state.turn_id) is state:
+                audio.extend(data)
+
+        async def observe(event: dict[str, Any]) -> None:
+            event_type = str(event.get("type") or "tts.feedback.event")
+            self.logger.write(
+                "feedback.tts.event",
+                turn_id=state.turn_id,
+                provider_event=event_type,
+                error_code=event.get("error_code"),
+            )
+            if event_type in {"tts.turn.done", "tts.turn.failed"}:
+                outcome["value"] = "done" if event_type == "tts.turn.done" else "failed"
+                terminal.set()
+
+        provider = self.build_tts_provider(collect, observe)
+        state.provider = provider
+        try:
+            await provider.connect()
+            await provider.begin_turn(token)
+            await provider.append_text(token, phrase)
+            await provider.finish_turn(token)
+            await asyncio.wait_for(terminal.wait(), timeout=5.0)
+            if outcome["value"] != "done" or not audio:
+                raise TTSProviderError("feedback_tts_failed")
+            await asyncio.sleep(
+                max(0.0, state.started_at + WORK_FEEDBACK_DELAY_SEC - time.perf_counter())
+            )
+            if state.final_ready or not self.turn_is_active(state.turn_id):
+                return
+            # The phrase may have been synthesized while later tools changed
+            # the visual activity. Re-emit the matching truthful activity so
+            # COMMS and the deterministic spoken phrase are identical when it
+            # reaches the device.
+            if state.displayed_activity != activity:
+                pending_activity = state.activity_task
+                if pending_activity and not pending_activity.done():
+                    pending_activity.cancel()
+                state.activity_task = None
+                state.activity = activity
+                await self.emit_work_activity(state)
+            admitted = await self.play_feedback_pcm(state, bytes(audio))
+            if not admitted:
+                raise TTSProviderError("feedback_playback_unavailable")
+            duration = len(audio) / max(1, self.config.tts_sample_rate * 2)
+            try:
+                await asyncio.wait_for(state.drained.wait(), timeout=max(3.0, duration + 2.0))
+            except asyncio.TimeoutError:
+                # The PCM was admitted, so playing a fallback cue here could
+                # overlap delayed device output. Final arbitration owns the
+                # generation fence if the device never reports a drain.
+                self.logger.write("feedback.speech.drain_timeout", turn_id=state.turn_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - deterministic local cue is the safe fallback.
+            self.logger.write(
+                "feedback.speech.error",
+                turn_id=state.turn_id,
+                error_code=type(exc).__name__,
+            )
+            await asyncio.sleep(
+                max(0.0, state.started_at + WORK_FEEDBACK_DELAY_SEC - time.perf_counter())
+            )
+            if not state.final_ready and self.turn_is_active(state.turn_id):
+                duration = await self.play_tool_cue(state.turn_id, hold=True)
+                state.hold_cue_played = duration > 0
+                state.nonverbal_until = max(
+                    state.nonverbal_until,
+                    time.monotonic() + duration + 0.03,
+                )
+        finally:
+            if state.phrase_task is asyncio.current_task():
+                state.phrase_task = None
+            state.provider = None
+            await self.close_speaker_quietly(provider)
+
+    async def play_feedback_pcm(self, state: WorkFeedbackState, pcm: bytes) -> bool:
+        token = state.feedback_token
+        if token is None or state.final_ready or not self.turn_is_active(state.turn_id):
+            return False
+        if self.native_audio_engine is not None:
+            if not self.native_audio_engine.begin_turn(token):
+                return False
+            admitted = await self.native_audio_engine.play(pcm, token)
+            if admitted:
+                admitted = await self.native_audio_engine.finish_turn(token, "done")
+        else:
+            speaker = await self.ensure_native_speaker_output()
+            if speaker is None or not speaker.begin_turn(token):
+                return False
+            admitted = await speaker.play(pcm, token)
+            if admitted:
+                admitted = await speaker.finish_turn(token, "done")
+        state.audio_enqueued = bool(admitted)
+        self.logger.write(
+            "feedback.speech.queued",
+            turn_id=state.turn_id,
+            admitted=bool(admitted),
+            playback_generation=token.generation,
+            text_chars=len(WORK_ACTIVITY_PHRASES.get(state.activity, "")),
+        )
+        return bool(admitted)
+
+    async def finish_work_feedback_for_final(self, turn_id: int) -> None:
+        state = self.work_feedback.get(turn_id)
+        if state is None:
+            return
+        state.final_ready = True
+        cancelled_tasks: list[asyncio.Task[Any]] = []
+        for task in (state.deadline_task, state.activity_task):
+            if task and not task.done():
+                task.cancel()
+                cancelled_tasks.append(task)
+        phrase_task = state.phrase_task
+        token = state.feedback_token
+        started = bool(token and self.feedback_playback_started(token))
+        if state.audio_enqueued and started and not state.drained.is_set():
+            try:
+                await asyncio.wait_for(state.drained.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                self.logger.write("feedback.speech.drain_timeout", turn_id=turn_id)
+                self.fence_feedback_before_final(turn_id)
+                if phrase_task and not phrase_task.done():
+                    phrase_task.cancel()
+        elif state.audio_enqueued and not state.drained.is_set():
+            # Fully synthesized feedback that has not reached the device is
+            # obsolete as soon as the answer is ready.
+            self.fence_feedback_before_final(turn_id)
+        if phrase_task and not phrase_task.done():
+            phrase_task.cancel()
+            await asyncio.gather(phrase_task, return_exceptions=True)
+        if cancelled_tasks:
+            await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+        remaining = state.nonverbal_until - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(min(0.2, remaining))
+        self.work_feedback.pop(turn_id, None)
+        if token is not None:
+            self.feedback_by_token.pop(token, None)
+
+    def feedback_playback_started(self, token: PlaybackToken) -> bool:
+        if self.native_audio_engine is not None:
+            return self.native_audio_engine.turn_has_started(token)
+        if self.native_speaker is not None:
+            return self.native_speaker.turn_has_started(token)
+        return False
+
+    def fence_feedback_before_final(self, turn_id: int) -> None:
+        state = self.work_feedback.get(turn_id)
+        token = state.feedback_token if state is not None else None
+        if token is None or token.generation != self.speak_generation:
+            return
+        self.speak_generation += 1
+        if self.native_audio_engine:
+            self.native_audio_engine.invalidate_generation(self.speak_generation)
+        if self.native_speaker:
+            self.native_speaker.invalidate_generation(self.speak_generation, "feedback_preempted")
+        self.turn_playback_tokens[turn_id] = PlaybackToken(self.speak_generation, turn_id)
+
+    def stop_work_feedback(self, turn_id: int, reason: str) -> None:
+        state = self.work_feedback.pop(turn_id, None)
+        if state is None:
+            return
+        state.final_ready = True
+        cancelled_tasks: list[asyncio.Task[Any]] = []
+        for task in (state.deadline_task, state.phrase_task, state.activity_task):
+            if task and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+                cancelled_tasks.append(task)
+        if state.audio_enqueued and state.feedback_token is not None:
+            # Preflight/validation failures do not otherwise advance playback
+            # generation. Fence any admitted feedback before returning the
+            # lane to listening; interruption already advanced it and is a
+            # no-op here because the token is stale.
+            self.work_feedback[turn_id] = state
+            self.fence_feedback_before_final(turn_id)
+            self.work_feedback.pop(turn_id, None)
+        if state.feedback_token is not None:
+            self.feedback_by_token.pop(state.feedback_token, None)
+        if cancelled_tasks:
+            self.spawn_background(self.drain_cancelled_tasks(cancelled_tasks))
+        elif state.provider is not None:
+            self.spawn_background(self.close_speaker_quietly(state.provider))
+        self.logger.write("feedback.cancel", turn_id=turn_id, reason=reason)
+
+    @staticmethod
+    async def drain_cancelled_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def play_tool_cue(self, turn_id: int, *, hold: bool) -> float:
+        engine = self.native_audio_engine
+        token = self.turn_playback_tokens.get(turn_id)
+        if token is None or not self.turn_is_active(turn_id):
+            self.logger.write("tool.cue.skipped", turn_id=turn_id, hold=hold, reason="turn_inactive")
+            return 0.0
         pcm = synthesize_tool_cue(self.config.device_sample_rate, hold=hold)
         if engine is not None:
             admitted = await engine.play_device_cue(pcm, token)
         else:
+            fallback = await self.ensure_native_speaker_output()
+            if fallback is None:
+                self.logger.write(
+                    "tool.cue.skipped",
+                    turn_id=turn_id,
+                    hold=hold,
+                    reason="device_clock_unavailable",
+                )
+                return 0.0
             cue = getattr(fallback, "play_device_cue", None)
             admitted = bool(await cue(pcm, token)) if cue is not None else False
+        duration = len(pcm) / 2 / self.config.device_sample_rate
         self.logger.write(
             "tool.cue",
             turn_id=turn_id,
             hold=hold,
             admitted=admitted,
             sample_rate=self.config.device_sample_rate,
-            duration_ms=int(len(pcm) / 2 / self.config.device_sample_rate * 1000),
+            duration_ms=int(duration * 1000),
         )
+        return duration if admitted else 0.0
+
+    async def ensure_native_speaker_output(self) -> NativeSpeakerSession | None:
+        """Open the half-duplex output once for answer and feedback audio."""
+
+        if self.native_speaker is not None and not bool(getattr(self.native_speaker, "closed", False)):
+            return self.native_speaker
+        if self.native_speaker_unavailable:
+            return None
+        async with self.native_speaker_start_lock:
+            if self.native_speaker is not None and not bool(getattr(self.native_speaker, "closed", False)):
+                return self.native_speaker
+            speaker = NativeSpeakerSession(
+                config=self.config,
+                logger=self.logger,
+                on_issue=self.send_json,
+                on_render=self.feed_render_reference,
+                on_drain=self.on_playback_drained,
+                on_first_frame=self.on_first_playback_frame,
+            )
+            if not await speaker.start():
+                self.native_speaker_unavailable = True
+                return None
+            speaker.playback_generation = self.speak_generation
+            self.native_speaker = speaker
+            return speaker
 
     async def recover_overflow_fork(self, session_id: str, before_ids: set[str]) -> str:
         messages = await self.client.messages_for_tracking(session_id)
@@ -2630,648 +2956,6 @@ class VoiceConnection:
             self.message_cache.pop(failed_session, None)
         return recovered_id
 
-    async def poll_text_turn(
-        self,
-        session_id: str,
-        tracker: AssistantTextTracker,
-        turn_id: int,
-        started: float,
-        stream_source: str,
-    ) -> None:
-        chunker = TTSChunker()
-        speech_filter = SpeechTextFilter()
-        first_text_ms: int | None = None
-        full_text = ""
-        while self.turn_is_active(turn_id) and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
-            if first_text_ms is None and elapsed_ms(started) >= int(self.config.first_text_timeout_sec * 1000):
-                await self.timeout_silent_turn(turn_id, started, stream_source)
-                return
-            try:
-                messages = await asyncio.wait_for(
-                    self.client.messages(session_id),
-                    timeout=1.0,
-                )
-            except asyncio.TimeoutError:
-                self.logger.write(
-                    "opencode.poll.timeout",
-                    turn_id=turn_id,
-                    timeout_ms=1_000,
-                    stream_source=stream_source,
-                )
-                await asyncio.sleep(self.config.poll_interval_sec)
-                continue
-            except Exception as exc:  # noqa: BLE001 - keep polling until the turn deadline.
-                self.logger.write(
-                    "opencode.poll.error",
-                    turn_id=turn_id,
-                    error=repr(exc),
-                    stream_source=stream_source,
-                )
-                await asyncio.sleep(self.config.poll_interval_sec)
-                continue
-            if not self.turn_is_active(turn_id):
-                return
-            update = tracker.update(messages)
-            if update.deltas and first_text_ms is None:
-                first_text_ms = elapsed_ms(started)
-                await self.send_json({"type": "assistant.first_text", "turn_id": turn_id, "latency_ms": first_text_ms})
-                self.logger.write("assistant.first_text", turn_id=turn_id, latency_ms=first_text_ms)
-            for delta in update.deltas:
-                if not self.turn_is_active(turn_id):
-                    return
-                full_text += delta
-                await self.send_json({"type": "assistant.delta", "turn_id": turn_id, "delta": delta})
-                for chunk in chunker.push(speech_filter.push(delta)):
-                    await self.speak(chunk, turn_id=turn_id)
-                    if not self.turn_is_active(turn_id):
-                        return
-            if update.completed:
-                if not self.turn_is_active(turn_id):
-                    return
-                for chunk in chunker.push(speech_filter.flush()) + chunker.flush():
-                    await self.speak(chunk, turn_id=turn_id)
-                    if not self.turn_is_active(turn_id):
-                        return
-                await self.finish_speaking_turn(turn_id)
-                self.log_if_silent_completion(turn_id, update.full_text or full_text)
-                if update.error:
-                    await self.send_json(
-                        {
-                            "type": "turn.error",
-                            "turn_id": turn_id,
-                            "message": str(update.error)[:1000],
-                            "failure": classify_turn_failure(update.error),
-                        }
-                    )
-                    self.logger.write("turn.error", turn_id=turn_id, error=update.error)
-                await self.send_json(
-                    {
-                        "type": "turn.complete",
-                        "turn_id": turn_id,
-                        "latency_ms": elapsed_ms(started),
-                        "text": update.full_text or full_text,
-                        "stream_source": stream_source,
-                    }
-                )
-                self.logger.write(
-                    "turn.complete",
-                    turn_id=turn_id,
-                    latency_ms=elapsed_ms(started),
-                    response_chars=len(update.full_text or full_text),
-                    stream_source=stream_source,
-                )
-                self.logger.state_transition(
-                    "thinking",
-                    "awaiting_playback" if self.turn_spoken_any else "ready",
-                    turn_id=turn_id,
-                )
-                self.active_turn_id = None
-                await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
-                return
-            await asyncio.sleep(self.config.poll_interval_sec)
-
-        if self.turn_is_active(turn_id):
-            await self.send_json({"type": "turn.timeout", "turn_id": turn_id})
-            self.logger.write("turn.timeout", turn_id=turn_id, latency_ms=elapsed_ms(started))
-            self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
-            self.active_turn_id = None
-
-    async def run_event_text_turn(
-        self,
-        session_id: str,
-        text: str,
-        before_messages: list[dict[str, Any]],
-        turn_id: int,
-        started: float,
-    ) -> None:
-        self.turn_playback_tokens.setdefault(turn_id, PlaybackToken(self.speak_generation, turn_id))
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        ready = asyncio.Event()
-        reader_task = asyncio.create_task(self.read_opencode_events(session_id, queue, ready))
-        prompt_sent = False
-        try:
-            try:
-                await asyncio.wait_for(ready.wait(), timeout=3)
-            except asyncio.TimeoutError as exc:
-                raise OpenCodeEventFallback("event_stream_open_timeout", prompt_sent=False) from exc
-            self.logger.write("opencode.stream.start", turn_id=turn_id, session_id=session_id)
-            try:
-                await self.client.prompt_async(session_id, text, self.config.model, agent=self.config.opencode_agent)
-            except Exception as exc:  # noqa: BLE001 - prompt_async is optional; fallback preserves old behavior.
-                raise OpenCodeEventFallback(f"prompt_async_error:{type(exc).__name__}", prompt_sent=False) from exc
-            prompt_sent = True
-            await self.send_json({"type": "opencode.requested", "turn_id": turn_id})
-
-            tracker = HybridOpenCodeTurnTracker(session_id=session_id, before_messages=before_messages)
-            chunker = TTSChunker()
-            speech_filter = SpeechTextFilter()
-            first_text_ms: int | None = None
-            full_text = ""
-            stale_idle_logged = False
-            completion_grace_deadline: float | None = None
-            completion_observed = False
-            last_event_ms = elapsed_ms(started)
-            hedge_active = False
-            event_healthy = True
-            hedge_deadline = time.perf_counter() + 3.0
-            poll_interval = max(0.5, self.config.poll_interval_sec * 5)
-            poll_task: asyncio.Task[None] | None = None
-            no_first_text_logged = False
-            text_sources: set[str] = set()
-
-            def ensure_polling() -> None:
-                nonlocal poll_task
-                if poll_task is None or poll_task.done():
-                    poll_task = asyncio.create_task(
-                        self.poll_opencode_messages(
-                            session_id=session_id,
-                            queue=queue,
-                            turn_id=turn_id,
-                            interval_sec=poll_interval,
-                        ),
-                        name=f"opencode-poll-{turn_id}",
-                    )
-
-            async def consume_update(update: Any, source: str) -> bool:
-                nonlocal first_text_ms, full_text, completion_grace_deadline
-                nonlocal completion_observed, hedge_deadline
-                if not self.turn_is_active(turn_id):
-                    return False
-                if update.deltas:
-                    text_sources.add(source)
-                    if first_text_ms is None:
-                        first_text_ms = elapsed_ms(started)
-                        await self.send_json(
-                            {"type": "assistant.first_text", "turn_id": turn_id, "latency_ms": first_text_ms}
-                        )
-                        self.logger.write("assistant.first_text", turn_id=turn_id, latency_ms=first_text_ms)
-                        self.logger.write(
-                            "opencode.stream.first_delta",
-                            turn_id=turn_id,
-                            latency_ms=first_text_ms,
-                            source=source,
-                        )
-                    for delta in update.deltas:
-                        if not self.turn_is_active(turn_id):
-                            return False
-                        full_text += delta
-                        await self.send_json({"type": "assistant.delta", "turn_id": turn_id, "delta": delta})
-                        for chunk in chunker.push(speech_filter.push(delta)):
-                            await self.speak(chunk, turn_id=turn_id)
-                            if not self.turn_is_active(turn_id):
-                                return False
-                    if not hedge_active:
-                        hedge_deadline = time.perf_counter() + 3.0
-                    if completion_observed and self.config.event_completion_grace_sec > 0:
-                        # Completion can arrive before one or more part events.
-                        # Debounce from the latest unseen text, not the first
-                        # premature session.idle signal.
-                        completion_grace_deadline = (
-                            time.perf_counter() + self.config.event_completion_grace_sec
-                        )
-
-                if not update.completed:
-                    return False
-                # A completed messages snapshot is already the canonical
-                # polling observation. Event completion, however, is only a
-                # signal: part events can still be queued behind session.idle.
-                if source == "poll" and not completion_observed:
-                    return bool(update.full_text or full_text)
-                completion_observed = True
-                if self.config.event_completion_grace_sec <= 0:
-                    return bool(update.full_text or full_text)
-                if completion_grace_deadline is None:
-                    completion_grace_deadline = (
-                        time.perf_counter() + self.config.event_completion_grace_sec
-                    )
-                    self.logger.write("opencode.stream.completion_grace", turn_id=turn_id)
-                return False
-
-            while self.turn_is_active(turn_id) and elapsed_ms(started) < int(self.config.max_turn_sec * 1000):
-                now = time.perf_counter()
-                if first_text_ms is None and elapsed_ms(started) >= int(
-                    self.config.first_text_timeout_sec * 1000
-                ):
-                    await self.timeout_silent_turn(turn_id, started, "event")
-                    return
-                if first_text_ms is None and not no_first_text_logged and elapsed_ms(started) >= 10_000:
-                    no_first_text_logged = True
-                    self.logger.write(
-                        "opencode.stream.first_delta.delayed",
-                        turn_id=turn_id,
-                        latency_ms=elapsed_ms(started),
-                        event_healthy=event_healthy,
-                        poll_active=bool(poll_task and not poll_task.done()),
-                    )
-                if completion_grace_deadline is not None and now >= completion_grace_deadline:
-                    # Reconcile through the same message-id tracker before
-                    # closing TTS, so a suffix observed only by polling still
-                    # reaches both the screen and speech exactly once.
-                    try:
-                        messages = await asyncio.wait_for(
-                            self.client.messages(session_id),
-                            timeout=1.0,
-                        )
-                    except asyncio.TimeoutError:
-                        self.logger.write(
-                            "opencode.stream.completion_reconcile.timeout",
-                            turn_id=turn_id,
-                            timeout_ms=1_000,
-                        )
-                        if full_text:
-                            stream_source = (
-                                "hybrid"
-                                if text_sources == {"event", "poll"}
-                                else next(iter(text_sources), "event")
-                            )
-                            await self.complete_event_text_turn(
-                                session_id=session_id,
-                                before_messages=before_messages,
-                                turn_id=turn_id,
-                                started=started,
-                                chunker=chunker,
-                                speech_filter=speech_filter,
-                                event_text=full_text,
-                                stream_source=stream_source,
-                            )
-                            self.logger.write(
-                                "opencode.stream.done",
-                                turn_id=turn_id,
-                                latency_ms=elapsed_ms(started),
-                                last_event_ms=last_event_ms,
-                                final_fetch="timeout",
-                            )
-                            return
-                        completion_grace_deadline = time.perf_counter() + poll_interval
-                        continue
-                    except Exception as exc:  # noqa: BLE001 - keep SSE alive and retry the grace fetch.
-                        self.logger.write(
-                            "opencode.stream.completion_reconcile.error",
-                            turn_id=turn_id,
-                            error=repr(exc),
-                        )
-                        if full_text:
-                            stream_source = (
-                                "hybrid"
-                                if text_sources == {"event", "poll"}
-                                else next(iter(text_sources), "event")
-                            )
-                            await self.complete_event_text_turn(
-                                session_id=session_id,
-                                before_messages=before_messages,
-                                turn_id=turn_id,
-                                started=started,
-                                chunker=chunker,
-                                speech_filter=speech_filter,
-                                event_text=full_text,
-                                stream_source=stream_source,
-                            )
-                            self.logger.write(
-                                "opencode.stream.done",
-                                turn_id=turn_id,
-                                latency_ms=elapsed_ms(started),
-                                last_event_ms=last_event_ms,
-                                final_fetch="error",
-                            )
-                            return
-                        completion_grace_deadline = time.perf_counter() + poll_interval
-                        continue
-                    update = tracker.update_messages(messages)
-                    if not self.turn_is_active(turn_id):
-                        return
-                    await consume_update(update, "poll")
-                    if not self.turn_is_active(turn_id):
-                        return
-                    if not update.full_text and not full_text:
-                        hedge_active = True
-                        ensure_polling()
-                        completion_grace_deadline = time.perf_counter() + poll_interval
-                        continue
-                    stream_source = (
-                        "hybrid" if text_sources == {"event", "poll"} else next(iter(text_sources), "event")
-                    )
-                    await self.complete_event_text_turn(
-                        session_id=session_id,
-                        before_messages=before_messages,
-                        turn_id=turn_id,
-                        started=started,
-                        chunker=chunker,
-                        speech_filter=speech_filter,
-                        event_text=full_text,
-                        stream_source=stream_source,
-                    )
-                    self.logger.write(
-                        "opencode.stream.done",
-                        turn_id=turn_id,
-                        latency_ms=elapsed_ms(started),
-                        last_event_ms=last_event_ms,
-                    )
-                    return
-                if not hedge_active and now >= hedge_deadline:
-                    hedge_active = True
-                    ensure_polling()
-                    self.logger.write("opencode.stream.poll_hedge.start", turn_id=turn_id, after_ms=3000)
-
-                source: str
-                turn_deadline = started + self.config.max_turn_sec
-                deadline = turn_deadline if hedge_active else min(turn_deadline, hedge_deadline)
-                if first_text_ms is None:
-                    deadline = min(deadline, started + self.config.first_text_timeout_sec)
-                if first_text_ms is None and not no_first_text_logged:
-                    deadline = min(deadline, started + 10.0)
-                if completion_grace_deadline is not None:
-                    deadline = min(deadline, completion_grace_deadline)
-                timeout = max(0.01, deadline - now)
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    continue
-                event_type = str(event.get("type") or "")
-                if event_type == "_poll_error":
-                    continue
-                if event_type == "_poll_messages":
-                    messages = event.get("messages")
-                    update = tracker.update_messages(messages if isinstance(messages, list) else [])
-                    source = "poll"
-                else:
-                    if event_type == "_stream_error":
-                        # This is an actual connection/read/parser failure, not
-                        # model silence. Keep the turn alive through an
-                        # independent polling producer.
-                        event_healthy = False
-                        hedge_active = True
-                        ensure_polling()
-                        self.logger.write(
-                            "opencode.stream.error",
-                            turn_id=turn_id,
-                            reason=str(event.get("reason") or "event_stream_error"),
-                            prompt_sent=prompt_sent,
-                        )
-                        continue
-                    last_event_ms = elapsed_ms(started)
-                    update = tracker.update_event(event)
-                    source = "event"
-                if not self.turn_is_active(turn_id):
-                    return
-                if tracker.stale_idles and not stale_idle_logged:
-                    stale_idle_logged = True
-                    self.logger.write("opencode.stream.stale_idle", turn_id=turn_id)
-                completed = await consume_update(update, source)
-                if completed:
-                    if not self.turn_is_active(turn_id):
-                        return
-                    stream_source = (
-                        "hybrid" if text_sources == {"event", "poll"} else next(iter(text_sources), source)
-                    )
-                    await self.complete_event_text_turn(
-                        session_id=session_id,
-                        before_messages=before_messages,
-                        turn_id=turn_id,
-                        started=started,
-                        chunker=chunker,
-                        speech_filter=speech_filter,
-                        event_text=full_text,
-                        stream_source=stream_source,
-                    )
-                    self.logger.write(
-                        "opencode.stream.done",
-                        turn_id=turn_id,
-                        latency_ms=elapsed_ms(started),
-                        last_event_ms=last_event_ms,
-                    )
-                    return
-
-            if self.turn_is_active(turn_id):
-                await self.send_json({"type": "turn.timeout", "turn_id": turn_id})
-                self.logger.write("turn.timeout", turn_id=turn_id, latency_ms=elapsed_ms(started), stream_source="event")
-                self.logger.state_transition("thinking", "voice_bridge_issue", turn_id=turn_id)
-                self.active_turn_id = None
-        finally:
-            if "poll_task" in locals() and poll_task is not None:
-                poll_task.cancel()
-                await asyncio.gather(poll_task, return_exceptions=True)
-            reader_task.cancel()
-            try:
-                await reader_task
-            except asyncio.CancelledError:
-                pass
-
-    async def read_opencode_events(
-        self,
-        session_id: str,
-        queue: asyncio.Queue[dict[str, Any]],
-        ready: asyncio.Event,
-    ) -> None:
-        try:
-            async for event in self.client.events(on_open=ready.set, directory=self.fork_directory):
-                if event_session_id(event) == session_id:
-                    await queue.put(event)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - event stream is an optimization; caller falls back.
-            if not ready.is_set():
-                ready.set()
-            await queue.put({"type": "_stream_error", "reason": repr(exc)})
-
-    async def poll_opencode_messages(
-        self,
-        *,
-        session_id: str,
-        queue: asyncio.Queue[dict[str, Any]],
-        turn_id: int,
-        interval_sec: float,
-        request_timeout_sec: float = 1.0,
-    ) -> None:
-        """Produce bounded polling observations without blocking SSE consumption."""
-
-        attempt = 0
-        try:
-            while self.turn_is_active(turn_id):
-                attempt += 1
-                started = time.perf_counter()
-                try:
-                    messages = await asyncio.wait_for(
-                        self.client.messages(session_id),
-                        timeout=request_timeout_sec,
-                    )
-                except asyncio.TimeoutError:
-                    self.logger.write(
-                        "opencode.stream.poll_hedge.timeout",
-                        turn_id=turn_id,
-                        attempt=attempt,
-                        timeout_ms=int(request_timeout_sec * 1000),
-                    )
-                    await queue.put({"type": "_poll_error", "reason": "timeout"})
-                except Exception as exc:  # noqa: BLE001 - SSE remains authoritative.
-                    self.logger.write(
-                        "opencode.stream.poll_hedge.error",
-                        turn_id=turn_id,
-                        attempt=attempt,
-                        error=repr(exc),
-                    )
-                    await queue.put({"type": "_poll_error", "reason": type(exc).__name__})
-                else:
-                    if attempt == 1 or attempt % 10 == 0:
-                        self.logger.write(
-                            "opencode.stream.poll_hedge.observation",
-                            turn_id=turn_id,
-                            attempt=attempt,
-                            latency_ms=elapsed_ms(started),
-                            message_count=len(messages),
-                        )
-                    await queue.put({"type": "_poll_messages", "messages": messages})
-                await asyncio.sleep(interval_sec)
-        except asyncio.CancelledError:
-            raise
-
-    async def complete_event_text_turn(
-        self,
-        session_id: str,
-        before_messages: list[dict[str, Any]],
-        turn_id: int,
-        started: float,
-        chunker: TTSChunker,
-        speech_filter: SpeechTextFilter,
-        event_text: str,
-        stream_source: str = "event",
-    ) -> None:
-        # Fetch the canonical message before closing TTS. OpenCode can expose
-        # session completion before its last part event reaches our SSE queue;
-        # any prefix-compatible suffix must pass through the ordinary delta
-        # and speech pipeline before provider EOF.
-        final_error: Any | None = None
-        try:
-            messages = await asyncio.wait_for(
-                self.client.messages(session_id),
-                timeout=1.0,
-            )
-        except asyncio.TimeoutError:
-            self.logger.write(
-                "opencode.stream.final_fetch.timeout",
-                turn_id=turn_id,
-                timeout_ms=1_000,
-            )
-            final_text = event_text
-        except Exception as exc:  # noqa: BLE001 - streamed text is already authoritative enough to finish.
-            self.logger.write(
-                "opencode.stream.final_fetch.error",
-                turn_id=turn_id,
-                error=repr(exc),
-            )
-            final_text = event_text
-        else:
-            if not self.turn_is_active(turn_id):
-                return
-            final_tracker = AssistantTextTracker(before_messages)
-            final_update = final_tracker.update(messages)
-            final_text = final_update.full_text or event_text
-            final_error = final_update.error
-        if final_text.startswith(event_text):
-            final_suffix = final_text[len(event_text) :]
-            if final_suffix:
-                await self.send_json(
-                    {"type": "assistant.delta", "turn_id": turn_id, "delta": final_suffix}
-                )
-                for chunk in chunker.push(speech_filter.push(final_suffix)):
-                    await self.speak(chunk, turn_id=turn_id)
-                    if not self.turn_is_active(turn_id):
-                        return
-                if stream_source == "event":
-                    stream_source = "hybrid"
-        elif final_text != event_text:
-            # Protocol v0 has append-only deltas, so a rewrite cannot retract
-            # already rendered text. Keep the canonical complete payload and
-            # avoid speaking a corrupt partial replacement.
-            self.logger.write(
-                "opencode.stream.final_rewrite",
-                turn_id=turn_id,
-                streamed_chars=len(event_text),
-                final_chars=len(final_text),
-            )
-        for chunk in chunker.push(speech_filter.flush()) + chunker.flush():
-            await self.speak(chunk, turn_id=turn_id)
-            if not self.turn_is_active(turn_id):
-                return
-        await self.finish_speaking_turn(turn_id)
-        if not self.turn_is_active(turn_id):
-            return
-        self.log_if_silent_completion(turn_id, final_text)
-        if final_error:
-            await self.send_json(
-                {
-                    "type": "turn.error",
-                    "turn_id": turn_id,
-                    "message": str(final_error)[:1000],
-                    "failure": classify_turn_failure(final_error),
-                }
-            )
-            self.logger.write("turn.error", turn_id=turn_id, error=final_error)
-        await self.send_json(
-            {
-                "type": "turn.complete",
-                "turn_id": turn_id,
-                "latency_ms": elapsed_ms(started),
-                "text": final_text,
-                "stream_source": stream_source,
-            }
-        )
-        self.logger.write(
-            "turn.complete",
-            turn_id=turn_id,
-            latency_ms=elapsed_ms(started),
-            response_chars=len(final_text),
-            stream_source=stream_source,
-        )
-        self.logger.state_transition(
-            "thinking",
-            "awaiting_playback" if self.turn_spoken_any else "ready",
-            turn_id=turn_id,
-        )
-        self.active_turn_id = None
-        await self.maybe_start_compaction(reason="turn_complete", run_in_background=True)
-
-    async def prompt_with_overflow_retry(
-        self,
-        session_id: str,
-        text: str,
-        tracker: AssistantTextTracker,
-        turn_id: int,
-    ) -> AssistantTextTracker:
-        overflow_compacted = False
-        while True:
-            try:
-                await self.client.prompt_text(session_id, text, self.config.model, agent=self.config.opencode_agent)
-                return tracker
-            except Exception as exc:  # noqa: BLE001 - only retry known context overflow failures.
-                if overflow_compacted or not is_context_overflow_error(exc):
-                    raise
-                overflow_compacted = True
-                messages = await self.read_messages(session_id)
-                update = tracker.update(messages)
-                before_tokens = max(active_context_estimate(messages).tokens, self.config.context_threshold_tokens)
-                self.logger.write(
-                    "turn.context_overflow",
-                    turn_id=turn_id,
-                    error=repr(exc),
-                    before_tokens=before_tokens,
-                    response_chars=len(update.full_text),
-                )
-                await self.send_json(
-                    {
-                        "type": "turn.context_overflow",
-                        "turn_id": turn_id,
-                        "before_tokens": before_tokens,
-                    }
-                )
-                outcome = await self.maybe_start_compaction(
-                    reason="context_overflow_error",
-                    run_in_background=False,
-                    force=True,
-                )
-                if outcome is None or not outcome.completed:
-                    raise exc
-                tracker = AssistantTextTracker(await self.read_messages(session_id))
-
     def build_speaker(self) -> TTSProvider:
         async def deliver(token: PlaybackToken, data: bytes) -> None:
             if (
@@ -3289,6 +2973,13 @@ class VoiceConnection:
                 return
             await self.send_tts_audio(data, token)
 
+        return self.build_tts_provider(deliver, self.handle_tts_provider_event)
+
+    def build_tts_provider(
+        self,
+        on_audio: Callable[[PlaybackToken, bytes], Awaitable[None]],
+        on_event: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> TTSProvider:
         if self.config.tts_provider == "cartesia":
             return CartesiaTTSProvider(
                 CartesiaTTSOptions(
@@ -3298,8 +2989,8 @@ class VoiceConnection:
                     version=self.config.cartesia_version,
                     sample_rate=self.config.tts_sample_rate,
                 ),
-                deliver,
-                self.handle_tts_provider_event,
+                on_audio,
+                on_event,
             )
         return DeepgramTTSProvider(
             DeepgramTTSOptions(
@@ -3307,8 +2998,8 @@ class VoiceConnection:
                 model=self.config.deepgram_tts_model,
                 sample_rate=self.config.tts_sample_rate,
             ),
-            deliver,
-            self.handle_tts_provider_event,
+            on_audio,
+            on_event,
         )
 
     async def handle_tts_provider_event(self, event: dict[str, Any]) -> None:
@@ -3590,15 +3281,6 @@ class VoiceConnection:
                 }
             )
 
-    def log_if_silent_completion(self, turn_id: int, response_text: str) -> None:
-        """A completed turn with real reply text but zero speak() calls means
-        the speech filter stripped everything (e.g. an all-code, no-prose
-        reply) — the turn finishes normally and silently, which looks
-        identical to a hang from the user's side. Diagnostic only; no
-        fallback utterance is sent."""
-        if response_text.strip() and not self.turn_spoken_any:
-            self.logger.write("tts.no_speakable_text", turn_id=turn_id, response_chars=len(response_text))
-
     async def interrupt_playback(self, reason: str) -> bool:
         """Stop the active turn and any speakers; the single owner of the
         speak-generation bump that keeps stale TTS audio off the wire.
@@ -3631,7 +3313,7 @@ class VoiceConnection:
         interrupted_turn_id = self.active_turn_id
         if interrupted_turn_id is not None:
             self.logger.write("turn.abort", turn_id=interrupted_turn_id, reason=reason)
-            self.cancel_tool_hold(interrupted_turn_id)
+            self.stop_work_feedback(interrupted_turn_id, reason)
         self.active_turn_id = None
         if self.speaker and cancelled_token:
             # The generation fence is already complete. Provider cancellation
@@ -4629,22 +4311,11 @@ class SidepodConnection(VoiceConnection):
                         playback_generation=token.generation,
                     )
             return
-        if self.native_speaker is None:
-            speaker = NativeSpeakerSession(
-                config=self.config,
-                logger=self.logger,
-                on_issue=self.send_json,
-                on_render=self.feed_render_reference,
-                on_drain=self.on_playback_drained,
-                on_first_frame=self.on_first_playback_frame,
-            )
-            if not await speaker.start():
-                self.native_speaker_unavailable = True
-                return
-            speaker.playback_generation = self.speak_generation
-            speaker.begin_turn(token)
-            self.native_speaker = speaker
-        if not await self.native_speaker.play(data, token):
+        speaker = await self.ensure_native_speaker_output()
+        if speaker is None:
+            return
+        speaker.begin_turn(token)
+        if not await speaker.play(data, token):
             if token.generation != self.speak_generation:
                 self.stale_tts_chunks += 1
                 self.logger.write(
@@ -4666,6 +4337,14 @@ class SidepodConnection(VoiceConnection):
 
     async def on_first_playback_frame(self, token: PlaybackToken) -> None:
         """`speaking` begins at device exposure, never provider arrival."""
+        feedback = self.feedback_by_token.get(token)
+        if feedback is not None:
+            self.logger.write(
+                "feedback.speech.first_audio",
+                turn_id=feedback.turn_id,
+                playback_generation=token.generation,
+            )
+            return
         if token.generation != self.speak_generation or self.tts_first_audio_seen:
             return
         self.tts_first_audio_seen = True
@@ -4725,6 +4404,15 @@ class SidepodConnection(VoiceConnection):
         self.logger.write(event_type, **detail)
 
     async def on_playback_drained(self, token: PlaybackToken | None = None) -> None:
+        feedback = self.feedback_by_token.get(token) if token is not None else None
+        if feedback is not None:
+            feedback.drained.set()
+            self.logger.write(
+                "feedback.speech.drain",
+                turn_id=feedback.turn_id,
+                playback_generation=token.generation,
+            )
+            return
         legacy_id = token.turn_id if token is not None else None
         if legacy_id is None:
             pending_ids = [item_id for item_id, seam in self.turn_seams.items() if seam.pending_complete]
@@ -4892,6 +4580,8 @@ class SidepodConnection(VoiceConnection):
             return payload
         if message_type == "turn.start":
             return self.translate_turn_start(payload)
+        if message_type == "turn.activity":
+            return self.translate_thinking_activity(payload)
         if message_type in {"compaction.wait", "compaction.continuing", "compaction.try_again", "compaction.wait.timeout"}:
             phase = {
                 "compaction.wait": "preparing_context",
@@ -4964,6 +4654,7 @@ class SidepodConnection(VoiceConnection):
             "sentAt": iso_utc_now(),
             "turnId": lane_id,
             "sourceMode": "live",
+            "activity": "reasoning",
             "submittedTextChars": len(str(payload.get("text") or "")),
         }
         if self.voice_lane_id:
@@ -4979,6 +4670,21 @@ class SidepodConnection(VoiceConnection):
             "turnId": lane_id,
             "sourceMode": "live",
             "phase": phase,
+        }
+        if self.voice_lane_id:
+            out["voiceLaneId"] = self.voice_lane_id
+        return out
+
+    def translate_thinking_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        lane_id = self.lane_turn_id(legacy_id) if legacy_id in self.turn_seams else self.ensure_pending_turn()
+        out: dict[str, Any] = {
+            "type": "thinking",
+            "sentAt": iso_utc_now(),
+            "turnId": lane_id,
+            "sourceMode": "live",
+            "phase": "responding",
+            "activity": str(payload.get("activity") or "reasoning"),
         }
         if self.voice_lane_id:
             out["voiceLaneId"] = self.voice_lane_id
@@ -5019,7 +4725,7 @@ class SidepodConnection(VoiceConnection):
             out["firstAudioLatencyMs"] = first_audio_ms
             if seam.completed:
                 # The turn's latency record already went out at text-complete;
-                # streamed turns usually reach first audio only afterwards.
+                # validated display text can reach COMMS before device audio.
                 self.logger.write(
                     "sidepod.turn.latency.audio",
                     turn_id=seam.lane_id,

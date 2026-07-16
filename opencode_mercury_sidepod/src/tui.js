@@ -101,15 +101,16 @@ function frame(title, children, color, borderColor, style = "heavy") {
   return lines.map((item) => line(item.text, item.color));
 }
 
-function renderBrailleOrb(phase, active, captionColor, label) {
+function renderBrailleOrb(phase, active, captionColor, label, workActive = false) {
   const cols = 12;
   const rows = 6;
   const subWidth = cols * 2;
   const subHeight = rows * 4;
   const cx = (subWidth - 1) / 2;
   const cy = (subHeight - 1) / 2;
-  const radius = active ? 8.95 : 8.35;
-  const haloRadius = active ? radius + 1.25 : radius;
+  const motionPhase = workActive ? phase * 2 : phase;
+  const radius = active ? (workActive ? 9.2 : 8.95) : 8.35;
+  const haloRadius = active ? radius + (workActive ? 1.55 : 1.25) : radius;
   const output = [];
 
   for (let cellY = 0; cellY < rows; cellY += 1) {
@@ -125,8 +126,8 @@ function renderBrailleOrb(phase, active, captionColor, label) {
           const dist = Math.sqrt(dx * dx + dy * dy);
           const stableShell = dist <= radius;
           const protectedEdge = dist > radius - 0.9 && stableShell;
-          const airPocket = active && dist < radius - 1.9 && texture(x, y, phase) < 0.03;
-          const halo = active && dist > radius && dist <= haloRadius && radiates(x, y, phase, dist, radius, cx, cy);
+          const airPocket = active && dist < radius - 1.9 && texture(x, y, motionPhase) < 0.03;
+          const halo = active && dist > radius && dist <= haloRadius && radiates(x, y, motionPhase, dist, radius, cx, cy);
           if ((stableShell && (protectedEdge || !airPocket)) || halo) {
             bits |= BRAILLE_BITS[localY][localX];
           }
@@ -223,6 +224,7 @@ function renderHero(state, theme) {
   const secondaryAccent = theme.secondary;
   const ok = theme.success;
   const active = state.micLive || state.laneStatus === "thinking" || state.laneStatus === "speaking";
+  const workActive = ["searching", "inspecting", "working", "finishing"].includes(state.laneActivity);
   const color = active ? ok : muted;
   const border = state.focused ? secondaryAccent : accent;
   return [
@@ -235,7 +237,8 @@ function renderHero(state, theme) {
           state.phase,
           active,
           secondaryAccent,
-          orbLabel(state.laneStatus, state.micLive, state.micDesired)
+          orbLabel(state.laneStatus, state.micLive, state.micDesired),
+          workActive
         ).map((item) =>
           typeof item === "string"
             ? center(item, INNER)
@@ -500,6 +503,7 @@ export async function tui(api) {
     // idle -> connecting -> ready/thinking/speaking, or offline when the
     // helper cannot be reached. Drives the hero caption and prompt annex.
     const [getLaneStatus, setLaneStatus] = createSignal("idle");
+    const [getLaneActivity, setLaneActivity] = createSignal(null);
     const [getModal, setModal] = createSignal(null);
     const [getModalScroll, setModalScroll] = createSignal(0);
     const [getPhase, setPhase] = createSignal(0);
@@ -818,6 +822,9 @@ export async function tui(api) {
       mutate(() => {
         if (ui.status) {
           setLaneStatus(ui.status === "ended" ? "idle" : ui.status);
+        }
+        if (ui.activity !== undefined) {
+          setLaneActivity(ui.activity);
         }
         if (typeof ui.micLive === "boolean") {
           setMicLive(ui.micLive);
@@ -1201,6 +1208,7 @@ export async function tui(api) {
         micDesired: getMicDesired(),
         focused: getFocused(),
         laneStatus: getLaneStatus(),
+        laneActivity: getLaneActivity(),
         phase: getPhase(),
         userText: getUserText(),
         assistantText: getAssistantText(),

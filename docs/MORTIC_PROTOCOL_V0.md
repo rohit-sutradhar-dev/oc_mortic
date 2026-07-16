@@ -423,6 +423,7 @@ Optional fields:
 - `voiceLaneId`: active voice lane id.
 - `submittedTextChars`: character count of submitted user text, not the raw text.
 - `phase`: optional backward-compatible presentation hint. `responding` is the ordinary state; `preparing_context`, `continuing`, and `try_again` provide concise compaction-blocking copy without exposing tokens or provider details.
+- `activity`: optional backward-compatible work hint: `reasoning`, `searching`, `inspecting`, `working`, or `finishing`. Renderers may use it for transient COMMS copy and orb motion, but must not persist it into Transcript or Handoff.
 
 Example:
 
@@ -439,7 +440,9 @@ Example:
 
 ### `assistant.delta`
 
-Sent for streamed assistant text that COMMS can render as the current Mortic response.
+Carries admitted assistant display text. The structured-only engine emits one
+atomic delta after final validation; clients retain sequence handling for
+protocol compatibility and stale-event protection.
 
 Required fields:
 

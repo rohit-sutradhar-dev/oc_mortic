@@ -55,6 +55,7 @@ _SPOKEN_PUNCTUATION_RE = re.compile(
     r"\b(?:slash|dot|equals)\b",
     re.IGNORECASE,
 )
+_SPOKEN_BRACKET_GLYPH_RE = re.compile(r"[()\[\]{}<>]")
 _CODE_ASSIGNMENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*[^\s,;]+")
 _PROVIDER_RE = re.compile(r"\b(?:mercury|inception|deepgram|cartesia|flux|aura)\b", re.IGNORECASE)
 _NON_WORD_RE = re.compile(r"[^\w%$]+", re.UNICODE)
@@ -442,6 +443,14 @@ def evaluate_response(value: Any, case: ResponseCase, workspace_root: str | None
             "Replace the filename or notation with a natural role derived from its basename and distinguishing folder; "
             "for example, release/status.md becomes 'the release status file.' Never substitute an unrelated generic "
             "role, and never say slash, dot, equals, open bracket, or close bracket.",
+        ),
+        (
+            "spoken_bracket_notation",
+            not _SPOKEN_BRACKET_GLYPH_RE.search(envelope.spoken_text),
+            "Remove every literal parenthesis, square bracket, brace, and angle bracket from spokenText. "
+            "Preserve the meaning in natural speech instead: say 'priority one' for [P1], 'the first item' "
+            "for items[0], 'a map from strings to T' for Map<string, T>, 'the refresh function' for "
+            "refresh(options), and fold parenthetical qualifications into the sentence.",
         ),
     ]
     for code, passed, repair in spoken_checks:

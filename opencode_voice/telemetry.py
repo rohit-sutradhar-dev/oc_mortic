@@ -142,7 +142,10 @@ def snapshot_voice_config(
     return TelemetryConfigSnapshot(
         tts_provider=_safe_label(getattr(config, "tts_provider", "unknown")),
         duplex_mode=_safe_label(getattr(config, "voice_duplex", "unknown")),
-        response_mode=_safe_label(getattr(config, "response_mode", "legacy")),
+        # Kept in the v1 telemetry schema as a fixed categorical field so old
+        # run-comparison tooling remains readable after the runtime selector
+        # and legacy response implementation are removed.
+        response_mode="structured",
         capture_sample_rate_hz=device_rate if capture_sample_rate_hz is None else capture_sample_rate_hz,
         playback_sample_rate_hz=device_rate if playback_sample_rate_hz is None else playback_sample_rate_hz,
         stt_sample_rate_hz=stt_rate if stt_sample_rate_hz is None else stt_sample_rate_hz,

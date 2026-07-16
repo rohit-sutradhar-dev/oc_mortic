@@ -146,7 +146,7 @@ class VoiceConfig:
     max_turn_sec: float = 300.0
     run_root: str = "runs/voice"
     deepgram_stt_model: str = "flux-general-en"
-    deepgram_tts_model: str = "aura-2-thalia-en"
+    deepgram_tts_model: str = "aura-2-jupiter-en"
     # Flux is fixed to a narrow-band transport clock.  TTS and the physical
     # device deliberately have separate clocks; conflating all three was the
     # reason provider-sized chunks were being written directly to a 16 kHz
@@ -174,10 +174,6 @@ class VoiceConfig:
     # gate the mic while TTS is audible. "full": raw passthrough (headphones).
     # "half": force the gate.
     voice_duplex: str = "auto"
-    # Canary switch for the strict display/spoken response contract. Keep the
-    # legacy path available for one release until both TTS provider matrices
-    # pass on real devices.
-    response_mode: str = "legacy"
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False

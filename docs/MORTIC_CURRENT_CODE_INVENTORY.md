@@ -10,11 +10,11 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 
 ## Repository Shape
 
-- `opencode_voice/` is the invisible Python/FastAPI helper. It owns native capture/playout, OpenCode session/fork calls, Flux STT, provider-neutral TTS, turn execution, speech filtering, compaction, and interruption handling.
+- `opencode_voice/` is the invisible Python/FastAPI helper. It owns native capture/playout, OpenCode session/fork calls, Flux STT, provider-neutral TTS, structured turn execution, response validation, compaction, work feedback, and interruption handling.
 - `opencode_mercury_sidepod/` is the native OpenCode TUI sidepod and communicates with the helper over protocol v0.
 - `docs/` contains the current PRD and execution plan.
 - `MORTIC_PLUGIN_HANDOFF.md` records the earlier bridge-plus-sidepod integration proposal. Some recommendations there are now superseded by the PRD, especially visible browser UI and packaged typed fallback.
-- `tests/test_opencode_voice.py` covers the Python bridge helpers, protocol parsers, event trackers, context estimation, Deepgram URL/message parsing, TTS chunking, and speech filtering.
+- `tests/test_opencode_voice.py` covers the Python bridge helpers, protocol parsers, context estimation, Deepgram URL/message parsing, and TTS chunking. Structured response, notation, and safety validation live in the response-contract suites.
 
 ## Reusable Code
 
@@ -24,15 +24,15 @@ This inventory gives Platform and Engine a shared factual map of the current rep
   - Reusable OpenCode API client for health, sessions, fork/delete, summarize, abort, synchronous prompt, `prompt_async`, `/event` SSE parsing, and message fetch.
   - `SSEParser` already has focused unit coverage for multiline and malformed frames.
 - `opencode_voice/server.py`
-  - `VoiceConnection` has reusable voice-lane orchestration: source session tracking, fork creation, fork cleanup, turn ids, barge-in, event-first turn execution, polling fallback, TTS streaming, context overflow retry, and compaction.
+  - `VoiceConnection` has reusable voice-lane orchestration: source session tracking, fork creation, fork cleanup, turn ids, barge-in, structured event observation with a polling hedge, TTS streaming, work feedback, context overflow retry, and compaction.
   - `DeepgramFluxSession` wraps the bounded, epoch-aware Flux sender; provider-neutral TTS lives in `tts_providers.py` with persistent Deepgram and Cartesia implementations.
   - `device_audio.py` owns the persistent device-clocked duplex stream, render reference, bounded jitter buffer, and generation-safe playout; `interruption.py` owns pure episode decisions.
   - `EPHEMERAL_PREFIX` and keep/delete behavior are useful starting points for source-thread safety.
 - `opencode_voice/deepgram.py`
-  - `build_flux_url`, `parse_flux_message`, `build_tts_url`, `TTSChunker`, `FlushLimiter`, and `SpeechTextFilter` are reusable.
-  - Speech filtering is product-critical because code, diffs, commands, paths, and JSON must stay screen-only.
+  - `build_flux_url`, `parse_flux_message`, `build_tts_url`, `TTSChunker`, and `FlushLimiter` are reusable.
+  - Legacy speech rewriting/filtering has been removed. Mercury produces separate display and spoken fields, and deterministic validation fails closed on unsafe output.
 - `opencode_voice/state.py`
-  - Context estimation, summary reset behavior, assistant delta tracking, and OpenCode event turn tracking are reusable for Engine compaction and streaming.
+  - Context estimation and summary reset behavior are reusable for Engine compaction. Structured event/message tracking lives in `response_contract.py` and `structured_turn.py`.
 - `opencode_voice/__main__.py`
   - Managed OpenCode startup, server detection, config overlay rendering, port selection, and CLI shape are useful for local helper launch/discovery design.
 - `opencode_voice/voice_agent.md`
@@ -64,15 +64,13 @@ This inventory gives Platform and Engine a shared factual map of the current rep
 - Ephemeral fork safety
   - Current bridge forks the chosen source session, switches model/agent on the fork, tags the fork title with `[voice tmp]`, and deletes the fork on close/stop when `keep_fork` is false.
   - Risk: source-thread untouched assertions are not yet tested end to end.
-- Event-first OpenCode streaming
-  - Current turn path opens `/event`, sends `prompt_async`, tracks assistant deltas, and falls back to polling when stream setup or stream delivery fails.
-  - This is central to the latency target.
-- Polling fallback
-  - Existing fallback can continue a turn after event stream failure, including a path for `poll_after_event`.
+- Event-first structured OpenCode turns
+  - Current turn path opens `/event`, sends `prompt_async` with strict structured output, tracks tool/final lifecycle, and hedges with polling when stream setup or delivery stalls.
+  - Only the final validated object is admitted. Existing `poll_after_event` compatibility remains for the hedge result.
 - Barge-in
   - Speech start/resume and manual barge-in close TTS, clear the active turn id, and best-effort abort the OpenCode fork turn.
-- Speech filtering
-  - Existing unit tests prove fenced code, markdown code details, commands, identifiers, and file names are removed or generalized before speech.
+- Structured response safety
+  - Existing unit tests prove invalid schema, secrets, paths, raw JSON, Markdown, URLs, code/commands, provider names, and spoken bracket notation are rejected or repaired before screen/TTS admission.
 - Context handling
   - Active context estimation, 70k threshold, proactive compaction, wait-on-compaction, and compact-and-retry on context overflow are implemented.
 - Safe local dev configuration

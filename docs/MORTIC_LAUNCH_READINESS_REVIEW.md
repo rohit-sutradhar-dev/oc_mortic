@@ -14,7 +14,7 @@ Documentation and ticket quality are excellent, and the scariest technical unkno
 - PRD is high quality: explicit non-goals, full state machine, v0 protocol contract, acceptance criteria at product/technical/UX levels, encoded decisions.
 - Execution plan cleanly splits Platform/Engine/Shared with mutual acceptance criteria per phase.
 - Sampled tickets (MOR-88, MOR-135, MOR-137) all have goal, owner track, affected modules, acceptance criteria, dependencies.
-- Real reusable engine assets exist: `opencode_voice/server.py` (fork lifecycle, event-first streaming, polling fallback, barge-in, compaction), `deepgram.py` (STT/TTS, SpeechTextFilter), `opencode_client.py` (SSE parser), `state.py` (context estimation).
+- Real reusable engine assets exist: `opencode_voice/server.py` (fork lifecycle, structured event observation, polling hedge, work feedback, barge-in, compaction), `deepgram.py` (STT transport and TTS helpers), `tts_providers.py` (Deepgram/Cartesia), `opencode_client.py` (SSE parser), and `state.py` (context estimation).
 - The code inventory (MOR-133) is honest — it flags most of the real gaps itself.
 
 ## Critical Risks (ranked)

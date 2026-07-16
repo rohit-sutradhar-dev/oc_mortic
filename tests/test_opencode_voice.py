@@ -22,13 +22,11 @@ from opencode_voice.config import (
     render_opencode_config,
     voice_bridge_issue_payload,
 )
-from opencode_voice.deepgram import FlushLimiter, SpeechTextFilter, TTSChunker, build_flux_url, parse_flux_message
+from opencode_voice.deepgram import FlushLimiter, TTSChunker, build_flux_url, parse_flux_message
 from opencode_voice.logging import RunLogger
 from opencode_voice.opencode_client import OpenCodeClient, SSEParser
 from opencode_voice.server import SIDEPOD_PROTOCOL_VERSION, create_app, helper_readiness_issues
 from opencode_voice.state import (
-    AssistantTextTracker,
-    OpenCodeEventTurnTracker,
     active_context_estimate,
     event_session_id,
     session_context_tokens,
@@ -573,59 +571,6 @@ class TokenTests(unittest.TestCase):
         self.assertIsNone(estimate.summary_message_id)
 
 
-class AssistantTrackerTests(unittest.TestCase):
-    def test_tracks_only_new_assistant_delta(self) -> None:
-        before = [
-            {
-                "info": {"id": "msg_old", "role": "assistant", "time": {"completed": 1}},
-                "parts": [{"type": "text", "text": "old text"}],
-            }
-        ]
-        tracker = AssistantTextTracker(before)
-        update = tracker.update(
-            before
-            + [
-                {
-                    "info": {"id": "msg_new", "role": "assistant", "time": {"created": 2}},
-                    "parts": [{"type": "text", "text": "hel"}],
-                }
-            ]
-        )
-        self.assertEqual(update.deltas, ["hel"])
-        update = tracker.update(
-            before
-            + [
-                {
-                    "info": {"id": "msg_new", "role": "assistant", "time": {"created": 2, "completed": 3}},
-                    "parts": [{"type": "text", "text": "hello"}],
-                }
-            ]
-        )
-        self.assertEqual(update.deltas, ["lo"])
-        self.assertTrue(update.completed)
-        self.assertEqual(update.full_text, "hello")
-
-    def test_tracks_new_zero_text_assistant_error(self) -> None:
-        tracker = AssistantTextTracker([])
-        update = tracker.update(
-            [
-                {
-                    "info": {
-                        "id": "msg_err",
-                        "role": "assistant",
-                        "time": {"created": 1, "completed": 2},
-                        "error": {"name": "APIError"},
-                    },
-                    "parts": [],
-                }
-            ]
-        )
-
-        self.assertEqual(update.message_id, "msg_err")
-        self.assertTrue(update.completed)
-        self.assertEqual(update.error, {"name": "APIError"})
-
-
 class SSEParserTests(unittest.TestCase):
     def test_parses_multiline_data_frame(self) -> None:
         parser = SSEParser()
@@ -646,6 +591,33 @@ class SSEParserTests(unittest.TestCase):
 
 
 class OpenCodeStructuredMessageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejected_legacy_tail_keeps_the_v2_projection(self) -> None:
+        projected = [
+            {"info": {"id": "msg_user", "role": "user"}, "parts": []},
+            {"info": {"id": "msg_assistant", "role": "assistant"}, "parts": []},
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.startswith("/api/session/"):
+                return httpx.Response(200, json={"data": projected, "cursor": None})
+            return httpx.Response(
+                400,
+                json={"name": "BadRequest", "data": {"message": "retryCount decode failed"}},
+            )
+
+        client = OpenCodeClient("http://opencode.test")
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(
+            base_url="http://opencode.test",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            messages = await client.messages_for_tracking("ses_structured")
+        finally:
+            await client.close()
+
+        self.assertEqual(messages, projected)
+
     async def test_empty_v2_projection_falls_back_to_decodable_legacy_tail(self) -> None:
         recent = [
             {"info": {"id": "msg_user", "role": "user"}, "parts": []},
@@ -698,248 +670,6 @@ class OpenCodeStructuredMessageCompatibilityTests(unittest.IsolatedAsyncioTestCa
             await client.close()
 
         self.assertEqual(messages, [summary, *recent])
-
-
-class OpenCodeEventTurnTrackerTests(unittest.TestCase):
-    # OpenCode 1.17 nests sessionID per event family (`properties.info` for
-    # message.updated, `properties.part` for message.part.updated); only
-    # session-level events keep it top-level. These tests use the real shapes.
-    def test_ignores_user_text_part_updates(self) -> None:
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
-        tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"info": {"id": "msg_user", "role": "user", "sessionID": "ses_1"}},
-            }
-        )
-
-        update = tracker.update(
-            {
-                "type": "message.part.updated",
-                "properties": {
-                    "part": {
-                        "id": "prt_1",
-                        "sessionID": "ses_1",
-                        "messageID": "msg_user",
-                        "type": "text",
-                        "text": "hello",
-                    },
-                },
-            }
-        )
-
-        self.assertEqual(update.deltas, [])
-        self.assertEqual(update.full_text, "")
-
-    def test_accepts_assistant_text_delta(self) -> None:
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids={"msg_old"})
-        tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
-            }
-        )
-
-        update = tracker.update(
-            {
-                "type": "message.part.delta",
-                "properties": {
-                    "sessionID": "ses_1",
-                    "messageID": "msg_new",
-                    "partID": "prt_1",
-                    "field": "text",
-                    "delta": "hel",
-                },
-            }
-        )
-
-        self.assertEqual(update.deltas, ["hel"])
-        self.assertEqual(update.full_text, "hel")
-
-    def test_deduplicates_full_text_updates(self) -> None:
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
-        tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"info": {"id": "msg_new", "role": "assistant", "sessionID": "ses_1"}},
-            }
-        )
-
-        def part_updated(text: str) -> dict[str, object]:
-            return {
-                "type": "message.part.updated",
-                "properties": {
-                    "part": {
-                        "id": "prt_1",
-                        "sessionID": "ses_1",
-                        "messageID": "msg_new",
-                        "type": "text",
-                        "text": text,
-                    },
-                },
-            }
-
-        first = tracker.update(part_updated("hel"))
-        second = tracker.update(part_updated("hello"))
-        duplicate = tracker.update(part_updated("hello"))
-
-        self.assertEqual(first.deltas, ["hel"])
-        self.assertEqual(second.deltas, ["lo"])
-        self.assertEqual(duplicate.deltas, [])
-        self.assertEqual(duplicate.full_text, "hello")
-
-    def test_accepts_delta_only_part_updates(self) -> None:
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
-        tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"info": {"id": "msg_new", "role": "assistant", "sessionID": "ses_1"}},
-            }
-        )
-
-        def delta_update(delta: str) -> dict[str, object]:
-            return {
-                "type": "message.part.updated",
-                "properties": {
-                    "delta": delta,
-                    "part": {
-                        "id": "prt_1",
-                        "sessionID": "ses_1",
-                        "messageID": "msg_new",
-                        "type": "text",
-                        "text": "",
-                    },
-                },
-            }
-
-        first = tracker.update(delta_update("hel"))
-        second = tracker.update(delta_update("lo"))
-
-        self.assertEqual(first.deltas, ["hel"])
-        self.assertEqual(second.deltas, ["lo"])
-        self.assertEqual(second.full_text, "hello")
-
-    def test_ignores_nested_events_for_other_sessions(self) -> None:
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
-        tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"info": {"id": "msg_other", "role": "assistant", "sessionID": "ses_2"}},
-            }
-        )
-
-        update = tracker.update(
-            {
-                "type": "message.part.updated",
-                "properties": {
-                    "part": {
-                        "id": "prt_1",
-                        "sessionID": "ses_2",
-                        "messageID": "msg_other",
-                        "type": "text",
-                        "text": "not ours",
-                    },
-                },
-            }
-        )
-
-        self.assertEqual(update.deltas, [])
-        self.assertEqual(update.full_text, "")
-
-    def test_completes_on_session_idle_after_assistant_message(self) -> None:
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
-        tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
-            }
-        )
-
-        update = tracker.update({"type": "session.idle", "properties": {"sessionID": "ses_1"}})
-
-        self.assertTrue(update.completed)
-        self.assertEqual(tracker.stale_idles, 0)
-
-    def test_idle_before_any_assistant_message_is_stale_not_completion(self) -> None:
-        # A session.idle left over from the previous (aborted) turn can arrive
-        # on the new turn's subscription before our prompt produces anything;
-        # honoring it used to force the poll fallback with an empty turn.
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
-
-        stale = tracker.update({"type": "session.idle", "properties": {"sessionID": "ses_1"}})
-
-        self.assertFalse(stale.completed)
-        self.assertEqual(tracker.stale_idles, 1)
-
-        tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
-            }
-        )
-        update = tracker.update({"type": "session.idle", "properties": {"sessionID": "ses_1"}})
-
-        self.assertTrue(update.completed)
-
-    def test_parts_before_the_role_event_are_buffered_and_replayed(self) -> None:
-        # On a fast turn the text parts can precede the message.updated that
-        # tags the message as assistant; dropping them left an empty turn that
-        # forced the poll fallback. They must be buffered and replayed.
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
-
-        early = tracker.update(
-            {
-                "type": "message.part.updated",
-                "properties": {
-                    "part": {
-                        "id": "prt_1",
-                        "sessionID": "ses_1",
-                        "messageID": "msg_new",
-                        "type": "text",
-                        "text": "hello there",
-                    },
-                },
-            }
-        )
-        self.assertEqual(early.deltas, [])  # role unknown: held, not applied yet
-
-        replayed = tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"sessionID": "ses_1", "info": {"id": "msg_new", "role": "assistant"}},
-            }
-        )
-
-        self.assertEqual(replayed.deltas, ["hello there"])
-        self.assertEqual(replayed.full_text, "hello there")
-
-    def test_buffered_parts_for_a_user_message_are_discarded(self) -> None:
-        tracker = OpenCodeEventTurnTracker("ses_1", existing_message_ids=set())
-        tracker.update(
-            {
-                "type": "message.part.updated",
-                "properties": {
-                    "part": {
-                        "id": "prt_1",
-                        "sessionID": "ses_1",
-                        "messageID": "msg_user",
-                        "type": "text",
-                        "text": "my question",
-                    },
-                },
-            }
-        )
-
-        resolved = tracker.update(
-            {
-                "type": "message.updated",
-                "properties": {"info": {"id": "msg_user", "role": "user", "sessionID": "ses_1"}},
-            }
-        )
-
-        self.assertEqual(resolved.deltas, [])
-        self.assertEqual(resolved.full_text, "")
-        self.assertEqual(tracker.pending_parts, {})
 
 
 class EventSessionIdTests(unittest.TestCase):
@@ -1142,47 +872,6 @@ class TTSTests(unittest.TestCase):
         self.assertTrue(limiter.allow(now=1))
         self.assertFalse(limiter.allow(now=2))
         self.assertTrue(limiter.allow(now=11))
-
-    def test_speech_filter_removes_fenced_code(self) -> None:
-        filter_ = SpeechTextFilter()
-
-        spoken = filter_.push("Here is the file.\n```python\nprint('nope')\n```\nDone.\n")
-
-        self.assertIn("Here is the file.", spoken)
-        self.assertNotIn("print", spoken)
-        self.assertIn("Done.", spoken)
-
-    def test_speech_filter_removes_markdown_code_details(self) -> None:
-        filter_ = SpeechTextFilter()
-
-        spoken = filter_.push(
-            "I created **`paninian_tokenizer.py`** in the project root.\n"
-            "It provides a simple pipeline:\n"
-            "1. **`basic_tokenize`** - splits text into words and punctuation.\n"
-            "2. **`sandhi_split`** - naive Sandhi splitter.\n"
-            "You can run the script directly:\n"
-            "```bash\n"
-            "python paninian_tokenizer.py\n"
-            "```\n"
-            "or import `parse_sentence` in your own code.\n"
-        )
-
-        self.assertIn("I created the file in the project root.", spoken)
-        self.assertIn("It provides a simple pipeline.", spoken)
-        self.assertNotIn("paninian_tokenizer.py", spoken)
-        self.assertNotIn("basic_tokenize", spoken)
-        self.assertNotIn("sandhi_split", spoken)
-        self.assertNotIn("python paninian_tokenizer.py", spoken)
-        self.assertNotIn("parse_sentence", spoken)
-
-    def test_speech_filter_releases_safe_partial_sentences(self) -> None:
-        filter_ = SpeechTextFilter()
-
-        spoken = filter_.push("Done. I am still forming the next sentence")
-
-        self.assertEqual(spoken, "Done.")
-        self.assertEqual(filter_.flush(), "I am still forming the next sentence")
-
 
 class NativeSpeakerPlaybackTests(unittest.IsolatedAsyncioTestCase):
     """Playback buffering: TTS delivers faster than realtime, so play() must

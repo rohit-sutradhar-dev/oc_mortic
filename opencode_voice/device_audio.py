@@ -310,6 +310,12 @@ class PersistentDeviceAudioEngine:
         with self._buffer_lock:
             return token in self._terminal_tokens
 
+    def turn_has_started(self, token: PlaybackToken) -> bool:
+        """Return whether non-silent PCM for this token reached PortAudio."""
+
+        with self._buffer_lock:
+            return token in self._first_frame_tokens
+
     def invalidate_generation(self, generation: int | None = None) -> int:
         """Atomically fence queued/acquired frames and wake blocked producers."""
 

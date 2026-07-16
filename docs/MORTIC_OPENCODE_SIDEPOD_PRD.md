@@ -39,7 +39,7 @@ OpenCode is already where the developer thinks, edits, and supervises agent work
 - the user speaks naturally;
 - Mortic responds quickly with speakable prose;
 - code, diffs, commands, paths, and JSON remain screen-only;
-- the current spoken turn is visible while it streams;
+- the submitted turn and truthful work activity are visible immediately, followed by one atomic validated answer;
 - the user can interrupt, refresh/reset, or hand off without touching the mouse.
 
 ## 3. Goals
@@ -52,7 +52,7 @@ OpenCode is already where the developer thinks, edits, and supervises agent work
 6. Keep Deepgram Flux STT and Deepgram Speak/Aura TTS behind an invisible local bridge/native helper.
 7. Maintain ephemeral fork safety: source OpenCode thread remains untouched unless the user explicitly chooses to copy/apply handoff text.
 8. Support mouse interaction, but design for keyboard-first use.
-9. Make the current turn legible while it is happening, including streaming assistant text and spoken TTS progress.
+9. Make the current turn legible while it is happening: show recognition and generic work activity immediately, then replace it atomically with the validated assistant response.
 10. Provide a high-quality PRD artifact that can be annotated before implementation begins.
 
 ## 4. Non-Goals
@@ -389,13 +389,13 @@ M key isolation rule: after `/mortic` focuses the sidebar, `M` must be captured 
 COMMS is not the full transcript. It is the current spoken interaction lane. It should show what the user most needs while speaking:
 
 - current user utterance as it is recognized;
-- current assistant response as it streams;
-- speech-only assistant text, not raw code/diffs/JSON;
+- transient, generic work activity while the answer is pending;
+- the final validated display response, atomically admitted separately from the natural spoken response;
 - enough context to know whether Mortic heard correctly and is responding.
 
 ### 10.2 Behavior
 
-COMMS should rerender as text arrives. If the current turn cannot fit in the box, it should auto-scroll to keep the most recent relevant text visible.
+COMMS should rerender as recognition or work activity changes. The final answer replaces progress atomically. If the current turn cannot fit in the box, it should auto-scroll to keep the most recent relevant text visible.
 
 States:
 
@@ -409,12 +409,13 @@ States:
 
 3. Thinking
    - `YOU`: final submitted transcript.
-   - `MORTIC`: `Thinking...`
+   - `MORTIC`: starts with `Thinking...`, then may show one generic activity sentence such as `I’m reviewing the relevant files.`
+   - tool names, arguments, paths, providers, percentages, model narration, and partial structured output are never shown.
 
 4. Speaking
    - `YOU`: final submitted transcript.
-   - `MORTIC`: assistant text streams in as OpenCode events arrive and TTS is fed.
-   - auto-scroll follows the latest spoken sentence.
+   - `MORTIC`: the validated `displayText` appears once before its corresponding `spokenText` is sent to TTS.
+   - screen and speech retain the same facts, certainty, qualifications, and ordering.
 
 5. Interrupted
    - `YOU`: new speech starts.
@@ -430,14 +431,14 @@ States:
 
 The assistant may produce code, commands, paths, diffs, or JSON in the OpenCode thread. Mortic must not read those aloud.
 
-COMMS should handle screen-only content with a short cue:
+COMMS should handle technical content through a natural validated summary:
 
 ```text
 MORTIC
 I wrote the implementation into the files. Details are in the thread.
 ```
 
-It should not stream long code blocks into the spoken lane. The full OpenCode thread remains the source of truth for code changes and detailed output.
+It should never admit code blocks, raw commands, paths, JSON, tool payloads, or partially formed structured output into the spoken lane. The full OpenCode thread remains the source of truth for code changes and detailed output.
 
 ## 11. Transcript Popup
 
@@ -610,8 +611,8 @@ Preferred user experience:
 4. COMMS shows interim transcript.
 5. User releases `M`.
 6. Final transcript is sent to the current thread's voice fork.
-7. Assistant text streams into COMMS.
-8. TTS begins as soon as safe speakable chunks are available.
+7. Thinking and observed work activity render in COMMS without exposing tool details or model narration.
+8. The final validated display response appears atomically and its paired spoken response begins TTS.
 9. Turn completes; transcript is persisted locally for popup/handoff.
 
 ### 14.2 Live Mode (superseded — now the only mode, gated by `M`)
@@ -648,7 +649,7 @@ The sidepod remains focused on spoken interaction: PTT, Live, Refresh, COMMS, Tr
 
 ### 15.1 Existing Bridge Reuse
 
-Use the existing Python helper behavior as the backend foundation, with the invisible local helper owning audio capture and playback. Preserve the streaming/event architecture and avoid regressions in first text, first device audio, barge-in, or total turn latency.
+Use the existing Python helper behavior as the backend foundation, with the invisible local helper owning audio capture and playback. Preserve event observation and the polling hedge, but admit only final validated structured responses. Avoid regressions in final text, first device audio, barge-in, or total turn latency.
 
 Current bridge/helper responsibilities that should remain:
 
@@ -656,15 +657,16 @@ Current bridge/helper responsibilities that should remain:
 - Inception/Mercury provider config overlay;
 - current session fork creation;
 - fork cleanup;
-- event-driven OpenCode streaming via `prompt_async` and `/event`;
-- fallback polling when event streaming fails;
+- event-driven OpenCode structured-result observation via `prompt_async` and `/event`;
+- polling as a non-cancelling hedge when event delivery stalls;
 - context threshold monitoring;
 - Mercury-backed compaction;
 - invisible OS microphone capture;
 - Deepgram Flux STT;
 - Deepgram Speak/Aura TTS;
 - barge-in;
-- speech filtering.
+- strict display/spoken response validation with one prompt-based repair and no legacy fallback;
+- generic visual work activity, local onset/holding cues, and at most one deterministic spoken holding phrase.
 
 ### 15.2 Provider Configuration
 
@@ -982,7 +984,7 @@ Mouse remains supported for discoverability, but it is secondary.
 - User can copy Transcript with `C`.
 - User can open Handoff popup.
 - User can generate and copy a handoff.
-- COMMS shows current turn as it streams.
+- COMMS shows recognition and work activity immediately, then the final validated response atomically.
 - COMMS auto-scrolls/re-renders when text exceeds available space.
 - Runtime/provider/model names are not shown in normal UI.
 - Source OpenCode session is not mutated by voice interaction.
@@ -997,10 +999,10 @@ Mouse remains supported for discoverability, but it is secondary.
 - `/mortic` slash command focuses the sidepod and is not forwarded as a normal model prompt.
 - Mortic focus mode captures `M` while pressed so PTT does not leak into the OpenCode prompt or other keymaps.
 - `R` and `Esc` confirmation prompts are implemented before reset/exit actions execute.
-- Event-driven OpenCode streaming remains the default backend path.
+- Event-driven OpenCode structured-result observation remains the default backend path.
 - Polling fallback remains available.
 - Context compaction remains threshold-gated.
-- TTS speech filter prevents code/diffs/commands/paths/JSON from being spoken.
+- Structured response validation prevents code/diffs/commands/paths/JSON and literal bracket notation from being spoken.
 - Logs include latency fields needed for regression comparisons.
 
 ### 23.3 UX Acceptance

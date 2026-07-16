@@ -76,6 +76,14 @@ def test_validator_rejects_mutations_and_flags_unknown_types() -> None:
     extra_field["futureField"] = {"nested": True}
     assert check_event(extra_field).ok, "unknown fields on known types must pass"
 
+    valid_activity = dict(events["thinking"])
+    valid_activity["activity"] = "inspecting"
+    assert check_event(valid_activity).ok
+
+    invalid_activity = dict(events["thinking"])
+    invalid_activity["activity"] = "reading_secret_path"
+    assert not check_event(invalid_activity).ok
+
 
 def test_generated_artifacts_match_the_typescript_source() -> None:
     source_hash = hashlib.sha256(SCHEMA_SOURCE.read_bytes()).hexdigest()

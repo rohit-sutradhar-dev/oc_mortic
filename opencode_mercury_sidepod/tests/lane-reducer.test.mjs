@@ -72,6 +72,23 @@ test("context preparation phases use concise non-technical copy", () => {
   assert.equal(intents[2].assistantText, "Try again.");
 });
 
+test("work activity is transient and never enters transcript history", () => {
+  const { state, intents } = play([
+    { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live", activity: "reasoning" },
+    { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live", activity: "inspecting" },
+    { type: "thinking", sentAt: at, turnId: "turn_0001", sourceMode: "live", activity: "finishing" },
+    { type: "assistant.delta", sentAt: at, turnId: "turn_0001", sequence: 1, delta: "The answer." },
+    { type: "complete", sentAt: at, turnId: "turn_0001", latency: { totalMs: 4200 } },
+  ]);
+
+  assert.equal(intents[0].assistantText, "…");
+  assert.equal(intents[1].assistantText, "I’m reviewing the relevant files.");
+  assert.equal(intents[2].assistantText, "I’m finishing that up.");
+  assert.equal(intents[3].assistantText, "The answer.");
+  assert.deepEqual(intents[4].appendTranscript, [{ role: "assistant", text: "The answer." }]);
+  assert.equal(state.activity, null);
+});
+
 test("a straggler partial never steals the running turn", () => {
   // The frozen-viewer bug from run 20260704T140244Z: a partial transcript
   // with a fresh turnId arrived right after thinking; superseding on it made

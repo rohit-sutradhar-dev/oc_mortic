@@ -48,7 +48,7 @@ class NativeSpeakerTerminalTests(unittest.IsolatedAsyncioTestCase):
     async def test_nonterminal_underflow_waits_for_full_refill_and_keeps_one_burst(self) -> None:
         drains: list[None] = []
 
-        async def on_drain() -> None:
+        async def on_drain(_token: PlaybackToken) -> None:
             drains.append(None)
 
         with tempfile.TemporaryDirectory() as tmp:

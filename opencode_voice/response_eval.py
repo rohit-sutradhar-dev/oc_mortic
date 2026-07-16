@@ -532,7 +532,7 @@ class ResponseEvalRunner:
             source_id = str(source.get("id") or "")
             if not source_id:
                 raise RuntimeError("OpenCode did not create an eval source session")
-            source_before = await self.client.messages(source_id)
+            source_before = await self.client.messages_for_tracking(source_id)
             fork = await self.client.fork_session(source_id)
             fork_id = str(fork.get("id") or "")
             if not fork_id:
@@ -633,7 +633,7 @@ class ResponseEvalRunner:
             judge = None
             if self.judge_enabled and not selected_evaluation.violations and selected_value is not None:
                 judge = await self._judge(case, selected_value, directory)
-            source_after = await self.client.messages(source_id)
+            source_after = await self.client.messages_for_tracking(source_id)
             all_tool_activity = [
                 *observation.tool_activity,
                 *(repair_observation.tool_activity if repair_observation else []),

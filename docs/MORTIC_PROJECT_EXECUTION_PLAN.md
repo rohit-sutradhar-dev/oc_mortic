@@ -181,7 +181,7 @@ Engine-owner acceptance criteria:
 Goal: render all user-visible voice artifacts.
 
 Deliverables:
-- COMMS shows current user transcript and assistant deltas.
+- COMMS shows the current user transcript, transient generic work activity, and the final validated display response.
 - COMMS auto-scrolls/re-renders to keep active text visible.
 - Transcript popup is scrollable and copyable.
 - Handoff popup is scrollable, generate/preview/copy capable.
@@ -194,7 +194,7 @@ User acceptance criteria:
 - User sees Config but cannot configure anything yet.
 
 Engine-owner acceptance criteria:
-- Platform renders streamed `assistant.delta` without waiting for turn completion.
+- Platform accepts one atomic `assistant.delta` for the validated final and treats earlier `thinking.activity` events as transient presentation only.
 - Platform stores enough local turn data for Transcript/Handoff.
 - Platform can request handoff generation through the agreed protocol or helper route.
 
@@ -336,14 +336,11 @@ Deliverables:
 - Engine serves Mercury/model capability to Platform through the helper/protocol, not through Platform-owned provider calls.
 - Engine creates an ephemeral fork.
 - Source thread remains untouched.
-- Turns use event-first OpenCode streaming.
-- Polling fallback remains available.
+- Turns subscribe to `/event` before prompting and admit only the final strict `{displayText, spokenText}` result.
+- Polling remains a low-rate hedge without cancelling the event reader.
 - Fork is deleted by default when the voice lane ends.
-- Native provider structured streaming through OpenCode ordinary text events is
-  documented but deferred: Mercury 2 exposed only 0–180 ms of measured safe
-  headroom. Revisit the provider-adapter design for autoregressive models that
-  pass the gates in
-  [Mortic Structured Streaming Investigation](MORTIC_STRUCTURED_STREAMING_INVESTIGATION.md).
+- Model narration, ordinary text parts, tool arguments/results, partial JSON,
+  and repair candidates are never sent to COMMS or TTS.
 
 User acceptance criteria:
 - Voice work does not mutate the source OpenCode thread.
@@ -352,26 +349,24 @@ User acceptance criteria:
 
 Platform-owner acceptance criteria:
 - Engine provides voice lane/fork state where needed.
-- Engine emits deltas as they arrive.
+- Engine emits generic `thinking.activity` updates during work and one atomic validated final.
 - Engine reports safe failure states as `voice_bridge_issue`.
 - Platform can treat Mercury as an Engine-provided capability and focus on OpenCode constraints.
 
-### E5: Speech Filtering + Screen-Only Output
+### E5: Structured Display/Spoken Safety
 
-Goal: prevent unspeakable technical content from being read aloud.
+Goal: make Mercury author both renderings and reject unsafe or unnatural speech before admission.
 
 Deliverables:
-- Code blocks are not spoken.
-- Diffs are not spoken.
-- Commands are not spoken.
-- Paths are not spoken.
-- JSON/raw tool payloads are not spoken.
-- Screen-only hints are available for COMMS/Transcript where useful.
+- Strict schema with separate `displayText` and `spokenText`, limited to 1,200 characters each.
+- Code, diffs, commands, absolute paths, raw JSON, Markdown/URLs, secrets, and provider/runtime names are rejected.
+- Literal parentheses, brackets, braces, and angle-bracket notation are rejected in speech and transformed semantically by Mercury.
+- One prompt-based repair is allowed for repairable deterministic violations; invalid output never falls back to legacy prose.
 
 User acceptance criteria:
-- Mortic does not read code aloud.
+- Mortic does not read code or notation punctuation aloud.
 - User hears concise, useful spoken summaries.
-- Detailed implementation content stays in OpenCode/thread/screen output.
+- The displayed and spoken answers preserve the same facts, certainty, qualifications, and ordering.
 
 Platform-owner acceptance criteria:
 - Engine marks or separates spoken text from screen-only content.

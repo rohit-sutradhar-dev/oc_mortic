@@ -11,8 +11,17 @@ export function createLaneState() {
     transcriptSeq: 0,
     deltaSeq: 0,
     assistantBuffer: "",
+    activity: null,
   };
 }
+
+const ACTIVITY_TEXT = {
+  reasoning: "…",
+  searching: "I’m searching for that now.",
+  inspecting: "I’m reviewing the relevant files.",
+  working: "I’m working through that now.",
+  finishing: "I’m finishing that up.",
+};
 
 // The engine tags every issue payload with the capability it degrades
 // (voice_bridge_issue_payload in the helper); audio problems mute the mic.
@@ -40,8 +49,8 @@ export function reduceLaneEvent(state, event) {
   }
   if (type === "listening") {
     return {
-      state,
-      ui: { status: "ready", micLive: true, userText: "Listening. Speak normally." },
+      state: { ...state, activity: null },
+      ui: { status: "ready", activity: null, micLive: true, userText: "Listening. Speak normally." },
     };
   }
   if (type === "transcript") {
@@ -76,10 +85,18 @@ export function reduceLaneEvent(state, event) {
     if (state.activeTurnId && event.turnId !== state.activeTurnId) {
       return { state, ui: null };
     }
+    const sameTurn = state.activeTurnId === event.turnId;
+    const activity = event.activity ?? (sameTurn ? state.activity : null) ?? "reasoning";
     return {
-      state: { ...state, activeTurnId: event.turnId, deltaSeq: 0, assistantBuffer: "" },
+      state: {
+        ...state,
+        activeTurnId: event.turnId,
+        activity,
+        ...(sameTurn ? {} : { deltaSeq: 0, assistantBuffer: "" }),
+      },
       ui: {
         status: "thinking",
+        activity,
         assistantText:
           event.phase === "preparing_context"
             ? "Preparing context…"
@@ -87,7 +104,7 @@ export function reduceLaneEvent(state, event) {
               ? "Continuing…"
               : event.phase === "try_again"
                 ? "Try again."
-                : "…",
+                : ACTIVITY_TEXT[activity] ?? ACTIVITY_TEXT.reasoning,
       },
     };
   }
@@ -105,7 +122,7 @@ export function reduceLaneEvent(state, event) {
     if (event.turnId !== state.activeTurnId) {
       return { state, ui: null };
     }
-    return { state, ui: { status: "speaking" } };
+    return { state: { ...state, activity: null }, ui: { status: "speaking", activity: null } };
   }
   if (type === "complete") {
     if (state.activeTurnId && event.turnId !== state.activeTurnId) {
@@ -113,9 +130,10 @@ export function reduceLaneEvent(state, event) {
     }
     const finalText = state.assistantBuffer || String(event.fullSpokenText ?? "");
     return {
-      state: { ...state, activeTurnId: null, assistantBuffer: "", deltaSeq: 0, transcriptSeq: 0 },
+      state: { ...state, activeTurnId: null, assistantBuffer: "", deltaSeq: 0, transcriptSeq: 0, activity: null },
       ui: {
         status: "ready",
+        activity: null,
         ...(finalText ? { assistantText: finalText, appendTranscript: [{ role: "assistant", text: finalText }] } : {}),
         smoke: { event: "lane.turn.complete", details: { turnId: event.turnId, latency: event.latency } },
       },
@@ -127,8 +145,8 @@ export function reduceLaneEvent(state, event) {
     // lower sequence could be dropped as "already seen" — the class of
     // silent drop that can freeze the viewer mid-turn.
     return {
-      state: { ...state, activeTurnId: null, assistantBuffer: "", deltaSeq: 0, transcriptSeq: 0 },
-      ui: { status: "ready", userText: "Interrupted.", assistantText: "Speech interrupted before playback finished." },
+      state: { ...state, activeTurnId: null, assistantBuffer: "", deltaSeq: 0, transcriptSeq: 0, activity: null },
+      ui: { status: "ready", activity: null, userText: "Interrupted.", assistantText: "Speech interrupted before playback finished." },
     };
   }
   if (type === "voice_bridge_issue") {

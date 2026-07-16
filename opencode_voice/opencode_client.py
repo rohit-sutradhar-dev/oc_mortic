@@ -255,7 +255,16 @@ class OpenCodeClient:
             if exc.response.status_code != 400:
                 raise
         projected = await self.projected_messages(session_id)
-        recent = await self.recent_messages(session_id)
+        try:
+            recent = await self.recent_messages(session_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 400:
+                raise
+            # The tail can temporarily consist only of the structured user
+            # message whose persisted ``format.retryCount`` is exactly what
+            # the legacy decoder cannot read.  The v2 projection is already a
+            # complete, safe tracking view, so a legacy-tail merge is optional.
+            recent = []
         merged = list(projected)
         positions: dict[str, int] = {}
         for index, message in enumerate(merged):
