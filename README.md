@@ -22,14 +22,12 @@ Required local environment variables for the current voice bridge:
 ```bash
 export INCEPTION_API_KEY="..."
 export DEEPGRAM_API_KEY="..."
+export CARTESIA_API_KEY="..."
 ```
 
-STT always runs on Deepgram Flux. TTS defaults to Deepgram but can be switched
-to Cartesia with `--tts-provider cartesia` (needs `CARTESIA_API_KEY` set too):
-
-```bash
-export CARTESIA_API_KEY="..."  # only needed when --tts-provider cartesia
-```
+STT always runs on Deepgram Flux. TTS defaults to Cartesia; use
+`--tts-provider deepgram` to select Deepgram TTS instead, in which case the
+Cartesia key is not required.
 
 ## Run The Helper
 
@@ -54,7 +52,7 @@ Useful options:
 mortic-helper --help
 mortic-helper --managed-opencode --opencode-dir "/path/to/project"
 mortic-helper --context-threshold 70000 --model-variant low
-mortic-helper --tts-provider cartesia     # switch TTS off Deepgram (STT stays on Flux)
+mortic-helper --tts-provider deepgram     # optional TTS override (STT always stays on Flux)
 mortic-helper --voice-duplex half          # explicit safety fallback / push-to-interrupt
 mortic-helper --device-sample-rate 48000  # native device/AEC clock
 mortic-helper --tts-sample-rate 16000     # provider PCM clock (resampled to device rate)

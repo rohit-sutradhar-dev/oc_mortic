@@ -666,6 +666,7 @@ Current bridge/helper responsibilities that should remain:
 - Deepgram Speak/Aura TTS;
 - barge-in;
 - strict display/spoken response validation with one prompt-based repair and no legacy fallback;
+- a read-only structured-turn evidence allowlist of `read`, `glob`, `grep`, `websearch`, and `webfetch`, with schema-injected `StructuredOutput` reserved for final submission;
 - generic visual work activity, local onset/holding cues, and at most one deterministic spoken holding phrase.
 
 ### 15.2 Provider Configuration

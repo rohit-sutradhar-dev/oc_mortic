@@ -234,6 +234,8 @@ class ManagedEvalServer(AbstractContextManager["ManagedEvalServer"]):
                     configured_model["limit"] = dict(overlay["model_limit"])
         env = os.environ.copy()
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+        if self.network_tools:
+            env["OPENCODE_ENABLE_EXA"] = "1"
         env["BUN_OPTIONS"] = " ".join(
             item
             for item in (env.get("BUN_OPTIONS", "").strip(), "--dns-result-order=ipv4first")

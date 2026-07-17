@@ -1445,6 +1445,18 @@ class StructuredResponseAndWorkFeedbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(complete["fullSpokenText"], client.response["spokenText"])
             self.assertEqual(client.prompt_payloads[0]["output_format"]["type"], "json_schema")
             self.assertIn("StructuredOutput", client.prompt_payloads[0]["system"])
+            self.assertEqual(
+                client.prompt_payloads[0]["tools"],
+                {
+                    "*": False,
+                    "read": True,
+                    "glob": True,
+                    "grep": True,
+                    "websearch": True,
+                    "webfetch": True,
+                    "StructuredOutput": True,
+                },
+            )
             assert_all_lane_messages_valid(self, websocket.sent)
             await connection.close()
 
@@ -1503,7 +1515,10 @@ class StructuredResponseAndWorkFeedbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(" ".join(speaker.spoken), safe["spokenText"])
             self.assertNotIn("/Users/ana", json.dumps(websocket.sent))
             self.assertEqual(len(client.prompts), 2)
-            self.assertTrue(all(value is False for value in client.prompt_payloads[1]["tools"].values()))
+            self.assertEqual(
+                client.prompt_payloads[1]["tools"],
+                {"*": False, "StructuredOutput": True},
+            )
             await connection.close()
 
     async def test_schema_invalid_first_response_can_be_repaired(self) -> None:

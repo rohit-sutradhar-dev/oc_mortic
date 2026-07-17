@@ -14,6 +14,30 @@ from opencode_voice.response_contract import RESPONSE_SCHEMA, ResponseEnvelope, 
 
 ToolCallback = Callable[[ToolActivity], Awaitable[None]]
 
+STRUCTURED_EVIDENCE_TOOLS = ("read", "glob", "grep", "websearch", "webfetch")
+STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
+DEFAULT_MAX_REAL_TOOL_CALLS = 12
+
+
+class _ToolBudgetExceeded(Exception):
+    pass
+
+
+def structured_tool_policy() -> dict[str, bool]:
+    """Return the production voice-turn allowlist understood by OpenCode."""
+
+    return {
+        "*": False,
+        **{name: True for name in STRUCTURED_EVIDENCE_TOOLS},
+        STRUCTURED_OUTPUT_TOOL: True,
+    }
+
+
+def structured_repair_tool_policy() -> dict[str, bool]:
+    """Repair may only resubmit the schema-injected StructuredOutput tool."""
+
+    return {"*": False, STRUCTURED_OUTPUT_TOOL: True}
+
 
 @dataclass(frozen=True)
 class StructuredTurnResult:
@@ -44,6 +68,7 @@ async def run_structured_turn(
     final_grace_sec: float = 1.0,
     tools: dict[str, bool] | None = None,
     on_tool_activity: ToolCallback | None = None,
+    max_real_tool_calls: int = DEFAULT_MAX_REAL_TOOL_CALLS,
 ) -> StructuredTurnResult:
     before_messages = await client.messages_for_tracking(session_id)
     tracker = StructuredTurnTracker(session_id, before_messages)
@@ -57,6 +82,7 @@ async def run_structured_turn(
     first_activity_ms: int | None = None
     last_activity_count = 0
     emitted_tools = 0
+    real_tool_call_ids: set[str] = set()
     structured_seen_at: float | None = None
     event_healthy = True
     stream_source = "event"
@@ -68,6 +94,11 @@ async def run_structured_turn(
         while emitted_tools < len(tracker.state.tool_activity):
             activity = tracker.state.tool_activity[emitted_tools]
             emitted_tools += 1
+            if activity.tool.casefold().replace("_", "") != "structuredoutput":
+                call_id = activity.part_id or f"{activity.message_id}:{emitted_tools}"
+                real_tool_call_ids.add(call_id)
+                if len(real_tool_call_ids) > max_real_tool_calls:
+                    raise _ToolBudgetExceeded
             if on_tool_activity is not None:
                 await on_tool_activity(activity)
 
@@ -87,7 +118,7 @@ async def run_structured_turn(
                 "schema": {key: value for key, value in RESPONSE_SCHEMA.items() if key != "$schema"},
             },
             system=load_structured_voice_prompt(),
-            tools=tools,
+            tools=structured_tool_policy() if tools is None else dict(tools),
         )
 
         while time.perf_counter() < deadline:
@@ -144,6 +175,18 @@ async def run_structured_turn(
             first_activity_ms,
             stream_source,
             fallback_error="turn_timeout",
+        )
+    except _ToolBudgetExceeded:
+        try:
+            await client.abort(session_id)
+        except Exception:  # noqa: BLE001 - the bounded failure remains authoritative.
+            pass
+        return _result(
+            tracker,
+            started,
+            first_activity_ms,
+            stream_source,
+            fallback_error="tool_budget_exceeded",
         )
     finally:
         reader.cancel()

@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         # chain), so a plugin-side "/mortic" session can't pass --tts-provider
         # directly; the env var (settable in .env like the API keys) is the
         # only way to configure it there.
-        tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "deepgram",
+        tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "cartesia",
         flux_eager_eot_threshold=None,
         voice_duplex=args.voice_duplex,
         event_completion_grace_sec=args.event_completion_grace_sec,
@@ -185,7 +185,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["deepgram", "cartesia"],
         help=(
             "TTS engine for playback (STT always stays on Deepgram Flux). "
-            "Falls back to OPENCODE_VOICE_TTS_PROVIDER, then 'deepgram'."
+            "Falls back to OPENCODE_VOICE_TTS_PROVIDER, then 'cartesia'."
         ),
     )
     parser.add_argument(
@@ -228,7 +228,7 @@ def run_doctor_cli(args: argparse.Namespace, model: ModelRef) -> int:
     config = VoiceConfig(
         opencode_url=url or "http://127.0.0.1:0",
         model=model,
-        tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "deepgram",
+        tts_provider=args.tts_provider or os.environ.get("OPENCODE_VOICE_TTS_PROVIDER") or "cartesia",
         opencode_agent=args.agent,
     )
     results = asyncio.run(doctor_mod.run_doctor(config, model, args.agent))
@@ -331,6 +331,10 @@ def start_managed_opencode(
         voice_agent_prompt=load_voice_agent_prompt(voice_agent_prompt_path),
         voice_agent_name=voice_agent_name,
     )
+    # OpenCode only registers its hosted Exa websearch tool for non-OpenCode
+    # providers when this supported feature flag is enabled. The service does
+    # not require a separate API key.
+    env["OPENCODE_ENABLE_EXA"] = "1"
     # OpenCode is distributed as a standalone Bun executable. Runtime flags
     # passed in argv are parsed by OpenCode's own CLI, where this flag is not a
     # valid `serve` option. BUN_OPTIONS is Bun's supported runtime-flag channel

@@ -98,7 +98,7 @@ class CredentialConfigTests(unittest.TestCase):
         events = [issue.to_voice_bridge_issue(sent_at="2026-07-03T00:00:00.000Z") for issue in credentials.issues]
         serialized = json.dumps(events)
 
-        self.assertEqual(len(events), 2)
+        self.assertEqual(len(events), 3)
         self.assertEqual({event["type"] for event in events}, {"voice_bridge_issue"})
         self.assertEqual({event["userMessage"] for event in events}, {"Voice Bridge Issue"})
         self.assertIn("voice_audio", {event["capability"] for event in events})
@@ -108,18 +108,21 @@ class CredentialConfigTests(unittest.TestCase):
         self.assertNotIn("Deepgram", serialized)
         self.assertNotIn("Mercury", serialized)
 
-    def test_cartesia_key_only_required_when_it_is_the_active_tts_provider(self) -> None:
+    def test_cartesia_key_is_required_by_default_but_not_for_deepgram_tts(self) -> None:
         env = {"DEEPGRAM_API_KEY": "audio-key", "INCEPTION_API_KEY": "turn-key"}
         with patch.dict(os.environ, env, clear=True):
-            deepgram_default = load_voice_credentials(dotenv_path="/tmp/mortic-missing-dotenv")
-            cartesia_active = load_voice_credentials(
-                dotenv_path="/tmp/mortic-missing-dotenv", tts_provider="cartesia"
+            cartesia_default = load_voice_credentials(dotenv_path="/tmp/mortic-missing-dotenv")
+            deepgram_active = load_voice_credentials(
+                dotenv_path="/tmp/mortic-missing-dotenv", tts_provider="deepgram"
             )
 
-        self.assertEqual(deepgram_default.issues, ())
-        self.assertEqual(len(cartesia_active.issues), 1)
-        self.assertEqual(cartesia_active.issues[0].diagnostic_code, "missing_cartesia_api_key")
-        self.assertEqual(cartesia_active.issues[0].capability, "voice_audio")
+        self.assertEqual(deepgram_active.issues, ())
+        self.assertEqual(len(cartesia_default.issues), 1)
+        self.assertEqual(cartesia_default.issues[0].diagnostic_code, "missing_cartesia_api_key")
+        self.assertEqual(cartesia_default.issues[0].capability, "voice_audio")
+
+    def test_cartesia_is_the_default_tts_provider(self) -> None:
+        self.assertEqual(VoiceConfig(opencode_url="http://opencode.test").tts_provider, "cartesia")
 
     def test_cartesia_key_redacted_even_when_deepgram_is_the_active_provider(self) -> None:
         env = {
@@ -179,6 +182,7 @@ class HelperReadinessTests(unittest.TestCase):
                 "audio_dependency_unavailable",
                 "missing_voice_audio_key",
                 "missing_voice_turn_key",
+                "missing_cartesia_api_key",
             },
         )
         self.assertNotIn("DEEPGRAM_API_KEY", serialized)

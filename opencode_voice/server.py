@@ -62,7 +62,11 @@ from opencode_voice.response_contract import (
     should_admit_repair,
     should_select_repair,
 )
-from opencode_voice.structured_turn import StructuredTurnResult, run_structured_turn
+from opencode_voice.structured_turn import (
+    StructuredTurnResult,
+    run_structured_turn,
+    structured_repair_tool_policy,
+)
 from opencode_voice.state import (
     active_context_estimate,
     elapsed_ms,
@@ -226,7 +230,7 @@ def helper_readiness_issues(
     audio_ready: bool | None = None,
     debug_ref: str | None = None,
     dotenv_path: str | Path = ".env",
-    tts_provider: str = "deepgram",
+    tts_provider: str = "cartesia",
 ) -> tuple[dict[str, Any], ...]:
     issues: list[dict[str, Any]] = []
     if not transport_ready:
@@ -2365,20 +2369,7 @@ class VoiceConnection:
                 session_id,
                 repair_prompt(text, result.raw, list(evaluation.violations)),
                 turn_id,
-                tools={
-                    name: False
-                    for name in (
-                        "read",
-                        "glob",
-                        "grep",
-                        "list",
-                        "edit",
-                        "bash",
-                        "task",
-                        "webfetch",
-                        "websearch",
-                    )
-                },
+                tools=structured_repair_tool_policy(),
                 emit_tool_cues=False,
             )
             repaired_evaluation = evaluate_response(
