@@ -1,179 +1,124 @@
-# Mortic Agent Operating Guide
+# Mortic — Agent Operating Guide
 
-This repo is the Mortic OpenCode sidepod project. Agents working here should use Jira as the work queue, use the repo as the implementation truth, and start the next highest-value task for the requested owner track.
+This repo (`rohit-sutradhar-dev/oc_mortic`) is one of two parallel
+implementations of the Mortic OpenCode sidepod. The other is `mortiphi/oc_mortic`,
+worked on independently by Aditya.
 
-## Primary Sources
+Both of us design the product and write the code. We discuss ideas constantly and
+then each implement them ourselves, so that two independent attempts exist rather
+than one merged compromise. Aditya's approach is feature-first and fast. This
+repo's approach is structure-first: the product should be as good, and the code
+should also be understandable, reviewable, and safe to change.
 
-- Product requirements: `docs/MORTIC_OPENCODE_SIDEPOD_PRD.md`
-- Delivery plan: `docs/MORTIC_PROJECT_EXECUTION_PLAN.md`
-- Jira project: `MOR` on `https://mortic.atlassian.net`
-- Delivery date: July 18, 2026
+Neither repo is the source of truth. Aditya's base is substantial and well-built;
+we inherit it, respect it, and build on it.
 
-If Jira and local docs disagree, call out the mismatch before implementing. Do not silently reinterpret product scope.
+## Relationship to upstream
 
-## Jira Connection
+**Read upstream. Never merge upstream.**
 
-Use the Atlassian/Jira connector when available.
+`upstream` is fetched and read as reference. Its changes are not merged — merging
+two independent tracks produced conflicts that cost more than reimplementation
+and eroded the structural work this repo exists to do.
 
-Required Jira fields:
-- Project: `MOR`
-- Track labels: `platform-track`, `engine-track`, `shared-track`
-- Start date: `Start date`
-- Due date: `duedate`
-- Primary statuses: `TO DO`, `IN PROGRESS`, done-status equivalents
+When upstream does something worth having, reimplement it here deliberately and
+record the choice. When we deliberately do something differently, record that too.
 
-Useful JQL:
+## Documentation layout
 
-```jql
-project = MOR ORDER BY duedate ASC, key ASC
-```
+| Path | What it is |
+|---|---|
+| `docs/*.md` | Primary product docs. Inherited from upstream, ours to edit. |
+| `docs/upstream/*.md` | Verbatim upstream mirror. Never edit. Refresh deliberately. |
+| `docs/dev/` | This repo's working docs (below). |
+| `docs/dev/specs/` | Specs for work being designed or built. |
 
-```jql
-project = MOR AND labels = platform-track ORDER BY duedate ASC, key ASC
-```
+Edit `docs/*.md` freely — they are ours now. `docs/upstream/` is what makes the
+editing safe, because drift stays visible.
 
-```jql
-project = MOR AND labels = engine-track ORDER BY duedate ASC, key ASC
-```
+## Working docs — where things get recorded
 
-```jql
-project = MOR AND labels = shared-track ORDER BY duedate ASC, key ASC
-```
+Record as you go, not at the end. Each of these has a distinct lifecycle; the
+sorting question is *what kind of thinking does this need?*
 
-```jql
-project = MOR AND duedate <= now() ORDER BY duedate ASC, key ASC
-```
+- **`docs/dev/decomposition.md`** — the standing refactoring program. Target
+  module boundaries, what has been extracted, what is next. Steps here are moves
+  in a plan whose direction is already settled.
+- **`docs/dev/proposals.md`** — ideas that cannot start until a design decision
+  is made. Graduate to `docs/dev/specs/` when designed.
+- **`docs/dev/chores.md`** — small items with an obvious fix that simply is not
+  done. No design thinking required.
+- **`docs/dev/decisions.md`** — append-only. Why a non-obvious choice was made.
+  Never delete entries; supersede them.
+- **`docs/dev/upstream-drift.md`** — where this repo diverges from upstream and
+  why. Organized by area, because it is read while looking at an upstream change.
 
-If the connector is unavailable, say so and use the local PRD/execution plan to continue with best effort. Do not invent Jira state.
+If an item needs a decision before work starts, it is a proposal. If the action is
+obvious, it is a chore. If it is a step toward the target architecture, it belongs
+in the decomposition plan.
 
-## Startup Routine
+## How to work here
 
-At the start of a work session:
+**Understand before changing.** The reason this repo exists is that code should be
+reviewable by understanding it, not only by checking that its surface behaves. A
+change you cannot explain is not done.
 
-1. Read this file.
-2. Check `git status --short`.
-3. Review the relevant PRD/execution-plan sections.
-4. Query Jira for the requested track.
-5. Query Jira for due or overdue work.
-6. Inspect local code/tests related to the likely next task.
-7. Summarize the chosen immediate priority before editing files.
+**Characterize before refactoring.** Before restructuring code, make sure tests
+capture the behavior you intend to preserve. If they do not exist, write them
+first — they are the thing that makes the refactor safe.
 
-If the user names a track, prioritize that track. If they do not, choose the earliest due unblocked item across all tracks and say which track you selected.
+**Extract toward single-purpose modules.** Prefer small files with one clear
+responsibility and an explicit interface. A module should be describable as: what
+it does, how it is used, what it depends on. Large files are a signal, not a style
+preference — see `docs/dev/decomposition.md` for current targets.
 
-## Track Selection
+**Protocols over concrete types.** Provider-neutral seams (`stt_provider.py`,
+`agent_backend.py`, `callbacks.py`) exist so implementations can be swapped and
+tested. Depend on the protocol, not the implementation.
 
-Platform Track owns:
-- Native OpenCode sidepod surface.
-- `/mortic` focus command.
-- Focus-mode typing lock and key isolation.
-- Command deck, confirmations, COMMS, Transcript, Handoff, Config stub.
-- Sidepod protocol client.
-- OpenCode plugin packaging, sandboxing, permissions, and lifecycle integration.
+**Scope changes.** One concern per change. Unrelated cleanup found along the way
+goes in `chores.md` rather than into the current diff.
 
-Engine Track owns:
-- Invisible local helper.
-- Helper/runtime distribution artifact.
-- OS mic capture.
-- Deepgram STT/TTS.
-- Mercury/Inception calls.
-- OpenCode ephemeral fork turn loop.
-- Event streaming and polling fallback.
-- Barge-in, compaction, speech filtering, and latency instrumentation.
+## Product rules
 
-Shared Track owns:
-- Protocol freeze.
-- Cross-track demos.
-- Security/privacy review.
-- Beta and release readiness.
-- Backlog quality and ownership review.
+These are properties of the product and hold regardless of implementation:
 
-## Taking Stock
-
-Before starting a ticket, determine whether it is already done.
-
-Check:
-- Jira status, comments, linked issues, and blockers.
-- Local implementation files.
-- Tests and fixtures.
-- Recent git commits or uncommitted changes.
-- Existing docs and runbooks.
-
-If implementation exists but Jira is not updated, report that and propose the Jira status change. If Jira says done but local evidence is missing, treat it as a verification task, not a rewrite.
-
-## Priority Algorithm
-
-For the selected track:
-
-1. Prefer overdue or due-soon tasks.
-2. Prefer blockers for other tickets.
-3. Prefer tasks needed for the next shared milestone.
-4. Prefer tasks with clear acceptance criteria.
-5. Avoid starting packaging/release work before core flow evidence exists.
-
-Do not start low-risk polish while a dated blocker is open.
-
-Immediate priority output should include:
-- Selected track.
-- Selected Jira key and title.
-- Why it is next.
-- Acceptance criteria being targeted.
-- Files or modules likely affected.
-- Verification plan.
-
-Keep the summary short, then start the work unless the user explicitly asked only for planning.
-
-## Implementation Rules
-
-- Keep changes scoped to the selected Jira ticket.
-- Preserve the existing Mortic visual language unless the PRD says otherwise.
-- Do not expose provider/model/runtime names in normal UI.
-- Do not add a typed fallback to the packaged sidepod.
-- Do not ship visible browser UI in the main path.
-- Keep source OpenCode threads untouched; voice work belongs in ephemeral forks.
-- Code, diffs, commands, paths, and JSON must not be spoken aloud by Mortic.
+- Code, diffs, commands, paths, and JSON must never be spoken aloud.
 - Never log, print, commit, or display API keys or raw secrets.
-- Do not overwrite user changes. If the worktree is dirty, inspect and work around unrelated changes.
+- Keep source OpenCode threads untouched; voice work belongs in ephemeral forks.
+- Do not expose provider, model, or runtime names in normal UI.
+- Do not ship visible browser UI in the main path.
+- Do not overwrite unrelated user changes. If the worktree is dirty, inspect and
+  work around them.
 
-## Jira During Work
+## Verification
 
-When starting implementation:
-- Move or mark the Jira issue as in progress if the workflow/tooling allows it.
-- If the issue is blocked, record the blocker instead of forcing implementation.
-
-When finishing:
-- Run the relevant tests.
-- Update the Jira issue with evidence: files changed, tests run, known gaps.
-- Move or mark the issue done only when acceptance criteria are met.
-
-If Jira updates are not available, include the exact update text in the final response so a human can paste it.
-
-## Verification Expectations
-
-Use the smallest verification that proves the ticket.
-
-Default local suite:
+Default suite:
 
 ```bash
 uv run pytest
 ```
 
-Examples:
-- Platform UI/state work: sidepod fixture tests, protocol reducer tests, visual snapshots if available.
-- Key/focus work: tests proving `/mortic` is not sent as a prompt and `M` does not leak into OpenCode keymaps.
-- Engine helper work: unit tests for protocol loop, health, startup/shutdown, and redaction.
-- STT/TTS work: mocked Deepgram tests plus one manual/live smoke only when keys and environment are intentionally available.
-- OpenCode streaming work: SSE parser tests, event-turn state tests, polling fallback tests.
-- Speech filtering: fixture corpus tests proving code/diffs/commands/paths/JSON are screen-only.
-- Performance work: timing report with first transcript, first assistant text, first TTS audio, total turn, retries, and stream source.
+Use the smallest verification that proves the change, and state what was run.
 
-If a test cannot be run, state why and identify the residual risk.
+`tests/test_opencode_voice.py::HelperReadinessTests::test_readiness_has_no_issues_when_runtime_checks_pass`
+currently fails — inherited from upstream, not caused by work here. See
+`docs/dev/chores.md`. Do not treat it as a regression; do not let it mask one.
 
-## Final Response Shape
+**Some tests are flaky under full-suite runs** — timing-sensitive ones around
+interruption and echo. Before concluding a change broke something, re-run the
+failing test in isolation. Before concluding it did not, re-run the full suite.
+Never dismiss a failure as flaky without checking. See `docs/dev/chores.md`.
 
-End each session with:
-- Jira key worked.
-- What changed.
-- Verification run.
-- Any remaining risk or next dependency.
+If a test cannot be run, say why and name the residual risk.
 
-Keep the final response concise. Do not paste secrets or long logs.
+## Session shape
+
+Start by reading this file, `git status --short`, and the working doc relevant to
+what you are about to do.
+
+Finish by stating what changed, what verification was run, what was recorded and
+where, and any remaining risk. Keep it short. Never paste secrets or long logs.
+
+Claims of completion require evidence. If tests fail, say so with the output. If a
+step was skipped, say that.
