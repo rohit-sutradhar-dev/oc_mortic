@@ -91,6 +91,27 @@ These are properties of the product and hold regardless of implementation:
 - Do not overwrite unrelated user changes. If the worktree is dirty, inspect and
   work around them.
 
+## Commits
+
+**Agents do not commit to `main`. Ever.** `main` commits are made by the repo
+owner, by hand.
+
+When work is ready to commit, say so and stop: what changed, what was verified,
+and a suggested commit message. Do not run `git commit` on `main`, and do not
+push.
+
+Agents may commit freely **inside a git worktree on a scratch branch** — that is
+what worktrees are for. Temporary commits there are working state, not history;
+the owner decides what becomes a real commit.
+
+```bash
+git worktree add ../oc_mortic-<topic> -b <topic>   # isolated checkout + branch
+# ... work and commit freely in that directory ...
+git worktree remove ../oc_mortic-<topic>           # when done
+```
+
+`main` in the primary working directory stays untouched throughout.
+
 ## Verification
 
 Default suite:
