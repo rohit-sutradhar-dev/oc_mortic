@@ -42,22 +42,10 @@ clock), promote to `proposals.md`.
 
 ---
 
-## Inherited failing test: readiness vs. Cartesia default
+## Tell Aditya about the Cartesia readiness test
 
-`tests/test_opencode_voice.py::HelperReadinessTests::test_readiness_has_no_issues_when_runtime_checks_pass`
-
-Fails on this repo **and identically on pristine `upstream/main`** — verified by
-running the suite in a clean worktree at `upstream/main`. Not caused by the merge.
-
-Upstream `168bd17` changed the default TTS provider to Cartesia
-(`config.py:68` — `required_credentials(tts_provider: str = "cartesia")`) without
-updating this test, which seeds only `DEEPGRAM_API_KEY` and `INCEPTION_API_KEY`.
-`required_credentials` therefore reports `missing_cartesia_api_key`.
-
-Fix here: add `CARTESIA_API_KEY` to the patched environment. Worth reporting to
-Aditya rather than only fixing locally — it is his bug and it fails in his tree.
-
-Cross-referenced in `upstream-drift.md` (Testing), which records that the failure
-is inherited so it is not mistaken for a regression.
+Fixed here 2026-07-18, but it still fails on `upstream/main` — it is his bug and
+his suite is red because of it. See `upstream-drift.md` (Testing) for the detail
+to send him.
 
 Raised 2026-07-18.

@@ -80,14 +80,22 @@ rather than reimplemented. Cartesia as default TTS provider likewise.
 
 ## Testing
 
-**Inherited failing test.**
-`test_readiness_has_no_issues_when_runtime_checks_pass` fails here *and* on
-pristine `upstream/main` — confirmed by running the suite in a clean worktree at
-`upstream/main`. Upstream `168bd17` defaulted TTS to Cartesia without updating the
-test's patched environment.
+**Cartesia readiness test — fixed here, still broken upstream.**
+`test_readiness_has_no_issues_when_runtime_checks_pass` patched the environment
+with only `DEEPGRAM_API_KEY` and `INCEPTION_API_KEY`. Upstream `168bd17` made
+Cartesia the default TTS provider (`config.py` —
+`required_credentials(tts_provider: str = "cartesia")`), so
+`required_credentials()` now also asks for `CARTESIA_API_KEY` and readiness
+reports `missing_cartesia_api_key`.
 
-Recorded here so it is not mistaken for a regression introduced by this repo's
-work. The fix is tracked in `chores.md`.
+Notably the test directly above it *was* updated for the new default, so this was
+an oversight rather than an intended behavior change.
+
+Fixed here 2026-07-18 by adding `CARTESIA_API_KEY` to the patched environment.
+Confirmed still failing on pristine `upstream/main` (clean worktree run) — worth
+sending to Aditya, tracked in `chores.md`.
+
+Suite here is now fully green (287 passed), so any future red is real.
 
 **Restored tests upstream dropped.** Three `SpeechTextFilter` tests
 (`test_speech_filter_removes_fenced_code`,

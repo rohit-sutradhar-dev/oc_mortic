@@ -196,7 +196,13 @@ class HelperReadinessTests(unittest.TestCase):
     def test_readiness_has_no_issues_when_runtime_checks_pass(self) -> None:
         with patch.dict(
             os.environ,
-            {"DEEPGRAM_API_KEY": "audio-key", "INCEPTION_API_KEY": "turn-key"},
+            {
+                "DEEPGRAM_API_KEY": "audio-key",
+                "INCEPTION_API_KEY": "turn-key",
+                # Cartesia is the default tts_provider, so required_credentials()
+                # asks for its key too.
+                "CARTESIA_API_KEY": "tts-key",
+            },
             clear=True,
         ):
             issues = helper_readiness_issues(transport_ready=True, audio_ready=True)
