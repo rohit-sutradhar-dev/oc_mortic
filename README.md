@@ -22,14 +22,12 @@ Required local environment variables for the current voice bridge:
 ```bash
 export INCEPTION_API_KEY="..."
 export DEEPGRAM_API_KEY="..."
+export CARTESIA_API_KEY="..."
 ```
 
-STT always runs on Deepgram Flux. TTS defaults to Deepgram but can be switched
-to Cartesia with `--tts-provider cartesia` (needs `CARTESIA_API_KEY` set too):
-
-```bash
-export CARTESIA_API_KEY="..."  # only needed when --tts-provider cartesia
-```
+STT always runs on Deepgram Flux. TTS defaults to Cartesia; use
+`--tts-provider deepgram` to select Deepgram TTS instead, in which case the
+Cartesia key is not required.
 
 ## Run The Helper
 
@@ -54,16 +52,17 @@ Useful options:
 mortic-helper --help
 mortic-helper --managed-opencode --opencode-dir "/path/to/project"
 mortic-helper --context-threshold 70000 --model-variant low
-mortic-helper --tts-provider cartesia     # switch TTS off Deepgram (STT stays on Flux)
+mortic-helper --tts-provider deepgram     # optional TTS override (STT always stays on Flux)
 mortic-helper --voice-duplex half          # explicit safety fallback / push-to-interrupt
 mortic-helper --device-sample-rate 48000  # native device/AEC clock
 mortic-helper --tts-sample-rate 16000     # provider PCM clock (resampled to device rate)
 mortic-helper --event-completion-grace-sec 0.6  # wait for trailing text before polling; 0 disables
 ```
 
-The orb in the sidepod shows Mortic's live activity — `listening` / `thinking` /
-`speaking` / `muted` — while the caption and prompt annex show mic and connection
-state; the two never report the same thing.
+The orb in the sidepod shows Mortic's live activity — `listening`, `thinking`,
+active work, `speaking`, or `muted` — while COMMS gives a transient, generic
+description such as “I’m reviewing the relevant files.” Tool names, arguments,
+paths, providers, and partial model output stay private.
 
 ## Echo Protection
 
@@ -86,10 +85,12 @@ a 500 ms restart guard, so a playback edge cannot re-arm the same echo.
 `TurnResumed` is compatibility-only and never flushes playback or aborts a
 turn. Eager EOT is disabled until Mortic has an isolated speculative lane.
 
-Turns stream from OpenCode's `/event` feed scoped to the fork's directory. If
-the model produces no delta for three seconds, low-rate polling hedges the live
-event reader from an independently timed task; a stuck poll never blocks SSE,
-and message-ID deduplication prevents repeated text or speech.
+Structured turns are observed through OpenCode's `/event` feed scoped to the
+fork's directory. Low-rate polling hedges the live reader after three seconds,
+and message-ID deduplication prevents repeated output. Only the final validated
+`displayText` and `spokenText` object reaches COMMS and TTS; model narration,
+partial JSON, tool arguments, and repair candidates never do. Deepgram TTS is
+the default at 16 kHz and is resampled locally to the 48 kHz device/AEC clock.
 
 ## Helper Distribution Contract
 

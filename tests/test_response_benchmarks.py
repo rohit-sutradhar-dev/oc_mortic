@@ -51,7 +51,7 @@ class CalibratedContractTests(unittest.TestCase):
         )
         self.assertEqual(result.violations, ())
 
-    def test_inline_json_is_found_anywhere_but_plain_parentheses_are_legal(self) -> None:
+    def test_inline_json_is_found_anywhere_and_display_parentheses_remain_legal(self) -> None:
         case = ResponseCase("json", "safety", "Explain it")
         bad = evaluate_response(
             {"displayText": "Result: {\"status\": \"ready\"} is final.", "spokenText": "The result is ready."},
@@ -63,6 +63,34 @@ class CalibratedContractTests(unittest.TestCase):
         )
         self.assertIn("raw_json", {item.code for item in bad.violations})
         self.assertNotIn("raw_json", {item.code for item in good.violations})
+
+    def test_spoken_brackets_are_rejected_without_rewriting_display_notation(self) -> None:
+        case = ResponseCase("brackets", "notation", "Explain the notation")
+        examples = (
+            "The first item is ready (temporarily).",
+            "Priority [P1] is ready.",
+            "Use Map<string, T> for the result.",
+            "Call refresh(options) next.",
+            "Reconnect the socket, options)",
+        )
+        for spoken in examples:
+            result = evaluate_response(
+                {
+                    "displayText": "Use items[0], Map<string, T>, and refresh(options) temporarily.",
+                    "spokenText": spoken,
+                },
+                case,
+            )
+            self.assertIn("spoken_bracket_notation", {item.code for item in result.violations}, spoken)
+
+        good = evaluate_response(
+            {
+                "displayText": "[P1] uses items[0] with Map<string, T> in refresh(options).",
+                "spokenText": "Priority one uses the first item with a map from strings to T in the refresh function.",
+            },
+            case,
+        )
+        self.assertNotIn("spoken_bracket_notation", {item.code for item in good.violations})
 
     def test_pair_reference_requires_display_and_natural_spoken_identity(self) -> None:
         case = ResponseCase(

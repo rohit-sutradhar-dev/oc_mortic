@@ -47,6 +47,7 @@ class ManagedOpenCodeStartupTests(unittest.TestCase):
             popen.call_args.kwargs["env"]["BUN_OPTIONS"],
             "--dns-result-order=ipv4first",
         )
+        self.assertEqual(popen.call_args.kwargs["env"]["OPENCODE_ENABLE_EXA"], "1")
         self.assertIs(popen.call_args.kwargs["stdout"], helper_main.sys.stderr)
 
     def test_managed_opencode_preserves_existing_bun_options(self) -> None:

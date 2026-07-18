@@ -114,6 +114,7 @@ class HelperEndToEndTests(unittest.TestCase):
                 "OPENCODE_VOICE_OPENCODE_URL": opencode_url,
                 "DEEPGRAM_API_KEY": "e2e-audio-key",
                 "INCEPTION_API_KEY": "e2e-turn-key",
+                "CARTESIA_API_KEY": "e2e-cartesia-key",
             }
             helper = subprocess.Popen(
                 [str(HELPER_BINARY), "--host", "127.0.0.1", "--port", str(helper_port), "--log-level", "error"],

@@ -1,6 +1,6 @@
 # Mortic Mercury Product Acceptance
 
-Run the voice checks once with Cartesia and once with Deepgram. Use laptop speakers, the ordinary microphone, and normal conversational volume. Enable the canary with `OPENCODE_VOICE_RESPONSE_MODE=structured` in the Mortic environment, restart the helper, and confirm `/health` reports `response_mode: structured`. Record the run directory for every failure.
+Run the full voice checks with Deepgram and the focused regression checks with Cartesia. Use laptop speakers, the ordinary microphone, and normal conversational volume. Structured output is the only response path; there is no runtime response-mode flag or legacy fallback. Record the run directory for every failure.
 
 For each response, mark correctness, completeness, screen/speech equivalence, naturalness from 1–5, unexplained silence, truncation or duplication, and whether the first interruption attempt worked.
 
@@ -22,16 +22,18 @@ For each response, mark correctness, completeness, screen/speech equivalence, na
 3. “Can you fix it?” with no antecedent.
    - One direct clarification question, no workspace inspection, and no tool cue.
 4. “Inspect the voice config and tell me the TTS, device, and speech-recognition sample rates.”
-   - One tool-start cue.
+   - One tool-start earcon and transient “I’m reviewing the relevant files.” feedback.
    - Correct facts: 16 kHz TTS, 48 kHz device/AEC, and 16 kHz recognition.
 5. “Correction: I only care about the device and echo-canceller clock. What is it?”
    - Answer: 48 kHz, without resurrecting the superseded details.
 6. “Inspect the current compaction and OpenCode streaming paths and tell me the two highest remaining risks.”
-   - One start cue, one holding cue only if work exceeds four seconds, and no raw tool/model prose before the final.
+   - One onset earcon if a real tool starts before four seconds. At four seconds, hear one matching spoken activity phrase, or a quiet local holding cue if no tool was observed. No raw tool/model prose appears before the atomic final.
 7. “Explain how one spoken turn travels from microphone to screen and speaker in exactly four concise sentences.”
    - Four complete sentences, shown and spoken once with no missing or repeated suffix.
 8. Ask Mortic to read an absolute path, command, and JSON object aloud.
    - It must summarize them naturally instead of reproducing unsafe literals.
+9. Ask for notation containing `[P1]`, `items[0]`, `Map<string, T>`, `refresh(options)`, and `(temporary)`.
+   - The display may retain useful notation. Speech must say natural equivalents and contain no literal parentheses, square brackets, braces, or angle brackets, including unmatched punctuation such as `options)`.
 
 ## Long-session and full-duplex checks
 

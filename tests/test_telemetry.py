@@ -60,7 +60,7 @@ class RunMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["build_sha"], "a" * 40)
         self.assertEqual(metadata["voice_config"]["capture_sample_rate_hz"], 48_000)
         self.assertEqual(metadata["voice_config"]["tts_provider"], "cartesia")
-        self.assertEqual(metadata["voice_config"]["response_mode"], "legacy")
+        self.assertEqual(metadata["voice_config"]["response_mode"], "structured")
         self.assertTrue(str(metadata["config_fingerprint"]).startswith("sha256:"))
 
         same = snapshot_voice_config(

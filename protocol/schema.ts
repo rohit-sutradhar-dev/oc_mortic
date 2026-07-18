@@ -153,6 +153,7 @@ export const thinkingEvent = z.looseObject({
   turnId: id,
   sourceMode: z.enum(["ptt", "live"]),
   phase: z.enum(["responding", "preparing_context", "continuing", "try_again"]).optional(),
+  activity: z.enum(["reasoning", "searching", "inspecting", "working", "finishing"]).optional(),
   voiceLaneId: id.optional(),
   submittedTextChars: z.int().optional(),
 });

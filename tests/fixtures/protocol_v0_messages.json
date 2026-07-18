@@ -141,6 +141,7 @@
         "sentAt": "2026-07-02T04:00:04.300Z",
         "turnId": "turn_0001",
         "sourceMode": "ptt",
+        "activity": "reasoning",
         "voiceLaneId": "lane_123",
         "submittedTextChars": 36
       }

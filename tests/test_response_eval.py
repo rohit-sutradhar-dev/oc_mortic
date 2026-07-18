@@ -14,6 +14,7 @@ from opencode_voice.response_contract import (
     ResponseCase,
     StructuredTurnTracker,
     Violation,
+    evaluate_response,
     grade_response,
     repair_prompt,
 )
@@ -197,6 +198,19 @@ class ResponseContractTests(unittest.TestCase):
 
         codes = {item.code for item in grade_response(value, case)}
         self.assertTrue({"raw_assignment", "spoken_path_spelling"}.issubset(codes))
+
+    def test_spoken_bracket_glyphs_are_rejected_as_repairable_safety_failures(self) -> None:
+        case = ResponseCase("speech-brackets", "notation", "Report it")
+        value = {
+            "displayText": "The status is [P1] and refresh(options) is temporary.",
+            "spokenText": "The status is priority one (temporary).",
+        }
+
+        result = evaluate_response(value, case)
+        violation = next(item for item in result.violations if item.code == "spoken_bracket_notation")
+        self.assertEqual(violation.gate, "safety")
+        self.assertEqual(violation.field, "spokenText")
+        self.assertTrue(violation.repairable)
 
     def test_provider_detection_uses_word_boundaries(self) -> None:
         case = ResponseCase("names", "conversation", "Reply")

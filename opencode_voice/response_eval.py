@@ -234,6 +234,8 @@ class ManagedEvalServer(AbstractContextManager["ManagedEvalServer"]):
                     configured_model["limit"] = dict(overlay["model_limit"])
         env = os.environ.copy()
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+        if self.network_tools:
+            env["OPENCODE_ENABLE_EXA"] = "1"
         env["BUN_OPTIONS"] = " ".join(
             item
             for item in (env.get("BUN_OPTIONS", "").strip(), "--dns-result-order=ipv4first")
@@ -532,7 +534,7 @@ class ResponseEvalRunner:
             source_id = str(source.get("id") or "")
             if not source_id:
                 raise RuntimeError("OpenCode did not create an eval source session")
-            source_before = await self.client._messages(source_id)
+            source_before = await self.client.messages(source_id)
             fork = await self.client.fork_session(source_id)
             fork_id = str(fork.get("id") or "")
             if not fork_id:
@@ -633,7 +635,7 @@ class ResponseEvalRunner:
             judge = None
             if self.judge_enabled and not selected_evaluation.violations and selected_value is not None:
                 judge = await self._judge(case, selected_value, directory)
-            source_after = await self.client._messages(source_id)
+            source_after = await self.client.messages(source_id)
             all_tool_activity = [
                 *observation.tool_activity,
                 *(repair_observation.tool_activity if repair_observation else []),

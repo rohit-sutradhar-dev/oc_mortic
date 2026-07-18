@@ -55,7 +55,7 @@ class TTSProvider(Protocol):
 @dataclass(frozen=True, slots=True)
 class DeepgramTTSOptions:
     api_key: str = field(repr=False)
-    model: str = "aura-2-thalia-en"
+    model: str = "aura-2-jupiter-en"
     sample_rate: int = 16_000
     connect_timeout_sec: float = 5.0
     send_timeout_sec: float = 0.5

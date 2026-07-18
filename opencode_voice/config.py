@@ -65,7 +65,7 @@ TTS_PROVIDER_CREDENTIALS: dict[str, CredentialSpec] = {
 ALL_CREDENTIALS = REQUIRED_CREDENTIALS + tuple(TTS_PROVIDER_CREDENTIALS.values())
 
 
-def required_credentials(tts_provider: str = "deepgram") -> tuple[CredentialSpec, ...]:
+def required_credentials(tts_provider: str = "cartesia") -> tuple[CredentialSpec, ...]:
     extra = TTS_PROVIDER_CREDENTIALS.get(tts_provider)
     return REQUIRED_CREDENTIALS + ((extra,) if extra else ())
 
@@ -146,7 +146,7 @@ class VoiceConfig:
     max_turn_sec: float = 300.0
     run_root: str = "runs/voice"
     deepgram_stt_model: str = "flux-general-en"
-    deepgram_tts_model: str = "aura-2-thalia-en"
+    deepgram_tts_model: str = "aura-2-jupiter-en"
     # Flux is fixed to a narrow-band transport clock.  TTS and the physical
     # device deliberately have separate clocks; conflating all three was the
     # reason provider-sized chunks were being written directly to a 16 kHz
@@ -160,7 +160,7 @@ class VoiceConfig:
     device_sample_rate: int = 48_000
     # STT stays on Deepgram Flux regardless of this setting; it only selects
     # which service synthesizes TTS audio.
-    tts_provider: str = "deepgram"
+    tts_provider: str = "cartesia"
     cartesia_tts_model: str = "sonic-3.5"
     cartesia_voice_id: str = "25d7abcb-4d6d-4aca-adce-8a1c85620c8b"
     cartesia_version: str = "2026-03-01"
@@ -174,10 +174,6 @@ class VoiceConfig:
     # gate the mic while TTS is audible. "full": raw passthrough (headphones).
     # "half": force the gate.
     voice_duplex: str = "auto"
-    # Canary switch for the strict display/spoken response contract. Keep the
-    # legacy path available for one release until both TTS provider matrices
-    # pass on real devices.
-    response_mode: str = "legacy"
     opencode_agent: str = "voice-build"
     voice_agent_prompt_path: str = "opencode_voice/voice_agent.md"
     keep_fork_default: bool = False
@@ -267,7 +263,7 @@ def load_voice_credentials(
     *,
     environ: MutableMapping[str, str] | None = None,
     dotenv_path: str | Path = ".env",
-    tts_provider: str = "deepgram",
+    tts_provider: str = "cartesia",
 ) -> VoiceCredentials:
     target = environ if environ is not None else os.environ
     load_local_dotenv(dotenv_path, target)
