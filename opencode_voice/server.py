@@ -1071,14 +1071,104 @@ def create_app(
     return app
 
 
-class VoiceConnection:
+async def reap_stale_voice_forks(
+    client: AgentBackend, logger: RunLogger, exclude_ids: set[str] | None = None
+) -> int:
+    exclude_ids = exclude_ids or set()
+    try:
+        rows = await client.list_sessions()
+    except Exception as exc:  # noqa: BLE001 - stale cleanup must not block helper startup.
+        logger.write("fork.reap.error", error=repr(exc), stage="list")
+        return 0
+    deleted = 0
+    for row in rows:
+        title = str(row.get("title") or session_title(row))
+        session_id = str(row.get("id") or "")
+        if not session_id or session_id in exclude_ids or not title.startswith(EPHEMERAL_PREFIX):
+            continue
+        try:
+            await client.delete_session(session_id)
+        except Exception as exc:  # noqa: BLE001 - best-effort stale cleanup.
+            logger.write("fork.reap.error", session_id=session_id, error=repr(exc), stage="delete")
+            continue
+        deleted += 1
+        logger.write("fork.reap.delete", session_id=session_id, title=title)
+    if deleted:
+        logger.write("fork.reap.complete", deleted=deleted)
+    return deleted
+
+
+@dataclass
+class TurnSeam:
+    """Per-turn bookkeeping for translating one legacy engine turn to v0."""
+
+    lane_id: str
+    started_at: float
+    latency: dict[str, Any] = field(default_factory=dict)
+    stream_source: str = "event"
+    assistant_seq: int = 0
+    # Kept (not popped) after turn.complete so a first TTS chunk arriving
+    # after the text finished can still report firstAudioMs.
+    completed: bool = False
+    pending_complete: dict[str, Any] | None = None
+    tts_expected: bool = False
+    provider_terminal: bool = False
+    provider_outcome: str | None = None
+    playback_started: bool = False
+    playback_drained: bool = False
+
+
+@dataclass
+class ActiveLaneRecord:
+    owner_id: str
+    source_session_id: str
+    voice_lane_id: str
+    acquired_at: float
+
+
+class ActiveSidepodLaneRegistry:
+    """Process-local guard for the single managed helper/workspace.
+
+    V1 deliberately rejects a second active lane instead of trying to merge or
+    take over audio state across TUI windows.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._active: ActiveLaneRecord | None = None
+
+    async def acquire(self, *, owner_id: str, source_session_id: str, voice_lane_id: str) -> ActiveLaneRecord | None:
+        async with self._lock:
+            if self._active is not None and self._active.owner_id != owner_id:
+                return self._active
+            self._active = ActiveLaneRecord(
+                owner_id=owner_id,
+                source_session_id=source_session_id,
+                voice_lane_id=voice_lane_id,
+                acquired_at=time.time(),
+            )
+            return None
+
+    async def release(self, owner_id: str) -> None:
+        async with self._lock:
+            if self._active is not None and self._active.owner_id == owner_id:
+                self._active = None
+
+
+class SidepodConnection:
+    """Protocol v0 lane. Every outbound message funnels through the send_json
+    override: legacy engine vocabulary is translated to v0, schema-validated,
+    and anything off-contract is kept off the wire (fail closed)."""
     def __init__(
         self,
         config: VoiceConfig,
         client: AgentBackend,
         logger: RunLogger,
         websocket: WebSocket,
+        client_factory: Callable[[str, float], AgentBackend] = OpenCodeClient,
+        lane_registry: ActiveSidepodLaneRegistry | None = None,
     ) -> None:
+        # Old Voice Connection init
         self.config = config
         self.client = client
         self.logger = logger
@@ -1167,7 +1257,470 @@ class VoiceConnection:
         self.interruption_decision_task: asyncio.Task[None] | None = None
         self.interruption_expiry_task: asyncio.Task[None] | None = None
 
+        # Sidepod Init
+        self.client_factory = client_factory
+        self.connection_id = f"sidepod_{id(self)}"
+        self.lane_registry = lane_registry or ActiveSidepodLaneRegistry()
+        self.lane_registered = False
+        self.lane_event_types = frozenset(sidepod_schema_document()["events"])
+        self.mic_watchdog_task: asyncio.Task[None] | None = None
+        self.lane_turn_counter = 0
+        self.pending_turn_id: str | None = None
+        self.transcript_seq = 0
+        self.last_interim_transcript = ""
+        self.speech_started_at: float | None = None
+        self.pending_latency: dict[str, Any] = {}
+        self.admitted_eot_started_at: float | None = None
+        # One turn runs at a time; the dict form only tolerates stragglers
+        # from an aborted turn arriving after the next one starts.
+        self.turn_seams: dict[int, TurnSeam] = {}
+
+    async def run(self) -> None:
+        readiness_issues = helper_readiness_issues(
+            transport_ready=True,
+            debug_ref=str(self.logger.run_dir),
+            tts_provider=self.config.tts_provider,
+        )
+        self.sidepod_readiness_issues = readiness_issues
+        if readiness_issues:
+            self.logger.state_transition(
+                "sidepod.connected",
+                "voice_bridge_issue",
+                diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
+            )
+            for issue in readiness_issues:
+                await self.send_json(issue)
+        else:
+            self.logger.state_transition("sidepod.connected", "waiting_for_start")
+
+        while True:
+            message = await self.websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            text = message.get("text")
+            if text is None:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                await self.send_protocol_issue(
+                    diagnostic_code="protocol_invalid_message",
+                    safe_detail="Invalid sidepod message",
+                )
+                continue
+            await self.handle_control(payload)
+
+    async def handle_control(self, payload: Any) -> None:
+        # Lane negotiation outranks shape validation: a start for a version we
+        # do not speak must answer protocol_version_unsupported, not invalid.
+        if isinstance(payload, dict) and payload.get("type") == "start":
+            version = payload.get("protocolVersion")
+            if isinstance(version, str) and version != SIDEPOD_PROTOCOL_VERSION:
+                await self.send_protocol_issue(
+                    diagnostic_code="protocol_version_unsupported",
+                    safe_detail="Sidepod protocol unsupported",
+                    retryable=False,
+                )
+                return
+        check = check_sidepod_command(payload)
+        if check.unknown_type:
+            # Compatibility rule: unknown message types are logged and ignored.
+            self.logger.write("sidepod.command.unknown", message_type=payload.get("type"))
+            return
+        if not check.ok:
+            self.logger.write(
+                "sidepod.command.invalid",
+                message_type=payload.get("type") if isinstance(payload, dict) else None,
+                errors=list(check.errors),
+            )
+            await self.send_protocol_issue(
+                diagnostic_code="protocol_invalid_message",
+                safe_detail="Invalid sidepod command",
+            )
+            return
+        kind = payload["type"]
+        if kind == "start":
+            await self.handle_start(payload)
+        elif kind == "stop":
+            await self.handle_stop(payload)
+        elif kind == "refresh":
+            await self.handle_refresh(payload)
+        elif kind == "ptt.start":
+            await self.handle_ptt_start(payload)
+        elif kind == "ptt.stop":
+            await self.handle_ptt_stop(payload)
+        elif kind == "live.set":
+            await self.handle_live_set(payload)
+        elif kind == "barge_in":
+            await self.barge_in(reason=str(payload.get("reason") or "sidepod"))
+        elif kind == "confirm.response":
+            self.logger.write(
+                "sidepod.confirm.response",
+                prompt_id=payload.get("promptId"),
+                action_id=payload.get("actionId"),
+                confirmed=bool(payload.get("confirmed")),
+                voice_lane_id=self.voice_lane_id,
+            )
+
+    async def handle_start(self, payload: dict[str, Any]) -> None:
+        # Version and shape are already enforced by handle_control before any
+        # wire message reaches here; handle_refresh builds a conforming payload.
+        source_session_id = str(payload.get("sourceSessionId") or "")
+        if self.sidepod_readiness_issues:
+            for issue in self.sidepod_readiness_issues:
+                await self.send_json(issue)
+            return
+
+        opencode_url = str(payload.get("opencodeUrl") or "").strip().rstrip("/")
+        if opencode_url and opencode_url != getattr(self.client, "base_url", None):
+            await self.client.close()
+            self.client = self.client_factory(opencode_url, 60)
+            self.message_cache.clear()
+            self.logger.write("sidepod.opencode.rebind", opencode_url=opencode_url)
+
+        if self.fork_session_id:
+            await self.stop()
+        self.voice_lane_id = self.voice_lane_id or f"lane_{int(time.time() * 1000)}"
+        try:
+            source_session = await self.client.get_session(source_session_id)
+        except Exception as exc:  # noqa: BLE001 - keep sidepod transport alive.
+            self.logger.write("sidepod.start.source_error", source_session_id=source_session_id, error=repr(exc))
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_start_failed",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+        source_title = str(source_session.get("title") or session_title(source_session))
+        if source_title.startswith(EPHEMERAL_PREFIX):
+            self.logger.write(
+                "sidepod.start.voice_tmp_source",
+                source_session_id=source_session_id,
+                source_title=source_title,
+            )
+            await self.send_protocol_issue(
+                diagnostic_code="voice_tmp_source_session",
+                safe_detail="Switch to the original chat before starting Mortic voice.",
+                retryable=True,
+            )
+            return
+        blocking_lane = await self.lane_registry.acquire(
+            owner_id=self.connection_id,
+            source_session_id=source_session_id,
+            voice_lane_id=self.voice_lane_id,
+        )
+        if blocking_lane is not None:
+            self.logger.write(
+                "sidepod.lane.busy",
+                source_session_id=source_session_id,
+                active_source_session_id=blocking_lane.source_session_id,
+                active_voice_lane_id=blocking_lane.voice_lane_id,
+            )
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_already_active",
+                safe_detail="Mortic voice is already active in this workspace.",
+                retryable=True,
+            )
+            return
+        self.lane_registered = True
+        # Open Flux while the fork is being prepared. This removes the
+        # provider handshake from the first M press without prompting for or
+        # opening the microphone before the user asks.
+        self.schedule_audio_prewarm()
+        if not self.config.keep_fork_default:
+            await reap_stale_voice_forks(self.client, self.logger, exclude_ids={source_session_id})
+        try:
+            fork = await self.create_voice_fork(
+                source_session_id,
+                keep_fork=bool(payload.get("keepFork")),
+                original=source_session,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep sidepod transport alive.
+            self.lane_registered = False
+            await self.lane_registry.release(self.connection_id)
+            await self.stop_audio(reason="lane_start_failed")
+            self.logger.write("sidepod.start.error", source_session_id=source_session_id, error=repr(exc))
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_start_failed",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+
+        self.logger.state_transition("waiting_for_start", "ready", voice_lane_id=self.voice_lane_id)
+        await self.send_json(
+            {
+                "type": "ready",
+                "sentAt": iso_utc_now(),
+                "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
+                "voiceLaneId": self.voice_lane_id,
+                "state": "ready",
+                "sourceSessionId": fork["source_session_id"],
+                "forkSessionId": fork["fork_session_id"],
+            }
+        )
+        await self.maybe_start_compaction(reason="session_start", run_in_background=True)
+
+    async def handle_refresh(self, payload: dict[str, Any]) -> None:
+        source_session_id = str(payload.get("sourceSessionId") or self.source_session_id or "")
+        if not source_session_id:
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_not_started",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+        await self.stop()
+        await self.handle_start(
+            {
+                "type": "start",
+                "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
+                "sourceSessionId": source_session_id,
+                "keepFork": self.keep_fork,
+            }
+        )
+
+    def schedule_mic_start(self) -> None:
+        self.mic_desired_live = True
+        if self.native_mic or self.native_audio_engine:
+            return
+        if self.mic_start_task and not self.mic_start_task.done():
+            return
+        self.mic_start_generation += 1
+        generation = self.mic_start_generation
+        transport_prepared = self.flux is not None
+        task = asyncio.create_task(self.start_mic_generation(generation, transport_prepared))
+        self.mic_start_task = task
+
+        def clear_finished(done: asyncio.Task[None]) -> None:
+            if self.mic_start_task is done:
+                self.mic_start_task = None
+
+        task.add_done_callback(clear_finished)
+
+    async def cancel_pending_mic_start(self, reason: str) -> None:
+        task = self.mic_start_task
+        was_pending = self.mic_desired_live or bool(task and not task.done())
+        self.mic_desired_live = False
+        self.mic_start_generation += 1
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self.mic_start_task is task:
+            self.mic_start_task = None
+        if was_pending:
+            self.logger.write("native_audio.start.cancel", reason=reason)
+
+    async def start_mic_generation(self, generation: int, transport_prepared: bool) -> None:
+        started_at = time.perf_counter()
+        try:
+            started = await self.start_native_audio()
+        except asyncio.CancelledError:
+            await self.stop_audio(reason="mic_start_cancelled", keep_transport=True)
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the v0 lane alive while STT reconnects.
+            if generation != self.mic_start_generation or not self.mic_desired_live:
+                return
+            self.mic_desired_live = False
+            self.logger.write(
+                "flux.connection.error",
+                stage="initial_connect",
+                error_code=type(exc).__name__,
+            )
+            await self.stop_audio(reason="stt_initial_connect_failed")
+            await self.send_json(
+                voice_bridge_issue_payload(
+                    capability="voice_audio",
+                    diagnostic_code="stt_transport_unhealthy",
+                    safe_detail="Voice recognition reconnecting",
+                    retryable=True,
+                    debug_ref=str(self.logger.run_dir),
+                    voice_lane_id=self.voice_lane_id,
+                )
+            )
+            return
+
+        if generation != self.mic_start_generation or not self.mic_desired_live:
+            await self.stop_audio(reason="mic_start_superseded", keep_transport=True)
+            return
+        if not started:
+            self.mic_desired_live = False
+            return
+        self.mic_capture_gated = False
+        self.start_mic_watchdog()
+        # Recheck after every awaited startup operation. A fast M/off must
+        # never be followed by a stale listening acknowledgement.
+        if generation != self.mic_start_generation or not self.mic_desired_live:
+            await self.shutdown_mic_watchdog()
+            await self.stop_audio(reason="mic_start_superseded", keep_transport=True)
+            return
+        self.logger.write(
+            "native_audio.mic.ready",
+            latency_ms=elapsed_ms(started_at),
+            transport_prepared=transport_prepared,
+            mode=self.duplex_mode(),
+        )
+        await self.send_json(
+            {
+                "type": "listening",
+                "sentAt": iso_utc_now(),
+                "voiceLaneId": self.voice_lane_id,
+                "mode": "live",
+            }
+        )
+
+    async def handle_live_set(self, payload: dict[str, Any]) -> None:
+        if not self.fork_session_id or not self.voice_lane_id:
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_not_started",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+        if bool(payload.get("value")):
+            if self.native_audio_engine and self.flux:
+                self.mic_desired_live = True
+                self.mic_capture_gated = False
+                self.mic_start_generation += 1
+                self.native_audio_engine.set_capture_enabled(True)
+                self.reset_audio_input_counters()
+                self.start_mic_watchdog()
+                self.logger.write("native_audio.capture_gate", enabled=True, reason="live.set.true")
+                await self.send_json(
+                    {
+                        "type": "listening",
+                        "sentAt": iso_utc_now(),
+                        "voiceLaneId": self.voice_lane_id,
+                        "mode": "live",
+                    }
+                )
+            else:
+                self.schedule_mic_start()
+        else:
+            reason = str(payload.get("reason") or "live.set.false")
+            self.mic_capture_gated = True
+            if self.native_audio_engine:
+                # Apply the privacy gate before any cancellation await.
+                self.native_audio_engine.set_capture_enabled(False)
+            await self.cancel_pending_mic_start(reason)
+            await self.shutdown_mic_watchdog()
+            if self.native_audio_engine:
+                # Soft mute: the synchronized device/AEC/output clock keeps
+                # running, while real capture is replaced with timed silence
+                # before it can reach Flux.
+                self.log_audio_input_summary(reason=reason)
+                self.reset_audio_input_counters()
+                active_episode = self.interruption_episode
+                self.reset_capture_interruption_state()
+                if active_episode is not None:
+                    self.expire_interruption_episode(active_episode)
+                self.logger.write("native_audio.capture_gate", enabled=False, reason=reason)
+            else:
+                # Explicit half-duplex fallback owns a separate mic stream,
+                # so closing it cannot disturb speaker playback.
+                await self.stop_audio(reason=reason, keep_transport=True)
+
+    def start_mic_watchdog(self) -> None:
+        self.cancel_mic_watchdog()
+        self.mic_watchdog_task = asyncio.create_task(self.mic_watchdog())
+
+    def cancel_mic_watchdog(self) -> asyncio.Task[None] | None:
+        task = self.mic_watchdog_task
+        if task and not task.done():
+            task.cancel()
+        self.mic_watchdog_task = None
+        return task
+
+    async def shutdown_mic_watchdog(self) -> None:
+        task = self.cancel_mic_watchdog()
+        if task and task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def mic_watchdog(self) -> None:
+        try:
+            await asyncio.sleep(MIC_WATCHDOG_SEC)
+        except asyncio.CancelledError:
+            return
+        if not (self.native_mic or self.native_audio_engine) or self.audio_input_chunks:
+            return
+        self.mic_desired_live = False
+        self.logger.write("native_audio.silent", window_sec=MIC_WATCHDOG_SEC)
+        await self.stop_audio(reason="mic_watchdog_silent")
+        await self.send_json(
+            voice_bridge_issue_payload(
+                capability="voice_audio",
+                diagnostic_code="mic_permission_needed",
+                safe_detail="Mic permission needed",
+                retryable=True,
+                debug_ref=str(self.logger.run_dir),
+                voice_lane_id=self.voice_lane_id,
+            )
+        )
+
+    async def handle_ptt_start(self, payload: dict[str, Any]) -> None:
+        if not self.fork_session_id or not self.voice_lane_id:
+            await self.send_protocol_issue(
+                diagnostic_code="voice_lane_not_started",
+                safe_detail="Voice lane unavailable",
+            )
+            return
+        self.active_turn_id = None
+        self.protocol_turn_id = str(payload.get("turnId") or "")
+        await self.send_protocol_issue(
+            diagnostic_code="native_audio_capture_unavailable",
+            safe_detail="Audio capture unavailable",
+        )
+
+    async def handle_ptt_stop(self, payload: dict[str, Any]) -> None:
+        turn_id = str(payload.get("turnId") or "")
+        if turn_id and self.protocol_turn_id == turn_id:
+            await self.barge_in(reason=str(payload.get("reason") or "ptt.stop"))
+            self.protocol_turn_id = ""
+
+    async def handle_stop(self, payload: dict[str, Any]) -> None:
+        reason = str(payload.get("reason") or "user.end_session")
+        lane_id = self.voice_lane_id
+        fork_deleted = bool(self.fork_session_id and not self.keep_fork)
+        await self.stop()
+        stopped: dict[str, Any] = {
+            "type": "stopped",
+            "sentAt": iso_utc_now(),
+            "reason": reason,
+            "forkDeleted": fork_deleted,
+        }
+        if lane_id:
+            stopped["voiceLaneId"] = lane_id
+        await self.send_json(stopped)
+
+    async def stop(self) -> None:
+        await self.cancel_pending_mic_start("sidepod_stop")
+        await self.shutdown_mic_watchdog()
+        await self.stop_audio(reason="sidepod_stop")
+        if self.turn_task and not self.turn_task.done():
+            self.turn_task.cancel()
+        self.clear_pending_completions()
+        await self.interrupt_playback("sidepod_stop")
+        # interrupt_playback keeps the device stream for the next turn; the
+        # session is over, so actually release it here.
+        if self.native_speaker:
+            await self.native_speaker.close()
+            self.native_speaker = None
+        if self.native_audio_engine:
+            await self.native_audio_engine.close()
+            self.native_audio_engine = None
+        await self.delete_voice_fork()
+        self.protocol_turn_id = ""
+        self.pending_turn_id = None
+        self.last_interim_transcript = ""
+        self.lane_registered = False
+        await self.lane_registry.release(self.connection_id)
+
     async def close(self) -> None:
+        await self.cancel_pending_mic_start("sidepod_close")
+        await self.shutdown_mic_watchdog()
+        try:
+            await self.close_base()
+        finally:
+            self.lane_registered = False
+            await self.lane_registry.release(self.connection_id)
+
+    async def close_base(self) -> None:
         self.closed = True
         now_ms = self.interruption_elapsed_ms()
         self.interruption_state = reduce_interruption(
@@ -1182,7 +1735,7 @@ class VoiceConnection:
             self.flux_watchdog_task,
             self.audio_transport_task,
             self.mic_start_task,
-            getattr(self, "mic_watchdog_task", None),
+            self.mic_watchdog_task,
             *self.tts_terminal_watchdogs.values(),
             *(
                 task
@@ -1239,6 +1792,590 @@ class VoiceConnection:
                 self.logger.write("fork.delete.error", session_id=fork_id, error=repr(exc))
             finally:
                 self.message_cache.pop(fork_id, None)
+
+    async def send_tts_audio(self, data: bytes, turn_id: int | PlaybackToken | None) -> None:
+        if self.native_speaker_unavailable:
+            return
+        token = turn_id if isinstance(turn_id, PlaybackToken) else PlaybackToken(self.speak_generation, int(turn_id or 0))
+        self.tts_last_audio_at[token] = time.monotonic()
+        if self.native_audio_engine is not None:
+            if not await self.native_audio_engine.play(data, token):
+                if token.generation != self.speak_generation:
+                    self.stale_tts_chunks += 1
+                    self.logger.write(
+                        "native_tts.stale_generation.drop",
+                        turn_id=token.turn_id,
+                        bytes=len(data),
+                        playback_generation=token.generation,
+                        active_playback_generation=self.speak_generation,
+                    )
+                    return
+                self.tts_unavailable_chunks += 1
+                if self.tts_unavailable_chunks == 1 or self.tts_unavailable_chunks % 50 == 0:
+                    self.logger.write(
+                        "native_tts.play.unavailable",
+                        turn_id=token.turn_id,
+                        bytes=len(data),
+                        chunks=self.tts_unavailable_chunks,
+                        playback_generation=token.generation,
+                    )
+            return
+        speaker = await self.ensure_native_speaker_output()
+        if speaker is None:
+            return
+        speaker.begin_turn(token)
+        if not await speaker.play(data, token):
+            if token.generation != self.speak_generation:
+                self.stale_tts_chunks += 1
+                self.logger.write(
+                    "native_tts.stale_generation.drop",
+                    turn_id=token.turn_id,
+                    bytes=len(data),
+                    playback_generation=token.generation,
+                    active_playback_generation=self.speak_generation,
+                )
+                return
+            self.tts_unavailable_chunks += 1
+            if self.tts_unavailable_chunks == 1 or self.tts_unavailable_chunks % 50 == 0:
+                self.logger.write(
+                    "native_tts.play.unavailable",
+                    turn_id=token.turn_id,
+                    bytes=len(data),
+                    chunks=self.tts_unavailable_chunks,
+                )
+
+    async def on_first_playback_frame(self, token: PlaybackToken) -> None:
+        """`speaking` begins at device exposure, never provider arrival."""
+        feedback = self.feedback_by_token.get(token)
+        if feedback is not None:
+            self.logger.write(
+                "feedback.speech.first_audio",
+                turn_id=feedback.turn_id,
+                playback_generation=token.generation,
+            )
+            return
+        if token.generation != self.speak_generation or self.tts_first_audio_seen:
+            return
+        self.tts_first_audio_seen = True
+        await self.send_json({"type": "tts.first_audio", "turn_id": token.turn_id})
+        self.logger.write(
+            "tts.first_audio",
+            turn_id=token.turn_id,
+            playback_generation=token.generation,
+        )
+        self.logger.state_transition("awaiting_playback", "speaking", turn_id=token.turn_id)
+
+    async def on_tts_turn_began(self, token: PlaybackToken) -> None:
+        seam = self.turn_seams.get(token.turn_id)
+        if seam is not None:
+            seam.provider_terminal = False
+            seam.provider_outcome = None
+            seam.playback_drained = False
+
+    async def on_tts_turn_terminal(
+        self,
+        token: PlaybackToken,
+        outcome: str,
+        *,
+        error_code: str | None = None,
+    ) -> None:
+        already_terminal = token in self.tts_terminal_tokens
+        await self.on_tts_turn_terminal_base(token, outcome, error_code=error_code)
+        if already_terminal:
+            return
+        seam = self.turn_seams.get(token.turn_id)
+        if seam is None:
+            return
+        seam.provider_terminal = True
+        seam.provider_outcome = outcome
+        if not self.playback_has_pending_audio():
+            # A provider can legitimately finish without a non-silent frame
+            # after speech filtering. There will be no device drain callback.
+            seam.playback_drained = True
+        if seam.completed and seam.pending_complete is not None and seam.playback_drained:
+            await self.flush_pending_completions(
+                reason="provider_failed" if outcome == "failed" else "provider_done",
+                legacy_id=token.turn_id,
+            )
+
+    def feed_render_reference(self, data: bytes) -> None:
+        # Called on the playback worker thread just before the device write,
+        # so the timestamp approximates when this chunk starts playing.
+        probe_data = self.render_to_probe_resampler.push(data) if self.render_to_probe_resampler else data
+        self.render_audio_ring.append(probe_data)
+        if self.echo_canceller:
+            self.echo_canceller.process_render(data)
+
+    async def on_playback_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "playback.event")
+        detail = {key: value for key, value in event.items() if key != "type"}
+        self.logger.write(event_type, **detail)
+
+    async def on_playback_drained(self, token: PlaybackToken | None = None) -> None:
+        feedback = self.feedback_by_token.get(token) if token is not None else None
+        if feedback is not None:
+            feedback.drained.set()
+            self.logger.write(
+                "feedback.speech.drain",
+                turn_id=feedback.turn_id,
+                playback_generation=token.generation,
+            )
+            return
+        legacy_id = token.turn_id if token is not None else None
+        if legacy_id is None:
+            pending_ids = [item_id for item_id, seam in self.turn_seams.items() if seam.pending_complete]
+            if len(pending_ids) == 1:
+                legacy_id = pending_ids[0]
+                token = self.turn_playback_tokens.get(legacy_id)
+        seam = self.turn_seams.get(legacy_id) if legacy_id is not None else None
+        if seam is not None:
+            seam.playback_drained = True
+            # Older injected speakers predate provider lifecycle events. Real
+            # providers must explicitly own EOF; keep compatibility confined
+            # to fakes/adapters that don't advertise the terminal contract.
+            if not bool(getattr(self.speaker, "supports_terminal_events", False)):
+                seam.provider_terminal = True
+                seam.provider_outcome = seam.provider_outcome or "done"
+                if token is not None:
+                    self.tts_terminal_tokens.setdefault(token, "done")
+                    if self.tts_turn_token == token:
+                        self.tts_turn_token = None
+            if seam.provider_terminal:
+                await self.flush_pending_completions(
+                    reason="playback_drained",
+                    legacy_id=legacy_id,
+                )
+                if seam.completed:
+                    self.logger.state_transition("speaking", "ready", turn_id=legacy_id)
+        # Reply finished speaking: return the lane to a resting listening
+        # state so the viewer's activity indicator stops reading "speaking".
+        # Only while the mic is still live and no new turn has taken over.
+        if (
+            self.native_mic is None and self.native_audio_engine is None
+            or self.active_turn_id is not None
+            or self.interruption_state.phase in {InterruptionPhase.CANDIDATE, InterruptionPhase.INTERRUPTED}
+        ):
+            return
+        if not self.voice_lane_id:
+            return
+        await self.send_json(
+            {
+                "type": "listening",
+                "sentAt": iso_utc_now(),
+                "voiceLaneId": self.voice_lane_id,
+                "mode": "live",
+            }
+        )
+
+    async def barge_in(self, reason: str) -> None:
+        turn_id = self.protocol_turn_id or None
+        # `interrupted` means something was actually cut off; a speech.start
+        # with no active turn or speech is just the user starting to talk.
+        if not await self.interrupt_playback(reason):
+            return
+        for seam in self.turn_seams.values():
+            if seam.lane_id != turn_id:
+                continue
+            interrupted_latency = {
+                key: value for key, value in seam.latency.items() if isinstance(value, (int, float))
+            }
+            interrupted_latency["totalMs"] = elapsed_ms(seam.started_at)
+            self.logger.write(
+                "sidepod.turn.latency.interrupted",
+                turn_id=seam.lane_id,
+                stream_source=seam.stream_source,
+                interruption_reason=reason,
+                **interrupted_latency,
+            )
+            break
+        self.clear_pending_completions()
+        await self.abort_fork_turn()
+        payload: dict[str, Any] = {"type": "interrupted", "sentAt": iso_utc_now(), "reason": reason}
+        if self.voice_lane_id:
+            payload["voiceLaneId"] = self.voice_lane_id
+        if turn_id:
+            payload["turnId"] = turn_id
+        await self.send_json(payload)
+
+    async def forward_flux_event(self, event: SpeechEvent) -> None:
+        etype = str(event.type or "")
+        if etype == "speech.start":
+            self.speech_started_at = time.perf_counter()
+            return
+        if etype == "speech.transcript":
+            # Flux can send interim text before StartOfTurn. Only an episode
+            # already owned as an ordinary user turn may create provisional
+            # sidepod text; candidates and pre-start text remain private until
+            # the controller admits their final EOT.
+            if self.interruption_state.phase is not InterruptionPhase.USER_TURN:
+                return
+            text = str(event.transcript or "")
+            if text.strip():
+                await self.send_lane_transcript(text, final=False, confidence=event.confidence)
+            return
+        # speech.end is deliberately NOT forwarded here: the durable
+        # (final) transcript entry is emitted from on_transcript_admitted
+        # only after the admission gate accepts it — rejected echo used to
+        # render in the transcript as words the user never said.
+        # Other raw STT events (speech.resumed, socket notices) stay off the lane.
+
+    async def on_transcript_admitted(self, transcript: str, confidence: float | None) -> None:
+        self.admitted_eot_started_at = time.perf_counter()
+        await self.send_lane_transcript(transcript, final=True, confidence=confidence)
+
+    async def send_lane_transcript(self, text: str, final: bool, confidence: Any = None) -> None:
+        # Flux emits Update about four times per second even if its current
+        # turn transcript hasn't changed. Repainting the same provisional text
+        # wastes protocol/TUI work and made live sessions look noisy. The final
+        # event is never deduplicated because it closes the transcript turn.
+        if not final and text == self.last_interim_transcript:
+            return
+        self.last_interim_transcript = "" if final else text
+        turn_id = self.ensure_pending_turn()
+        if "firstTranscriptMs" not in self.pending_latency and self.speech_started_at is not None:
+            self.pending_latency["firstTranscriptMs"] = elapsed_ms(self.speech_started_at)
+        self.transcript_seq += 1
+        payload: dict[str, Any] = {
+            "type": "transcript",
+            "sentAt": iso_utc_now(),
+            "turnId": turn_id,
+            "sequence": self.transcript_seq,
+            "text": text,
+            "final": final,
+        }
+        if isinstance(confidence, (int, float)):
+            payload["confidence"] = float(confidence)
+        await self.send_json(payload)
+
+    def ensure_pending_turn(self) -> str:
+        if not self.pending_turn_id:
+            self.lane_turn_counter += 1
+            self.pending_turn_id = f"turn_{self.lane_turn_counter:04d}"
+            self.transcript_seq = 0
+            self.pending_latency = {}
+        return self.pending_turn_id
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        if str(payload.get("type") or "") == "turn.start":
+            # A new turn is not evidence that the previous reply finished
+            # speaking.  Only release an old completion that already owns
+            # both provider EOF and device drain; an interrupted/nonterminal
+            # reply must never be reported as successfully complete.
+            await self.flush_pending_completions(reason="new_turn", ready_only=True)
+        outbound = self.translate_to_v0(payload)
+        if outbound is INTERNAL_EVENT_HANDLED:
+            return
+        if outbound is None:
+            self.logger.write("sidepod.lane.unknown", message_type=payload.get("type"))
+            return
+        assert isinstance(outbound, dict)
+        check = check_sidepod_event(outbound)
+        if not check.ok:
+            self.logger.write(
+                "sidepod.lane.violation",
+                message_type=str(outbound.get("type")),
+                errors=list(check.errors),
+            )
+            return
+        await self.send_json_base(outbound)
+
+    def translate_to_v0(self, payload: dict[str, Any]) -> dict[str, Any] | object | None:
+        message_type = str(payload.get("type") or "")
+        # v0-native payloads (lane handlers and base-class issue plumbing both
+        # emit them) pass through; the discriminator against same-named legacy
+        # messages is `sentAt`, which no legacy message may ever carry.
+        if message_type in self.lane_event_types and "sentAt" in payload:
+            return payload
+        if message_type == "turn.start":
+            return self.translate_turn_start(payload)
+        if message_type == "turn.activity":
+            return self.translate_thinking_activity(payload)
+        if message_type in {"compaction.wait", "compaction.continuing", "compaction.try_again", "compaction.wait.timeout"}:
+            phase = {
+                "compaction.wait": "preparing_context",
+                "compaction.continuing": "continuing",
+                "compaction.try_again": "try_again",
+                "compaction.wait.timeout": "try_again",
+            }[message_type]
+            return self.translate_thinking_phase(payload, phase)
+        if message_type == "assistant.delta":
+            return self.translate_assistant_delta(payload)
+        if message_type == "assistant.first_text":
+            seam = self.turn_seams.get(int(payload.get("turn_id") or 0))
+            latency_ms = payload.get("latency_ms")
+            if seam and isinstance(latency_ms, (int, float)):
+                seam.latency["firstAssistantTextMs"] = latency_ms
+            return INTERNAL_EVENT_HANDLED
+        if message_type == "tts.first_audio":
+            return self.translate_tts_first_audio(payload)
+        if message_type == "turn.complete":
+            return self.translate_turn_complete(payload) or INTERNAL_EVENT_HANDLED
+        if message_type in ("turn.error", "turn.timeout"):
+            return self.translate_turn_failure(payload)
+        if message_type == "opencode.stream.fallback":
+            seam = self.turn_seams.get(int(payload.get("turn_id") or 0))
+            if seam:
+                seam.stream_source = "poll_after_event" if payload.get("prompt_sent") else "poll"
+            return INTERNAL_EVENT_HANDLED
+        if message_type == "error":
+            return voice_bridge_issue_payload(
+                capability="sidepod_transport",
+                diagnostic_code="engine_error",
+                safe_detail="Voice engine error",
+                debug_ref=str(self.logger.run_dir),
+                voice_lane_id=self.voice_lane_id,
+            )
+        if message_type in INTERNAL_ONLY_ENGINE_EVENTS:
+            return INTERNAL_EVENT_HANDLED
+        return None
+
+    def lane_turn_id(self, legacy_id: int) -> str:
+        seam = self.turn_seams.get(legacy_id)
+        return seam.lane_id if seam else f"turn_legacy_{legacy_id}"
+
+    def translate_turn_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        lane_id = self.ensure_pending_turn()
+        self.pending_turn_id = None
+        self.protocol_turn_id = lane_id
+        # Completed seams were only kept for late first-audio; a new turn
+        # supersedes them.
+        for old_id in [k for k, v in self.turn_seams.items() if v.completed]:
+            old_seam = self.turn_seams[old_id]
+            if old_seam.pending_complete is not None:
+                self.logger.write(
+                    "sidepod.turn.complete.superseded",
+                    turn_id=old_seam.lane_id,
+                    provider_terminal=old_seam.provider_terminal,
+                    playback_drained=old_seam.playback_drained,
+                )
+            del self.turn_seams[old_id]
+        self.turn_seams[legacy_id] = TurnSeam(
+            lane_id=lane_id,
+            started_at=self.admitted_eot_started_at or time.perf_counter(),
+            latency=dict(self.pending_latency),
+        )
+        self.admitted_eot_started_at = None
+        self.pending_latency = {}
+        out: dict[str, Any] = {
+            "type": "thinking",
+            "sentAt": iso_utc_now(),
+            "turnId": lane_id,
+            "sourceMode": "live",
+            "activity": "reasoning",
+            "submittedTextChars": len(str(payload.get("text") or "")),
+        }
+        if self.voice_lane_id:
+            out["voiceLaneId"] = self.voice_lane_id
+        return out
+
+    def translate_thinking_phase(self, payload: dict[str, Any], phase: str) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        lane_id = self.lane_turn_id(legacy_id) if legacy_id in self.turn_seams else self.ensure_pending_turn()
+        out: dict[str, Any] = {
+            "type": "thinking",
+            "sentAt": iso_utc_now(),
+            "turnId": lane_id,
+            "sourceMode": "live",
+            "phase": phase,
+        }
+        if self.voice_lane_id:
+            out["voiceLaneId"] = self.voice_lane_id
+        return out
+
+    def translate_thinking_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        lane_id = self.lane_turn_id(legacy_id) if legacy_id in self.turn_seams else self.ensure_pending_turn()
+        out: dict[str, Any] = {
+            "type": "thinking",
+            "sentAt": iso_utc_now(),
+            "turnId": lane_id,
+            "sourceMode": "live",
+            "phase": "responding",
+            "activity": str(payload.get("activity") or "reasoning"),
+        }
+        if self.voice_lane_id:
+            out["voiceLaneId"] = self.voice_lane_id
+        return out
+
+    def translate_assistant_delta(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        seam = self.turn_seams.get(legacy_id)
+        if seam:
+            seam.assistant_seq += 1
+        return {
+            "type": "assistant.delta",
+            "sentAt": iso_utc_now(),
+            "turnId": self.lane_turn_id(legacy_id),
+            "sequence": seam.assistant_seq if seam else 1,
+            "delta": str(payload.get("delta") or ""),
+        }
+
+    def translate_tts_first_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
+        legacy_id = int(payload.get("turn_id") or 0)
+        seam = self.turn_seams.get(legacy_id)
+        out: dict[str, Any] = {
+            "type": "speaking",
+            "sentAt": iso_utc_now(),
+            "turnId": self.lane_turn_id(legacy_id),
+        }
+        if self.voice_lane_id:
+            out["voiceLaneId"] = self.voice_lane_id
+        if seam:
+            first_audio_ms = elapsed_ms(seam.started_at)
+            seam.latency["firstAudioMs"] = first_audio_ms
+            seam.playback_started = True
+            seam.playback_drained = False
+            if seam.pending_complete is not None:
+                seam.pending_complete["latency"] = {
+                    key: value for key, value in seam.latency.items() if isinstance(value, (int, float))
+                }
+            out["firstAudioLatencyMs"] = first_audio_ms
+            if seam.completed:
+                # The turn's latency record already went out at text-complete;
+                # validated display text can reach COMMS before device audio.
+                self.logger.write(
+                    "sidepod.turn.latency.audio",
+                    turn_id=seam.lane_id,
+                    firstAudioMs=first_audio_ms,
+                )
+        return out
+
+    def translate_turn_complete(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        legacy_id = int(payload.get("turn_id") or 0)
+        seam = self.turn_seams.get(legacy_id)
+        if seam:
+            seam.completed = True
+        lane_id = seam.lane_id if seam else f"turn_legacy_{legacy_id}"
+        latency = {
+            key: value
+            for key, value in (seam.latency if seam else {}).items()
+            if isinstance(value, (int, float))
+        }
+        total_ms = payload.get("latency_ms")
+        model_complete_ms = total_ms if isinstance(total_ms, (int, float)) else None
+        payload_stream_source = str(payload.get("stream_source") or "")
+        if seam and payload_stream_source in {"event", "poll", "hybrid", "poll_after_event"}:
+            seam.stream_source = payload_stream_source
+        stream_source = seam.stream_source if seam else (payload_stream_source or "event")
+        wire_stream_source = "poll_after_event" if stream_source == "hybrid" else stream_source
+        self.logger.write(
+            "sidepod.turn.latency.text",
+            turn_id=lane_id,
+            stream_source=stream_source,
+            modelCompleteMs=model_complete_ms,
+            **latency,
+        )
+        out: dict[str, Any] = {
+            "type": "complete",
+            "sentAt": iso_utc_now(),
+            "turnId": lane_id,
+            "latency": latency,
+            "streamSource": wire_stream_source,
+        }
+        # Poll-fallback turns stream no assistant.delta events, so this is
+        # the viewer's only copy of the reply text (the reducer falls back
+        # to fullSpokenText when its delta buffer is empty).
+        spoken_text = str(payload.get("spoken_text") or payload.get("text") or "")
+        if spoken_text:
+            out["fullSpokenText"] = spoken_text
+        if seam:
+            seam.tts_expected = bool(self.turn_spoken_any and not self.native_speaker_unavailable)
+        if seam and seam.tts_expected and not (seam.provider_terminal and seam.playback_drained):
+            seam.pending_complete = out
+            self.logger.write("sidepod.turn.complete.pending_playback", turn_id=lane_id)
+            return None
+        latency["totalMs"] = elapsed_ms(seam.started_at) if seam else int(model_complete_ms or 0)
+        self.logger.write("sidepod.turn.latency", turn_id=lane_id, stream_source=stream_source, **latency)
+        return out
+
+    async def flush_pending_completion_after_timeout(self, legacy_id: int, delay_sec: float = 10.0) -> None:
+        await asyncio.sleep(delay_sec)
+        seam = self.turn_seams.get(legacy_id)
+        if not seam or seam.pending_complete is None:
+            return
+        # Kept as a compatibility hook for older callers. Elapsed wall time is
+        # never evidence that provider output or device playout is complete.
+        if seam.provider_terminal and seam.playback_drained:
+            await self.flush_pending_completions(reason="terminal_watchdog", legacy_id=legacy_id)
+        else:
+            self.logger.write(
+                "sidepod.turn.complete.still_pending",
+                turn_id=seam.lane_id,
+                provider_terminal=seam.provider_terminal,
+                playback_drained=seam.playback_drained,
+            )
+
+    async def flush_pending_completions(
+        self,
+        *,
+        reason: str,
+        legacy_id: int | None = None,
+        ready_only: bool = False,
+    ) -> None:
+        for item_id, seam in list(self.turn_seams.items()):
+            if legacy_id is not None and item_id != legacy_id:
+                continue
+            if seam.pending_complete is None:
+                continue
+            if ready_only and not (seam.provider_terminal and seam.playback_drained):
+                continue
+            complete = seam.pending_complete
+            seam.pending_complete = None
+            latency = complete.setdefault("latency", {})
+            if isinstance(latency, dict):
+                latency["totalMs"] = elapsed_ms(seam.started_at)
+            self.logger.write(
+                "sidepod.turn.latency",
+                turn_id=seam.lane_id,
+                stream_source=seam.stream_source,
+                completion_reason=reason,
+                **(latency if isinstance(latency, dict) else {}),
+            )
+            self.logger.write("sidepod.turn.complete.flush", turn_id=seam.lane_id, reason=reason)
+            await self.send_json(complete)
+
+    def clear_pending_completions(self) -> None:
+        for seam in self.turn_seams.values():
+            seam.pending_complete = None
+
+    def translate_turn_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
+        timed_out = payload.get("type") == "turn.timeout"
+        if timed_out:
+            # A timed-out turn gets no turn.complete, so drop its seam state here.
+            self.turn_seams.pop(int(payload.get("turn_id") or 0), None)
+            reason = "turn_timeout"
+        else:
+            reason = str(payload.get("failure") or "failed")
+        diagnostic_code, safe_detail, retryable = TURN_FAILURE_DETAILS.get(
+            reason, TURN_FAILURE_DETAILS["failed"]
+        )
+        return voice_bridge_issue_payload(
+            capability="voice_turns",
+            diagnostic_code=diagnostic_code,
+            safe_detail=safe_detail,
+            retryable=retryable,
+            debug_ref=str(self.logger.run_dir),
+            voice_lane_id=self.voice_lane_id,
+        )
+
+    async def send_protocol_issue(
+        self,
+        *,
+        diagnostic_code: str,
+        safe_detail: str,
+        retryable: bool = True,
+    ) -> None:
+        await self.send_json(
+            voice_bridge_issue_payload(
+                capability="sidepod_transport",
+                diagnostic_code=diagnostic_code,
+                safe_detail=safe_detail,
+                retryable=retryable,
+                debug_ref=str(self.logger.run_dir),
+                voice_lane_id=self.voice_lane_id,
+            )
+        )
 
     def interruption_elapsed_ms(self) -> int:
         return int((time.perf_counter() - self.interruption_clock_started) * 1000)
@@ -1391,9 +2528,7 @@ class VoiceConnection:
             self.config.device_sample_rate, self.config.deepgram_sample_rate
         )
         async def on_engine_drain(_token: PlaybackToken) -> None:
-            callback = getattr(self, "on_playback_drained", None)
-            if callback:
-                await callback(_token)
+            callback = self.on_playback_drained(_token)
 
         engine = PersistentDeviceAudioEngine(
             DeviceAudioOptions(
@@ -1402,7 +2537,7 @@ class VoiceConnection:
             ),
             on_render=self.feed_render_reference,
             on_capture=self.handle_processed_native_audio,
-            on_first_frame=getattr(self, "on_first_playback_frame", None),
+            on_first_frame=self.on_first_playback_frame,
             on_drain=on_engine_drain,
             capture_processor=self.filter_mic_frame,
             on_event=self.on_playback_event,
@@ -3061,11 +4196,6 @@ class VoiceConnection:
             return None
         return PlaybackToken(generation, turn_id)
 
-    async def on_tts_turn_began(self, token: PlaybackToken) -> None:
-        """Subclass hook for protocol-specific per-turn lifecycle state."""
-
-        return None
-
     def arm_tts_terminal_watchdog(self, token: PlaybackToken) -> None:
         previous = self.tts_terminal_watchdogs.pop(token, None)
         if previous and not previous.done():
@@ -3104,7 +4234,7 @@ class VoiceConnection:
         except asyncio.CancelledError:
             raise
 
-    async def on_tts_turn_terminal(
+    async def on_tts_turn_terminal_base(
         self,
         token: PlaybackToken,
         outcome: str,
@@ -3698,7 +4828,7 @@ class VoiceConnection:
                 confirmation_task.cancel()
                 await asyncio.gather(confirmation_task, return_exceptions=True)
 
-    async def send_json(self, payload: dict[str, Any]) -> None:
+    async def send_json_base(self, payload: dict[str, Any]) -> None:
         if self.closed:
             # A frozen viewer with working audio means sends are dying here;
             # leave a trace instead of vanishing (rate-limited).
@@ -3723,1150 +4853,3 @@ class VoiceConnection:
                     message_type=str(payload.get("type")),
                     error=repr(exc),
                 )
-
-
-async def reap_stale_voice_forks(
-    client: AgentBackend, logger: RunLogger, exclude_ids: set[str] | None = None
-) -> int:
-    exclude_ids = exclude_ids or set()
-    try:
-        rows = await client.list_sessions()
-    except Exception as exc:  # noqa: BLE001 - stale cleanup must not block helper startup.
-        logger.write("fork.reap.error", error=repr(exc), stage="list")
-        return 0
-    deleted = 0
-    for row in rows:
-        title = str(row.get("title") or session_title(row))
-        session_id = str(row.get("id") or "")
-        if not session_id or session_id in exclude_ids or not title.startswith(EPHEMERAL_PREFIX):
-            continue
-        try:
-            await client.delete_session(session_id)
-        except Exception as exc:  # noqa: BLE001 - best-effort stale cleanup.
-            logger.write("fork.reap.error", session_id=session_id, error=repr(exc), stage="delete")
-            continue
-        deleted += 1
-        logger.write("fork.reap.delete", session_id=session_id, title=title)
-    if deleted:
-        logger.write("fork.reap.complete", deleted=deleted)
-    return deleted
-
-
-@dataclass
-class TurnSeam:
-    """Per-turn bookkeeping for translating one legacy engine turn to v0."""
-
-    lane_id: str
-    started_at: float
-    latency: dict[str, Any] = field(default_factory=dict)
-    stream_source: str = "event"
-    assistant_seq: int = 0
-    # Kept (not popped) after turn.complete so a first TTS chunk arriving
-    # after the text finished can still report firstAudioMs.
-    completed: bool = False
-    pending_complete: dict[str, Any] | None = None
-    tts_expected: bool = False
-    provider_terminal: bool = False
-    provider_outcome: str | None = None
-    playback_started: bool = False
-    playback_drained: bool = False
-
-
-@dataclass
-class ActiveLaneRecord:
-    owner_id: str
-    source_session_id: str
-    voice_lane_id: str
-    acquired_at: float
-
-
-class ActiveSidepodLaneRegistry:
-    """Process-local guard for the single managed helper/workspace.
-
-    V1 deliberately rejects a second active lane instead of trying to merge or
-    take over audio state across TUI windows.
-    """
-
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._active: ActiveLaneRecord | None = None
-
-    async def acquire(self, *, owner_id: str, source_session_id: str, voice_lane_id: str) -> ActiveLaneRecord | None:
-        async with self._lock:
-            if self._active is not None and self._active.owner_id != owner_id:
-                return self._active
-            self._active = ActiveLaneRecord(
-                owner_id=owner_id,
-                source_session_id=source_session_id,
-                voice_lane_id=voice_lane_id,
-                acquired_at=time.time(),
-            )
-            return None
-
-    async def release(self, owner_id: str) -> None:
-        async with self._lock:
-            if self._active is not None and self._active.owner_id == owner_id:
-                self._active = None
-
-
-class SidepodConnection(VoiceConnection):
-    """Protocol v0 lane. Every outbound message funnels through the send_json
-    override: legacy engine vocabulary is translated to v0, schema-validated,
-    and anything off-contract is kept off the wire (fail closed)."""
-
-    def __init__(
-        self,
-        config: VoiceConfig,
-        client: AgentBackend,
-        logger: RunLogger,
-        websocket: WebSocket,
-        client_factory: Callable[[str, float], AgentBackend] = OpenCodeClient,
-        lane_registry: ActiveSidepodLaneRegistry | None = None,
-    ) -> None:
-        super().__init__(config=config, client=client, logger=logger, websocket=websocket)
-        self.client_factory = client_factory
-        self.connection_id = f"sidepod_{id(self)}"
-        self.lane_registry = lane_registry or ActiveSidepodLaneRegistry()
-        self.lane_registered = False
-        self.lane_event_types = frozenset(sidepod_schema_document()["events"])
-        self.mic_watchdog_task: asyncio.Task[None] | None = None
-        self.lane_turn_counter = 0
-        self.pending_turn_id: str | None = None
-        self.transcript_seq = 0
-        self.last_interim_transcript = ""
-        self.speech_started_at: float | None = None
-        self.pending_latency: dict[str, Any] = {}
-        self.admitted_eot_started_at: float | None = None
-        # One turn runs at a time; the dict form only tolerates stragglers
-        # from an aborted turn arriving after the next one starts.
-        self.turn_seams: dict[int, TurnSeam] = {}
-
-    async def run(self) -> None:
-        readiness_issues = helper_readiness_issues(
-            transport_ready=True,
-            debug_ref=str(self.logger.run_dir),
-            tts_provider=self.config.tts_provider,
-        )
-        self.sidepod_readiness_issues = readiness_issues
-        if readiness_issues:
-            self.logger.state_transition(
-                "sidepod.connected",
-                "voice_bridge_issue",
-                diagnostic_codes=[issue["diagnosticCode"] for issue in readiness_issues],
-            )
-            for issue in readiness_issues:
-                await self.send_json(issue)
-        else:
-            self.logger.state_transition("sidepod.connected", "waiting_for_start")
-
-        while True:
-            message = await self.websocket.receive()
-            if message.get("type") == "websocket.disconnect":
-                break
-            text = message.get("text")
-            if text is None:
-                continue
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                await self.send_protocol_issue(
-                    diagnostic_code="protocol_invalid_message",
-                    safe_detail="Invalid sidepod message",
-                )
-                continue
-            await self.handle_control(payload)
-
-    async def handle_control(self, payload: Any) -> None:
-        # Lane negotiation outranks shape validation: a start for a version we
-        # do not speak must answer protocol_version_unsupported, not invalid.
-        if isinstance(payload, dict) and payload.get("type") == "start":
-            version = payload.get("protocolVersion")
-            if isinstance(version, str) and version != SIDEPOD_PROTOCOL_VERSION:
-                await self.send_protocol_issue(
-                    diagnostic_code="protocol_version_unsupported",
-                    safe_detail="Sidepod protocol unsupported",
-                    retryable=False,
-                )
-                return
-        check = check_sidepod_command(payload)
-        if check.unknown_type:
-            # Compatibility rule: unknown message types are logged and ignored.
-            self.logger.write("sidepod.command.unknown", message_type=payload.get("type"))
-            return
-        if not check.ok:
-            self.logger.write(
-                "sidepod.command.invalid",
-                message_type=payload.get("type") if isinstance(payload, dict) else None,
-                errors=list(check.errors),
-            )
-            await self.send_protocol_issue(
-                diagnostic_code="protocol_invalid_message",
-                safe_detail="Invalid sidepod command",
-            )
-            return
-        kind = payload["type"]
-        if kind == "start":
-            await self.handle_start(payload)
-        elif kind == "stop":
-            await self.handle_stop(payload)
-        elif kind == "refresh":
-            await self.handle_refresh(payload)
-        elif kind == "ptt.start":
-            await self.handle_ptt_start(payload)
-        elif kind == "ptt.stop":
-            await self.handle_ptt_stop(payload)
-        elif kind == "live.set":
-            await self.handle_live_set(payload)
-        elif kind == "barge_in":
-            await self.barge_in(reason=str(payload.get("reason") or "sidepod"))
-        elif kind == "confirm.response":
-            self.logger.write(
-                "sidepod.confirm.response",
-                prompt_id=payload.get("promptId"),
-                action_id=payload.get("actionId"),
-                confirmed=bool(payload.get("confirmed")),
-                voice_lane_id=self.voice_lane_id,
-            )
-
-    async def handle_start(self, payload: dict[str, Any]) -> None:
-        # Version and shape are already enforced by handle_control before any
-        # wire message reaches here; handle_refresh builds a conforming payload.
-        source_session_id = str(payload.get("sourceSessionId") or "")
-        if self.sidepod_readiness_issues:
-            for issue in self.sidepod_readiness_issues:
-                await self.send_json(issue)
-            return
-
-        opencode_url = str(payload.get("opencodeUrl") or "").strip().rstrip("/")
-        if opencode_url and opencode_url != getattr(self.client, "base_url", None):
-            await self.client.close()
-            self.client = self.client_factory(opencode_url, 60)
-            self.message_cache.clear()
-            self.logger.write("sidepod.opencode.rebind", opencode_url=opencode_url)
-
-        if self.fork_session_id:
-            await self.stop()
-        self.voice_lane_id = self.voice_lane_id or f"lane_{int(time.time() * 1000)}"
-        try:
-            source_session = await self.client.get_session(source_session_id)
-        except Exception as exc:  # noqa: BLE001 - keep sidepod transport alive.
-            self.logger.write("sidepod.start.source_error", source_session_id=source_session_id, error=repr(exc))
-            await self.send_protocol_issue(
-                diagnostic_code="voice_lane_start_failed",
-                safe_detail="Voice lane unavailable",
-            )
-            return
-        source_title = str(source_session.get("title") or session_title(source_session))
-        if source_title.startswith(EPHEMERAL_PREFIX):
-            self.logger.write(
-                "sidepod.start.voice_tmp_source",
-                source_session_id=source_session_id,
-                source_title=source_title,
-            )
-            await self.send_protocol_issue(
-                diagnostic_code="voice_tmp_source_session",
-                safe_detail="Switch to the original chat before starting Mortic voice.",
-                retryable=True,
-            )
-            return
-        blocking_lane = await self.lane_registry.acquire(
-            owner_id=self.connection_id,
-            source_session_id=source_session_id,
-            voice_lane_id=self.voice_lane_id,
-        )
-        if blocking_lane is not None:
-            self.logger.write(
-                "sidepod.lane.busy",
-                source_session_id=source_session_id,
-                active_source_session_id=blocking_lane.source_session_id,
-                active_voice_lane_id=blocking_lane.voice_lane_id,
-            )
-            await self.send_protocol_issue(
-                diagnostic_code="voice_lane_already_active",
-                safe_detail="Mortic voice is already active in this workspace.",
-                retryable=True,
-            )
-            return
-        self.lane_registered = True
-        # Open Flux while the fork is being prepared. This removes the
-        # provider handshake from the first M press without prompting for or
-        # opening the microphone before the user asks.
-        self.schedule_audio_prewarm()
-        if not self.config.keep_fork_default:
-            await reap_stale_voice_forks(self.client, self.logger, exclude_ids={source_session_id})
-        try:
-            fork = await self.create_voice_fork(
-                source_session_id,
-                keep_fork=bool(payload.get("keepFork")),
-                original=source_session,
-            )
-        except Exception as exc:  # noqa: BLE001 - keep sidepod transport alive.
-            self.lane_registered = False
-            await self.lane_registry.release(self.connection_id)
-            await self.stop_audio(reason="lane_start_failed")
-            self.logger.write("sidepod.start.error", source_session_id=source_session_id, error=repr(exc))
-            await self.send_protocol_issue(
-                diagnostic_code="voice_lane_start_failed",
-                safe_detail="Voice lane unavailable",
-            )
-            return
-
-        self.logger.state_transition("waiting_for_start", "ready", voice_lane_id=self.voice_lane_id)
-        await self.send_json(
-            {
-                "type": "ready",
-                "sentAt": iso_utc_now(),
-                "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
-                "voiceLaneId": self.voice_lane_id,
-                "state": "ready",
-                "sourceSessionId": fork["source_session_id"],
-                "forkSessionId": fork["fork_session_id"],
-            }
-        )
-        await self.maybe_start_compaction(reason="session_start", run_in_background=True)
-
-    async def handle_refresh(self, payload: dict[str, Any]) -> None:
-        source_session_id = str(payload.get("sourceSessionId") or self.source_session_id or "")
-        if not source_session_id:
-            await self.send_protocol_issue(
-                diagnostic_code="voice_lane_not_started",
-                safe_detail="Voice lane unavailable",
-            )
-            return
-        await self.stop()
-        await self.handle_start(
-            {
-                "type": "start",
-                "protocolVersion": SIDEPOD_PROTOCOL_VERSION,
-                "sourceSessionId": source_session_id,
-                "keepFork": self.keep_fork,
-            }
-        )
-
-    def schedule_mic_start(self) -> None:
-        self.mic_desired_live = True
-        if self.native_mic or self.native_audio_engine:
-            return
-        if self.mic_start_task and not self.mic_start_task.done():
-            return
-        self.mic_start_generation += 1
-        generation = self.mic_start_generation
-        transport_prepared = self.flux is not None
-        task = asyncio.create_task(self.start_mic_generation(generation, transport_prepared))
-        self.mic_start_task = task
-
-        def clear_finished(done: asyncio.Task[None]) -> None:
-            if self.mic_start_task is done:
-                self.mic_start_task = None
-
-        task.add_done_callback(clear_finished)
-
-    async def cancel_pending_mic_start(self, reason: str) -> None:
-        task = self.mic_start_task
-        was_pending = self.mic_desired_live or bool(task and not task.done())
-        self.mic_desired_live = False
-        self.mic_start_generation += 1
-        if task and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        if self.mic_start_task is task:
-            self.mic_start_task = None
-        if was_pending:
-            self.logger.write("native_audio.start.cancel", reason=reason)
-
-    async def start_mic_generation(self, generation: int, transport_prepared: bool) -> None:
-        started_at = time.perf_counter()
-        try:
-            started = await self.start_native_audio()
-        except asyncio.CancelledError:
-            await self.stop_audio(reason="mic_start_cancelled", keep_transport=True)
-            raise
-        except Exception as exc:  # noqa: BLE001 - keep the v0 lane alive while STT reconnects.
-            if generation != self.mic_start_generation or not self.mic_desired_live:
-                return
-            self.mic_desired_live = False
-            self.logger.write(
-                "flux.connection.error",
-                stage="initial_connect",
-                error_code=type(exc).__name__,
-            )
-            await self.stop_audio(reason="stt_initial_connect_failed")
-            await self.send_json(
-                voice_bridge_issue_payload(
-                    capability="voice_audio",
-                    diagnostic_code="stt_transport_unhealthy",
-                    safe_detail="Voice recognition reconnecting",
-                    retryable=True,
-                    debug_ref=str(self.logger.run_dir),
-                    voice_lane_id=self.voice_lane_id,
-                )
-            )
-            return
-
-        if generation != self.mic_start_generation or not self.mic_desired_live:
-            await self.stop_audio(reason="mic_start_superseded", keep_transport=True)
-            return
-        if not started:
-            self.mic_desired_live = False
-            return
-        self.mic_capture_gated = False
-        self.start_mic_watchdog()
-        # Recheck after every awaited startup operation. A fast M/off must
-        # never be followed by a stale listening acknowledgement.
-        if generation != self.mic_start_generation or not self.mic_desired_live:
-            await self.shutdown_mic_watchdog()
-            await self.stop_audio(reason="mic_start_superseded", keep_transport=True)
-            return
-        self.logger.write(
-            "native_audio.mic.ready",
-            latency_ms=elapsed_ms(started_at),
-            transport_prepared=transport_prepared,
-            mode=self.duplex_mode(),
-        )
-        await self.send_json(
-            {
-                "type": "listening",
-                "sentAt": iso_utc_now(),
-                "voiceLaneId": self.voice_lane_id,
-                "mode": "live",
-            }
-        )
-
-    async def handle_live_set(self, payload: dict[str, Any]) -> None:
-        if not self.fork_session_id or not self.voice_lane_id:
-            await self.send_protocol_issue(
-                diagnostic_code="voice_lane_not_started",
-                safe_detail="Voice lane unavailable",
-            )
-            return
-        if bool(payload.get("value")):
-            if self.native_audio_engine and self.flux:
-                self.mic_desired_live = True
-                self.mic_capture_gated = False
-                self.mic_start_generation += 1
-                self.native_audio_engine.set_capture_enabled(True)
-                self.reset_audio_input_counters()
-                self.start_mic_watchdog()
-                self.logger.write("native_audio.capture_gate", enabled=True, reason="live.set.true")
-                await self.send_json(
-                    {
-                        "type": "listening",
-                        "sentAt": iso_utc_now(),
-                        "voiceLaneId": self.voice_lane_id,
-                        "mode": "live",
-                    }
-                )
-            else:
-                self.schedule_mic_start()
-        else:
-            reason = str(payload.get("reason") or "live.set.false")
-            self.mic_capture_gated = True
-            if self.native_audio_engine:
-                # Apply the privacy gate before any cancellation await.
-                self.native_audio_engine.set_capture_enabled(False)
-            await self.cancel_pending_mic_start(reason)
-            await self.shutdown_mic_watchdog()
-            if self.native_audio_engine:
-                # Soft mute: the synchronized device/AEC/output clock keeps
-                # running, while real capture is replaced with timed silence
-                # before it can reach Flux.
-                self.log_audio_input_summary(reason=reason)
-                self.reset_audio_input_counters()
-                active_episode = self.interruption_episode
-                self.reset_capture_interruption_state()
-                if active_episode is not None:
-                    self.expire_interruption_episode(active_episode)
-                self.logger.write("native_audio.capture_gate", enabled=False, reason=reason)
-            else:
-                # Explicit half-duplex fallback owns a separate mic stream,
-                # so closing it cannot disturb speaker playback.
-                await self.stop_audio(reason=reason, keep_transport=True)
-
-    def start_mic_watchdog(self) -> None:
-        self.cancel_mic_watchdog()
-        self.mic_watchdog_task = asyncio.create_task(self.mic_watchdog())
-
-    def cancel_mic_watchdog(self) -> asyncio.Task[None] | None:
-        task = self.mic_watchdog_task
-        if task and not task.done():
-            task.cancel()
-        self.mic_watchdog_task = None
-        return task
-
-    async def shutdown_mic_watchdog(self) -> None:
-        task = self.cancel_mic_watchdog()
-        if task and task is not asyncio.current_task():
-            await asyncio.gather(task, return_exceptions=True)
-
-    async def mic_watchdog(self) -> None:
-        try:
-            await asyncio.sleep(MIC_WATCHDOG_SEC)
-        except asyncio.CancelledError:
-            return
-        if not (self.native_mic or self.native_audio_engine) or self.audio_input_chunks:
-            return
-        self.mic_desired_live = False
-        self.logger.write("native_audio.silent", window_sec=MIC_WATCHDOG_SEC)
-        await self.stop_audio(reason="mic_watchdog_silent")
-        await self.send_json(
-            voice_bridge_issue_payload(
-                capability="voice_audio",
-                diagnostic_code="mic_permission_needed",
-                safe_detail="Mic permission needed",
-                retryable=True,
-                debug_ref=str(self.logger.run_dir),
-                voice_lane_id=self.voice_lane_id,
-            )
-        )
-
-    async def handle_ptt_start(self, payload: dict[str, Any]) -> None:
-        if not self.fork_session_id or not self.voice_lane_id:
-            await self.send_protocol_issue(
-                diagnostic_code="voice_lane_not_started",
-                safe_detail="Voice lane unavailable",
-            )
-            return
-        self.active_turn_id = None
-        self.protocol_turn_id = str(payload.get("turnId") or "")
-        await self.send_protocol_issue(
-            diagnostic_code="native_audio_capture_unavailable",
-            safe_detail="Audio capture unavailable",
-        )
-
-    async def handle_ptt_stop(self, payload: dict[str, Any]) -> None:
-        turn_id = str(payload.get("turnId") or "")
-        if turn_id and self.protocol_turn_id == turn_id:
-            await self.barge_in(reason=str(payload.get("reason") or "ptt.stop"))
-            self.protocol_turn_id = ""
-
-    async def handle_stop(self, payload: dict[str, Any]) -> None:
-        reason = str(payload.get("reason") or "user.end_session")
-        lane_id = self.voice_lane_id
-        fork_deleted = bool(self.fork_session_id and not self.keep_fork)
-        await self.stop()
-        stopped: dict[str, Any] = {
-            "type": "stopped",
-            "sentAt": iso_utc_now(),
-            "reason": reason,
-            "forkDeleted": fork_deleted,
-        }
-        if lane_id:
-            stopped["voiceLaneId"] = lane_id
-        await self.send_json(stopped)
-
-    async def stop(self) -> None:
-        await self.cancel_pending_mic_start("sidepod_stop")
-        await self.shutdown_mic_watchdog()
-        await self.stop_audio(reason="sidepod_stop")
-        if self.turn_task and not self.turn_task.done():
-            self.turn_task.cancel()
-        self.clear_pending_completions()
-        await self.interrupt_playback("sidepod_stop")
-        # interrupt_playback keeps the device stream for the next turn; the
-        # session is over, so actually release it here.
-        if self.native_speaker:
-            await self.native_speaker.close()
-            self.native_speaker = None
-        if self.native_audio_engine:
-            await self.native_audio_engine.close()
-            self.native_audio_engine = None
-        await self.delete_voice_fork()
-        self.protocol_turn_id = ""
-        self.pending_turn_id = None
-        self.last_interim_transcript = ""
-        self.lane_registered = False
-        await self.lane_registry.release(self.connection_id)
-
-    async def close(self) -> None:
-        await self.cancel_pending_mic_start("sidepod_close")
-        await self.shutdown_mic_watchdog()
-        try:
-            await super().close()
-        finally:
-            self.lane_registered = False
-            await self.lane_registry.release(self.connection_id)
-
-    async def send_tts_audio(self, data: bytes, turn_id: int | PlaybackToken | None) -> None:
-        if self.native_speaker_unavailable:
-            return
-        token = turn_id if isinstance(turn_id, PlaybackToken) else PlaybackToken(self.speak_generation, int(turn_id or 0))
-        self.tts_last_audio_at[token] = time.monotonic()
-        if self.native_audio_engine is not None:
-            if not await self.native_audio_engine.play(data, token):
-                if token.generation != self.speak_generation:
-                    self.stale_tts_chunks += 1
-                    self.logger.write(
-                        "native_tts.stale_generation.drop",
-                        turn_id=token.turn_id,
-                        bytes=len(data),
-                        playback_generation=token.generation,
-                        active_playback_generation=self.speak_generation,
-                    )
-                    return
-                self.tts_unavailable_chunks += 1
-                if self.tts_unavailable_chunks == 1 or self.tts_unavailable_chunks % 50 == 0:
-                    self.logger.write(
-                        "native_tts.play.unavailable",
-                        turn_id=token.turn_id,
-                        bytes=len(data),
-                        chunks=self.tts_unavailable_chunks,
-                        playback_generation=token.generation,
-                    )
-            return
-        speaker = await self.ensure_native_speaker_output()
-        if speaker is None:
-            return
-        speaker.begin_turn(token)
-        if not await speaker.play(data, token):
-            if token.generation != self.speak_generation:
-                self.stale_tts_chunks += 1
-                self.logger.write(
-                    "native_tts.stale_generation.drop",
-                    turn_id=token.turn_id,
-                    bytes=len(data),
-                    playback_generation=token.generation,
-                    active_playback_generation=self.speak_generation,
-                )
-                return
-            self.tts_unavailable_chunks += 1
-            if self.tts_unavailable_chunks == 1 or self.tts_unavailable_chunks % 50 == 0:
-                self.logger.write(
-                    "native_tts.play.unavailable",
-                    turn_id=token.turn_id,
-                    bytes=len(data),
-                    chunks=self.tts_unavailable_chunks,
-                )
-
-    async def on_first_playback_frame(self, token: PlaybackToken) -> None:
-        """`speaking` begins at device exposure, never provider arrival."""
-        feedback = self.feedback_by_token.get(token)
-        if feedback is not None:
-            self.logger.write(
-                "feedback.speech.first_audio",
-                turn_id=feedback.turn_id,
-                playback_generation=token.generation,
-            )
-            return
-        if token.generation != self.speak_generation or self.tts_first_audio_seen:
-            return
-        self.tts_first_audio_seen = True
-        await self.send_json({"type": "tts.first_audio", "turn_id": token.turn_id})
-        self.logger.write(
-            "tts.first_audio",
-            turn_id=token.turn_id,
-            playback_generation=token.generation,
-        )
-        self.logger.state_transition("awaiting_playback", "speaking", turn_id=token.turn_id)
-
-    async def on_tts_turn_began(self, token: PlaybackToken) -> None:
-        await super().on_tts_turn_began(token)
-        seam = self.turn_seams.get(token.turn_id)
-        if seam is not None:
-            seam.provider_terminal = False
-            seam.provider_outcome = None
-            seam.playback_drained = False
-
-    async def on_tts_turn_terminal(
-        self,
-        token: PlaybackToken,
-        outcome: str,
-        *,
-        error_code: str | None = None,
-    ) -> None:
-        already_terminal = token in self.tts_terminal_tokens
-        await super().on_tts_turn_terminal(token, outcome, error_code=error_code)
-        if already_terminal:
-            return
-        seam = self.turn_seams.get(token.turn_id)
-        if seam is None:
-            return
-        seam.provider_terminal = True
-        seam.provider_outcome = outcome
-        if not self.playback_has_pending_audio():
-            # A provider can legitimately finish without a non-silent frame
-            # after speech filtering. There will be no device drain callback.
-            seam.playback_drained = True
-        if seam.completed and seam.pending_complete is not None and seam.playback_drained:
-            await self.flush_pending_completions(
-                reason="provider_failed" if outcome == "failed" else "provider_done",
-                legacy_id=token.turn_id,
-            )
-
-    def feed_render_reference(self, data: bytes) -> None:
-        # Called on the playback worker thread just before the device write,
-        # so the timestamp approximates when this chunk starts playing.
-        probe_data = self.render_to_probe_resampler.push(data) if self.render_to_probe_resampler else data
-        self.render_audio_ring.append(probe_data)
-        if self.echo_canceller:
-            self.echo_canceller.process_render(data)
-
-    async def on_playback_event(self, event: dict[str, Any]) -> None:
-        event_type = str(event.get("type") or "playback.event")
-        detail = {key: value for key, value in event.items() if key != "type"}
-        self.logger.write(event_type, **detail)
-
-    async def on_playback_drained(self, token: PlaybackToken | None = None) -> None:
-        feedback = self.feedback_by_token.get(token) if token is not None else None
-        if feedback is not None:
-            feedback.drained.set()
-            self.logger.write(
-                "feedback.speech.drain",
-                turn_id=feedback.turn_id,
-                playback_generation=token.generation,
-            )
-            return
-        legacy_id = token.turn_id if token is not None else None
-        if legacy_id is None:
-            pending_ids = [item_id for item_id, seam in self.turn_seams.items() if seam.pending_complete]
-            if len(pending_ids) == 1:
-                legacy_id = pending_ids[0]
-                token = self.turn_playback_tokens.get(legacy_id)
-        seam = self.turn_seams.get(legacy_id) if legacy_id is not None else None
-        if seam is not None:
-            seam.playback_drained = True
-            # Older injected speakers predate provider lifecycle events. Real
-            # providers must explicitly own EOF; keep compatibility confined
-            # to fakes/adapters that don't advertise the terminal contract.
-            if not bool(getattr(self.speaker, "supports_terminal_events", False)):
-                seam.provider_terminal = True
-                seam.provider_outcome = seam.provider_outcome or "done"
-                if token is not None:
-                    self.tts_terminal_tokens.setdefault(token, "done")
-                    if self.tts_turn_token == token:
-                        self.tts_turn_token = None
-            if seam.provider_terminal:
-                await self.flush_pending_completions(
-                    reason="playback_drained",
-                    legacy_id=legacy_id,
-                )
-                if seam.completed:
-                    self.logger.state_transition("speaking", "ready", turn_id=legacy_id)
-        # Reply finished speaking: return the lane to a resting listening
-        # state so the viewer's activity indicator stops reading "speaking".
-        # Only while the mic is still live and no new turn has taken over.
-        if (
-            self.native_mic is None and self.native_audio_engine is None
-            or self.active_turn_id is not None
-            or self.interruption_state.phase in {InterruptionPhase.CANDIDATE, InterruptionPhase.INTERRUPTED}
-        ):
-            return
-        if not self.voice_lane_id:
-            return
-        await self.send_json(
-            {
-                "type": "listening",
-                "sentAt": iso_utc_now(),
-                "voiceLaneId": self.voice_lane_id,
-                "mode": "live",
-            }
-        )
-
-    async def barge_in(self, reason: str) -> None:
-        turn_id = self.protocol_turn_id or None
-        # `interrupted` means something was actually cut off; a speech.start
-        # with no active turn or speech is just the user starting to talk.
-        if not await self.interrupt_playback(reason):
-            return
-        for seam in self.turn_seams.values():
-            if seam.lane_id != turn_id:
-                continue
-            interrupted_latency = {
-                key: value for key, value in seam.latency.items() if isinstance(value, (int, float))
-            }
-            interrupted_latency["totalMs"] = elapsed_ms(seam.started_at)
-            self.logger.write(
-                "sidepod.turn.latency.interrupted",
-                turn_id=seam.lane_id,
-                stream_source=seam.stream_source,
-                interruption_reason=reason,
-                **interrupted_latency,
-            )
-            break
-        self.clear_pending_completions()
-        await self.abort_fork_turn()
-        payload: dict[str, Any] = {"type": "interrupted", "sentAt": iso_utc_now(), "reason": reason}
-        if self.voice_lane_id:
-            payload["voiceLaneId"] = self.voice_lane_id
-        if turn_id:
-            payload["turnId"] = turn_id
-        await self.send_json(payload)
-
-    async def forward_flux_event(self, event: SpeechEvent) -> None:
-        etype = str(event.type or "")
-        if etype == "speech.start":
-            self.speech_started_at = time.perf_counter()
-            return
-        if etype == "speech.transcript":
-            # Flux can send interim text before StartOfTurn. Only an episode
-            # already owned as an ordinary user turn may create provisional
-            # sidepod text; candidates and pre-start text remain private until
-            # the controller admits their final EOT.
-            if self.interruption_state.phase is not InterruptionPhase.USER_TURN:
-                return
-            text = str(event.transcript or "")
-            if text.strip():
-                await self.send_lane_transcript(text, final=False, confidence=event.confidence)
-            return
-        # speech.end is deliberately NOT forwarded here: the durable
-        # (final) transcript entry is emitted from on_transcript_admitted
-        # only after the admission gate accepts it — rejected echo used to
-        # render in the transcript as words the user never said.
-        # Other raw STT events (speech.resumed, socket notices) stay off the lane.
-
-    async def on_transcript_admitted(self, transcript: str, confidence: float | None) -> None:
-        self.admitted_eot_started_at = time.perf_counter()
-        await self.send_lane_transcript(transcript, final=True, confidence=confidence)
-
-    async def send_lane_transcript(self, text: str, final: bool, confidence: Any = None) -> None:
-        # Flux emits Update about four times per second even if its current
-        # turn transcript hasn't changed. Repainting the same provisional text
-        # wastes protocol/TUI work and made live sessions look noisy. The final
-        # event is never deduplicated because it closes the transcript turn.
-        if not final and text == self.last_interim_transcript:
-            return
-        self.last_interim_transcript = "" if final else text
-        turn_id = self.ensure_pending_turn()
-        if "firstTranscriptMs" not in self.pending_latency and self.speech_started_at is not None:
-            self.pending_latency["firstTranscriptMs"] = elapsed_ms(self.speech_started_at)
-        self.transcript_seq += 1
-        payload: dict[str, Any] = {
-            "type": "transcript",
-            "sentAt": iso_utc_now(),
-            "turnId": turn_id,
-            "sequence": self.transcript_seq,
-            "text": text,
-            "final": final,
-        }
-        if isinstance(confidence, (int, float)):
-            payload["confidence"] = float(confidence)
-        await self.send_json(payload)
-
-    def ensure_pending_turn(self) -> str:
-        if not self.pending_turn_id:
-            self.lane_turn_counter += 1
-            self.pending_turn_id = f"turn_{self.lane_turn_counter:04d}"
-            self.transcript_seq = 0
-            self.pending_latency = {}
-        return self.pending_turn_id
-
-    async def send_json(self, payload: dict[str, Any]) -> None:
-        if str(payload.get("type") or "") == "turn.start":
-            # A new turn is not evidence that the previous reply finished
-            # speaking.  Only release an old completion that already owns
-            # both provider EOF and device drain; an interrupted/nonterminal
-            # reply must never be reported as successfully complete.
-            await self.flush_pending_completions(reason="new_turn", ready_only=True)
-        outbound = self.translate_to_v0(payload)
-        if outbound is INTERNAL_EVENT_HANDLED:
-            return
-        if outbound is None:
-            self.logger.write("sidepod.lane.unknown", message_type=payload.get("type"))
-            return
-        assert isinstance(outbound, dict)
-        check = check_sidepod_event(outbound)
-        if not check.ok:
-            self.logger.write(
-                "sidepod.lane.violation",
-                message_type=str(outbound.get("type")),
-                errors=list(check.errors),
-            )
-            return
-        await super().send_json(outbound)
-
-    def translate_to_v0(self, payload: dict[str, Any]) -> dict[str, Any] | object | None:
-        message_type = str(payload.get("type") or "")
-        # v0-native payloads (lane handlers and base-class issue plumbing both
-        # emit them) pass through; the discriminator against same-named legacy
-        # messages is `sentAt`, which no legacy message may ever carry.
-        if message_type in self.lane_event_types and "sentAt" in payload:
-            return payload
-        if message_type == "turn.start":
-            return self.translate_turn_start(payload)
-        if message_type == "turn.activity":
-            return self.translate_thinking_activity(payload)
-        if message_type in {"compaction.wait", "compaction.continuing", "compaction.try_again", "compaction.wait.timeout"}:
-            phase = {
-                "compaction.wait": "preparing_context",
-                "compaction.continuing": "continuing",
-                "compaction.try_again": "try_again",
-                "compaction.wait.timeout": "try_again",
-            }[message_type]
-            return self.translate_thinking_phase(payload, phase)
-        if message_type == "assistant.delta":
-            return self.translate_assistant_delta(payload)
-        if message_type == "assistant.first_text":
-            seam = self.turn_seams.get(int(payload.get("turn_id") or 0))
-            latency_ms = payload.get("latency_ms")
-            if seam and isinstance(latency_ms, (int, float)):
-                seam.latency["firstAssistantTextMs"] = latency_ms
-            return INTERNAL_EVENT_HANDLED
-        if message_type == "tts.first_audio":
-            return self.translate_tts_first_audio(payload)
-        if message_type == "turn.complete":
-            return self.translate_turn_complete(payload) or INTERNAL_EVENT_HANDLED
-        if message_type in ("turn.error", "turn.timeout"):
-            return self.translate_turn_failure(payload)
-        if message_type == "opencode.stream.fallback":
-            seam = self.turn_seams.get(int(payload.get("turn_id") or 0))
-            if seam:
-                seam.stream_source = "poll_after_event" if payload.get("prompt_sent") else "poll"
-            return INTERNAL_EVENT_HANDLED
-        if message_type == "error":
-            return voice_bridge_issue_payload(
-                capability="sidepod_transport",
-                diagnostic_code="engine_error",
-                safe_detail="Voice engine error",
-                debug_ref=str(self.logger.run_dir),
-                voice_lane_id=self.voice_lane_id,
-            )
-        if message_type in INTERNAL_ONLY_ENGINE_EVENTS:
-            return INTERNAL_EVENT_HANDLED
-        return None
-
-    def lane_turn_id(self, legacy_id: int) -> str:
-        seam = self.turn_seams.get(legacy_id)
-        return seam.lane_id if seam else f"turn_legacy_{legacy_id}"
-
-    def translate_turn_start(self, payload: dict[str, Any]) -> dict[str, Any]:
-        legacy_id = int(payload.get("turn_id") or 0)
-        lane_id = self.ensure_pending_turn()
-        self.pending_turn_id = None
-        self.protocol_turn_id = lane_id
-        # Completed seams were only kept for late first-audio; a new turn
-        # supersedes them.
-        for old_id in [k for k, v in self.turn_seams.items() if v.completed]:
-            old_seam = self.turn_seams[old_id]
-            if old_seam.pending_complete is not None:
-                self.logger.write(
-                    "sidepod.turn.complete.superseded",
-                    turn_id=old_seam.lane_id,
-                    provider_terminal=old_seam.provider_terminal,
-                    playback_drained=old_seam.playback_drained,
-                )
-            del self.turn_seams[old_id]
-        self.turn_seams[legacy_id] = TurnSeam(
-            lane_id=lane_id,
-            started_at=self.admitted_eot_started_at or time.perf_counter(),
-            latency=dict(self.pending_latency),
-        )
-        self.admitted_eot_started_at = None
-        self.pending_latency = {}
-        out: dict[str, Any] = {
-            "type": "thinking",
-            "sentAt": iso_utc_now(),
-            "turnId": lane_id,
-            "sourceMode": "live",
-            "activity": "reasoning",
-            "submittedTextChars": len(str(payload.get("text") or "")),
-        }
-        if self.voice_lane_id:
-            out["voiceLaneId"] = self.voice_lane_id
-        return out
-
-    def translate_thinking_phase(self, payload: dict[str, Any], phase: str) -> dict[str, Any]:
-        legacy_id = int(payload.get("turn_id") or 0)
-        lane_id = self.lane_turn_id(legacy_id) if legacy_id in self.turn_seams else self.ensure_pending_turn()
-        out: dict[str, Any] = {
-            "type": "thinking",
-            "sentAt": iso_utc_now(),
-            "turnId": lane_id,
-            "sourceMode": "live",
-            "phase": phase,
-        }
-        if self.voice_lane_id:
-            out["voiceLaneId"] = self.voice_lane_id
-        return out
-
-    def translate_thinking_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
-        legacy_id = int(payload.get("turn_id") or 0)
-        lane_id = self.lane_turn_id(legacy_id) if legacy_id in self.turn_seams else self.ensure_pending_turn()
-        out: dict[str, Any] = {
-            "type": "thinking",
-            "sentAt": iso_utc_now(),
-            "turnId": lane_id,
-            "sourceMode": "live",
-            "phase": "responding",
-            "activity": str(payload.get("activity") or "reasoning"),
-        }
-        if self.voice_lane_id:
-            out["voiceLaneId"] = self.voice_lane_id
-        return out
-
-    def translate_assistant_delta(self, payload: dict[str, Any]) -> dict[str, Any]:
-        legacy_id = int(payload.get("turn_id") or 0)
-        seam = self.turn_seams.get(legacy_id)
-        if seam:
-            seam.assistant_seq += 1
-        return {
-            "type": "assistant.delta",
-            "sentAt": iso_utc_now(),
-            "turnId": self.lane_turn_id(legacy_id),
-            "sequence": seam.assistant_seq if seam else 1,
-            "delta": str(payload.get("delta") or ""),
-        }
-
-    def translate_tts_first_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
-        legacy_id = int(payload.get("turn_id") or 0)
-        seam = self.turn_seams.get(legacy_id)
-        out: dict[str, Any] = {
-            "type": "speaking",
-            "sentAt": iso_utc_now(),
-            "turnId": self.lane_turn_id(legacy_id),
-        }
-        if self.voice_lane_id:
-            out["voiceLaneId"] = self.voice_lane_id
-        if seam:
-            first_audio_ms = elapsed_ms(seam.started_at)
-            seam.latency["firstAudioMs"] = first_audio_ms
-            seam.playback_started = True
-            seam.playback_drained = False
-            if seam.pending_complete is not None:
-                seam.pending_complete["latency"] = {
-                    key: value for key, value in seam.latency.items() if isinstance(value, (int, float))
-                }
-            out["firstAudioLatencyMs"] = first_audio_ms
-            if seam.completed:
-                # The turn's latency record already went out at text-complete;
-                # validated display text can reach COMMS before device audio.
-                self.logger.write(
-                    "sidepod.turn.latency.audio",
-                    turn_id=seam.lane_id,
-                    firstAudioMs=first_audio_ms,
-                )
-        return out
-
-    def translate_turn_complete(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-        legacy_id = int(payload.get("turn_id") or 0)
-        seam = self.turn_seams.get(legacy_id)
-        if seam:
-            seam.completed = True
-        lane_id = seam.lane_id if seam else f"turn_legacy_{legacy_id}"
-        latency = {
-            key: value
-            for key, value in (seam.latency if seam else {}).items()
-            if isinstance(value, (int, float))
-        }
-        total_ms = payload.get("latency_ms")
-        model_complete_ms = total_ms if isinstance(total_ms, (int, float)) else None
-        payload_stream_source = str(payload.get("stream_source") or "")
-        if seam and payload_stream_source in {"event", "poll", "hybrid", "poll_after_event"}:
-            seam.stream_source = payload_stream_source
-        stream_source = seam.stream_source if seam else (payload_stream_source or "event")
-        wire_stream_source = "poll_after_event" if stream_source == "hybrid" else stream_source
-        self.logger.write(
-            "sidepod.turn.latency.text",
-            turn_id=lane_id,
-            stream_source=stream_source,
-            modelCompleteMs=model_complete_ms,
-            **latency,
-        )
-        out: dict[str, Any] = {
-            "type": "complete",
-            "sentAt": iso_utc_now(),
-            "turnId": lane_id,
-            "latency": latency,
-            "streamSource": wire_stream_source,
-        }
-        # Poll-fallback turns stream no assistant.delta events, so this is
-        # the viewer's only copy of the reply text (the reducer falls back
-        # to fullSpokenText when its delta buffer is empty).
-        spoken_text = str(payload.get("spoken_text") or payload.get("text") or "")
-        if spoken_text:
-            out["fullSpokenText"] = spoken_text
-        if seam:
-            seam.tts_expected = bool(self.turn_spoken_any and not self.native_speaker_unavailable)
-        if seam and seam.tts_expected and not (seam.provider_terminal and seam.playback_drained):
-            seam.pending_complete = out
-            self.logger.write("sidepod.turn.complete.pending_playback", turn_id=lane_id)
-            return None
-        latency["totalMs"] = elapsed_ms(seam.started_at) if seam else int(model_complete_ms or 0)
-        self.logger.write("sidepod.turn.latency", turn_id=lane_id, stream_source=stream_source, **latency)
-        return out
-
-    async def flush_pending_completion_after_timeout(self, legacy_id: int, delay_sec: float = 10.0) -> None:
-        await asyncio.sleep(delay_sec)
-        seam = self.turn_seams.get(legacy_id)
-        if not seam or seam.pending_complete is None:
-            return
-        # Kept as a compatibility hook for older callers. Elapsed wall time is
-        # never evidence that provider output or device playout is complete.
-        if seam.provider_terminal and seam.playback_drained:
-            await self.flush_pending_completions(reason="terminal_watchdog", legacy_id=legacy_id)
-        else:
-            self.logger.write(
-                "sidepod.turn.complete.still_pending",
-                turn_id=seam.lane_id,
-                provider_terminal=seam.provider_terminal,
-                playback_drained=seam.playback_drained,
-            )
-
-    async def flush_pending_completions(
-        self,
-        *,
-        reason: str,
-        legacy_id: int | None = None,
-        ready_only: bool = False,
-    ) -> None:
-        for item_id, seam in list(self.turn_seams.items()):
-            if legacy_id is not None and item_id != legacy_id:
-                continue
-            if seam.pending_complete is None:
-                continue
-            if ready_only and not (seam.provider_terminal and seam.playback_drained):
-                continue
-            complete = seam.pending_complete
-            seam.pending_complete = None
-            latency = complete.setdefault("latency", {})
-            if isinstance(latency, dict):
-                latency["totalMs"] = elapsed_ms(seam.started_at)
-            self.logger.write(
-                "sidepod.turn.latency",
-                turn_id=seam.lane_id,
-                stream_source=seam.stream_source,
-                completion_reason=reason,
-                **(latency if isinstance(latency, dict) else {}),
-            )
-            self.logger.write("sidepod.turn.complete.flush", turn_id=seam.lane_id, reason=reason)
-            await self.send_json(complete)
-
-    def clear_pending_completions(self) -> None:
-        for seam in self.turn_seams.values():
-            seam.pending_complete = None
-
-    def translate_turn_failure(self, payload: dict[str, Any]) -> dict[str, Any]:
-        timed_out = payload.get("type") == "turn.timeout"
-        if timed_out:
-            # A timed-out turn gets no turn.complete, so drop its seam state here.
-            self.turn_seams.pop(int(payload.get("turn_id") or 0), None)
-            reason = "turn_timeout"
-        else:
-            reason = str(payload.get("failure") or "failed")
-        diagnostic_code, safe_detail, retryable = TURN_FAILURE_DETAILS.get(
-            reason, TURN_FAILURE_DETAILS["failed"]
-        )
-        return voice_bridge_issue_payload(
-            capability="voice_turns",
-            diagnostic_code=diagnostic_code,
-            safe_detail=safe_detail,
-            retryable=retryable,
-            debug_ref=str(self.logger.run_dir),
-            voice_lane_id=self.voice_lane_id,
-        )
-
-    async def send_protocol_issue(
-        self,
-        *,
-        diagnostic_code: str,
-        safe_detail: str,
-        retryable: bool = True,
-    ) -> None:
-        await self.send_json(
-            voice_bridge_issue_payload(
-                capability="sidepod_transport",
-                diagnostic_code=diagnostic_code,
-                safe_detail=safe_detail,
-                retryable=retryable,
-                debug_ref=str(self.logger.run_dir),
-                voice_lane_id=self.voice_lane_id,
-            )
-        )
